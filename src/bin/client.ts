@@ -90,8 +90,12 @@ const errorTag = (error: unknown): string => {
 
 const errorMessage = (error: unknown): string => {
   if (typeof error === "object" && error !== null) {
-    if ("message" in error && typeof error.message === "string") return error.message
-    if ("reason" in error && typeof error.reason === "string") return error.reason
+    const message = "message" in error && typeof error.message === "string" ? error.message : undefined
+    if (message !== undefined && message.trim().length > 0) return message
+    const reason = "reason" in error && typeof error.reason === "string" ? error.reason : undefined
+    if (reason !== undefined && reason.trim().length > 0) return reason
+    if (message !== undefined) return message
+    if (reason !== undefined) return reason
   }
   return String(error)
 }

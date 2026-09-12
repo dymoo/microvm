@@ -447,8 +447,8 @@ EOF
   client() { MICROVM_URL=$URL MICROVM_TOKEN=$admin_token node "$ROOT/dist/bin/client.js" "$@"; }
 
   # JSON success responses contain sandbox credentials, so keep them in-memory
-  # and silent. On failure, emit only the step, exit code, validated error tag,
-  # and an allowlisted nested boot-cause tag; every unstructured field stays redacted.
+  # and silent. Failures expose only a validated error tag and a hardcoded boot
+  # stage/category; every unstructured field stays redacted.
   capture_client_json() { # output_var step client_args...
     local output_var=$1 step=$2 output status
     shift 2
@@ -466,15 +466,80 @@ step, status = sys.argv[1:3]
 try:
     payload = json.load(sys.stdin)
 except Exception:
-    print(f"ci-acceptance: {step} failed (exit {status}): ClientError: <unparseable redacted response>", file=sys.stderr)
+    print(
+        f"ci-acceptance: {step} failed (exit {status}): "
+        "ClientError; stage=unknown; category=unknown; message=<unparseable redacted response>",
+        file=sys.stderr,
+    )
     raise SystemExit
 tag = payload.get("error") if isinstance(payload, dict) else None
 if not isinstance(tag, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", tag) is None:
     tag = "ClientError"
-cause = payload.get("message") if isinstance(payload, dict) and tag == "BootFailed" else None
-safe_causes = {"BootFailed", "BootProcessDied", "FirecrackerError", "VmTeardownFault"}
-cause_suffix = f"; cause={cause}" if cause in safe_causes else ""
-print(f"ci-acceptance: {step} failed (exit {status}): {tag}{cause_suffix}; message=<redacted>", file=sys.stderr)
+
+stage = "unknown"
+category = "unknown"
+http_status = None
+message = payload.get("message") if isinstance(payload, dict) and tag == "BootFailed" else None
+if isinstance(message, str):
+    if re.fullmatch(r"chroot provisioning failed:[\s\S]*", message):
+        stage, category = "provision-chroot", "io"
+    elif re.fullmatch(r"jailer failed to start:[\s\S]*", message):
+        stage, category = "jailer-start", "spawn"
+    elif re.fullmatch(r"jailer exited before API socket appeared(?::[\s\S]*)?", message):
+        stage, category = "jailer-start", "early-exit"
+    elif re.fullmatch(r"timed out waiting for firecracker API socket(?::[\s\S]*)?", message):
+        stage, category = "jailer-start", "api-socket-timeout"
+    else:
+        endpoint_stages = {
+            "/boot-source": "configure-boot-source",
+            "/drives/rootfs": "configure-root-drive",
+            "/machine-config": "configure-machine",
+            "/vsock": "configure-vsock",
+            "/actions": "instance-start",
+        }
+        api_match = re.fullmatch(
+            r"api (/boot-source|/drives/rootfs|/machine-config|/vsock|/actions)([\s\S]*)",
+            message,
+        )
+        if api_match is not None:
+            endpoint, suffix = api_match.groups()
+            api_stage = endpoint_stages[endpoint]
+            if suffix == " timed out":
+                stage, category = api_stage, "timeout"
+            elif suffix == " response exceeded 1048576 bytes":
+                stage, category = api_stage, "response-too-large"
+            else:
+                status_match = re.fullmatch(r" failed ([0-9]{3}):[\s\S]*", suffix)
+                if status_match is not None and 100 <= int(status_match.group(1)) <= 599:
+                    stage, category = api_stage, "http-error"
+                    http_status = int(status_match.group(1))
+                elif re.fullmatch(r":[\s\S]*", suffix):
+                    stage, category = api_stage, "transport"
+        elif message == "boot exceeded timeout":
+            stage, category = "configure", "overall-timeout"
+        elif re.fullmatch(
+            r"readiness timeout after [0-9]+ms for mvm-[0-9a-z]{8,24}:[\s\S]*",
+            message,
+        ):
+            stage, category = "guest-readiness", "timeout"
+        elif message == "process group survived SIGTERM and SIGKILL":
+            stage, category = "rollback", "signal"
+        elif re.fullmatch(r"cgroup removal failed \(processes may remain\):[\s\S]*", message):
+            stage, category = "rollback", "cgroup"
+        elif re.fullmatch(r"state save failed:[\s\S]*", message):
+            stage, category = "state-persist", "io"
+        elif re.fullmatch(
+            r"failed create was quarantined because cleanup was uncertain:[\s\S]*",
+            message,
+        ):
+            stage, category = "failed-create-cleanup", "uncertain"
+
+status_suffix = f"; http_status={http_status}" if http_status is not None else ""
+print(
+    f"ci-acceptance: {step} failed (exit {status}): {tag}; "
+    f"stage={stage}; category={category}{status_suffix}; message=<redacted>",
+    file=sys.stderr,
+)
 ' "$step" "$status" <<<"$output"
       return "$status"
     fi

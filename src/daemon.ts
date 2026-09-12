@@ -678,7 +678,12 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             uid: allocation.uid,
             gid: allocation.gid
           }, image).pipe(
-            Effect.mapError((cause) => new BootFailed({ vmId: vmId!, reason: String(cause) })),
+            Effect.mapError((cause) => new BootFailed({
+              vmId: vmId!,
+              reason: cause.reason !== undefined && cause.reason.trim().length > 0
+                ? cause.reason
+                : cause._tag
+            })),
             Effect.forkIn(daemonScope)
           )
           const cancelBoot = (): Effect.Effect<void> => Fiber.interrupt(bootFiber).pipe(Effect.asVoid)

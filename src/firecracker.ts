@@ -385,11 +385,6 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
               action_type: "InstanceStart"
             })
           }).pipe(
-            Effect.mapError((cause) =>
-              cause instanceof BootProcessDied
-                ? cause
-                : new FirecrackerError({ vmId, reason: String(cause) })
-            ),
             Effect.timeout({ milliseconds: config.bootTimeoutMs }),
             Effect.catch((cause) =>
               Cause.isTimeoutError(cause)
