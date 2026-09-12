@@ -1,13 +1,34 @@
 # Runtime artifact pins for Linux/KVM acceptance
 
-Research status: 2026-09-12. This note records provenance and configuration evidence; it does **not** claim a successful boot. The real boot remains the Linux/KVM acceptance job's responsibility.
+Research and acceptance status: 2026-09-12. This note records provenance, configuration evidence, and the successful hosted Linux/KVM acceptance run for the exact pinned inputs below. Runtime compatibility evidence does not change an artifact's provenance label.
 
 ## Trust labels
 
 - **Upstream-published digest**: a digest published independently by the project that owns the artifact.
 - **Local HTTPS observation (TOFU)**: a digest computed after one HTTPS download. It detects later drift only after an operator reviews and promotes it; it is not an upstream-published checksum.
 - **Config verified**: the required settings were found in the exact config bound to the binary.
-- **Boot unverified**: no Linux/KVM execution occurred during this research on Darwin.
+- **Hosted acceptance verified**: the exact pinned inputs completed the Linux/KVM scope recorded below. This is compatibility evidence, not an upgrade to artifact provenance.
+
+## Hosted acceptance evidence
+
+[`hosted-linux-acceptance` run 34714700955](https://github.com/dymoo/microvm/actions/runs/34714700955) completed successfully on commit [`92590474064f222f13483b3130b2abdb530958e0`](https://github.com/dymoo/microvm/commit/92590474064f222f13483b3130b2abdb530958e0). The uploaded [`hosted-acceptance-evidence` artifact (ID 10304307833)](https://github.com/dymoo/microvm/actions/runs/34714700955/artifacts/10304307833) has digest `sha256:440f2ef3681205c737c09759cf432894d74c935b880826f5c761830d3f7d993a`.
+
+The run observed:
+
+- 57/57 Linux Vitest tests, guest Go race tests, and the real `CID_LOCAL` rejection gate.
+- A 2,048 MiB image and the jailed CID 2 guest protocol, including the idle request-header deadline and Node.js/Python execution.
+- Two-VM authorization, isolation, and execution bounds, followed by native teardown with no run-state or cgroup leftovers.
+
+The exact TOFU kernel digest `d8ced68bd61e27b6813e2c993cc53a4029c59e13210672180591c84109684fe4` booted and passed this scope. The result proves compatibility for this exact digest; it does not upgrade the digest's provenance or make the demonstration-only prebuilt kernel production-recommended.
+
+| GitHub-hosted Azure observation | Time |
+| --- | ---: |
+| Daemon cold start to listening | 723 ms |
+| First jailed VM create and readiness | 7,816 ms |
+| Guest protocol acceptance | 5,532 ms |
+| Two-VM acceptance | 26,671 ms |
+
+These timings are one GitHub-hosted Azure observation, not a Proxmox latency or capacity benchmark.
 
 ## Firecracker and jailer: use v1.17.0
 
@@ -54,7 +75,7 @@ Static inspection identifies the kernel as an unstripped x86-64 ELF with Build I
 
 The downloaded ELF contains `CONFIG_IKCONFIG`. Extracting that gzip payload without executing the binary produced 99,233 bytes that are byte-for-byte identical to the adjacent config object and have the same config SHA-256 above. This binds the checked config to the checked binary.
 
-The S3 listing advertises `CRC64NVME` as an algorithm but does not publish its value; anonymous `HEAD` also returns no checksum value. The multipart ETag (`0780a2063fe710dfa595658f0ae56af4-4`) is not a SHA-256. No SHA-256 sidecar was present. Therefore the kernel digest above is **not upstream-published**. Use it only if an operator explicitly promotes this exact first-party CI download as the acceptance input; otherwise use the source-build route below. The binary's config is verified, but its download identity is TOFU and its boot is unverified.
+The S3 listing advertises `CRC64NVME` as an algorithm but does not publish its value; anonymous `HEAD` also returns no checksum value. The multipart ETag (`0780a2063fe710dfa595658f0ae56af4-4`) is not a SHA-256. No SHA-256 sidecar was present. Therefore the kernel digest above is **not upstream-published**. Use it only if an operator explicitly promotes this exact first-party CI download as the acceptance input; otherwise use the source-build route below. The binary's config is verified, and the hosted run above proves runtime compatibility for this exact digest. Its download identity remains TOFU; that result does not upgrade its provenance or make the demonstration-only prebuilt kernel production-recommended.
 
 ### Required config, verified in the embedded config
 
