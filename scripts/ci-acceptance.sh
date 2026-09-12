@@ -7,6 +7,8 @@
 #   preflight  hard capability checks under the daemon's real root privilege
 #   artifacts  verify + install pinned Firecracker/jailer/kernel/keyring (root)
 #   tests      pnpm typecheck/build + vitest (structured zero-skip gate) + go -race
+#   vsock     hosted-only real AF_VSOCK peer-authorization test (runner builds
+#              and runs it; root only loads the loopback transport)
 #   image      build the pinned guest image via scripts/build-guest-image.sh
 #   daemon     boot the real daemon as an owned child, run guest-protocol and
 #              two-VM acceptance, then prove release on native shutdown
@@ -229,6 +231,37 @@ PY
   echo "portable tests (structured zero-skip gate) and guest go -race tests passed"
 }
 
+# ------------------------------------------------------------------- vsock --
+vsock_security() {
+  [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] \
+    || die "real VSOCK security test is restricted to an ephemeral GitHub-hosted runner"
+  (( EUID != 0 )) || die "real VSOCK test binary must be compiled by the runner user"
+  [[ -n ${RUNNER_TEMP:-} && -d $RUNNER_TEMP ]] || die "RUNNER_TEMP is unavailable"
+  command -v sudo >/dev/null || die "sudo is required for the hosted real VSOCK test"
+  command -v timeout >/dev/null || die "timeout is required for the hosted real VSOCK test"
+  mkdir -p "$EVIDENCE_DIR"
+
+  local test_binary=$RUNNER_TEMP/microvm-vsock.test
+  trap 'rm -f -- "$test_binary"' EXIT
+  (
+    cd "$ROOT/guest"
+    go test -c -tags=realvsock -o "$test_binary" ./internal/vsock
+  )
+  # No capability skip: module, bind, connect, authorization, read, or close
+  # failure is a red acceptance step. Only loading the loopback module needs
+  # root; binding port 1024 and executing the test remain unprivileged.
+  sudo modprobe vsock_loopback
+  timeout --signal=KILL 15s "$test_binary" \
+    -test.v \
+    -test.run '^TestListenerRejectsLocalVSOCKPeer$' \
+    -test.count=1 \
+    -test.timeout=10s \
+    | tee "$EVIDENCE_DIR/tests-vsock.txt"
+  rm -f -- "$test_binary"
+  trap - EXIT
+  echo "real VSOCK peer-authorization test passed"
+}
+
 # ------------------------------------------------------------------- image --
 image() {
   [[ $EUID -eq 0 ]] || die "image build must run as root"
@@ -267,6 +300,16 @@ process_start_identity() { # pid -> process start time
   [[ -r /proc/$1/stat ]] || return 1
   stat=$(< "/proc/$1/stat")
   stat_starttime "$stat"
+}
+
+process_identity_alive() { # PID:STARTTIME -> exact live process identity
+  local record=$1 pid expected_start actual_start
+  [[ $record =~ ^([1-9][0-9]*):([0-9]+)$ ]] || return 1
+  pid=${BASH_REMATCH[1]}
+  expected_start=${BASH_REMATCH[2]}
+  kill -0 "$pid" 2>/dev/null || return 1
+  actual_start=$(process_start_identity "$pid") || return 1
+  [[ $actual_start == "$expected_start" ]]
 }
 
 wait_for_port() { # pid seconds label
@@ -403,6 +446,38 @@ EOF
 
   client() { MICROVM_URL=$URL MICROVM_TOKEN=$admin_token node "$ROOT/dist/bin/client.js" "$@"; }
 
+  # JSON success responses contain sandbox credentials, so keep them in-memory
+  # and silent. On failure, emit only the step, exit code, and validated error
+  # tag; every unstructured field stays redacted.
+  capture_client_json() { # output_var step client_args...
+    local output_var=$1 step=$2 output status
+    shift 2
+    set +e
+    output=$(client "$@")
+    status=$?
+    set -e
+    if (( status != 0 )); then
+      python3 -c '
+import json
+import re
+import sys
+
+step, status = sys.argv[1:3]
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print(f"ci-acceptance: {step} failed (exit {status}): ClientError: <unparseable redacted response>", file=sys.stderr)
+    raise SystemExit
+tag = payload.get("error") if isinstance(payload, dict) else None
+if not isinstance(tag, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", tag) is None:
+    tag = "ClientError"
+print(f"ci-acceptance: {step} failed (exit {status}): {tag}; message=<redacted>", file=sys.stderr)
+' "$step" "$status" <<<"$output"
+      return "$status"
+    fi
+    printf -v "$output_var" '%s' "$output"
+  }
+
   # Failure/interrupt path: destroy what we created, stop the daemon we own,
   # and report — never claim green, never delete diagnostic state. The normal
   # path below performs the same teardown with hard verification instead.
@@ -439,18 +514,20 @@ EOF
   # the jailer. The vsock UDS lives inside the per-VM jailer chroot; see
   # vmLayout in src/host.ts — this only resolves the documented path.
   started=$(now_ms)
-  create_json=$(client create --image node --cpus 1 --mem-mib 512 --ttl-s 900 --json)
+  capture_client_json create_json "protocol VM create" \
+    create --image node --cpus 1 --mem-mib 512 --ttl-s 900 --json
   vm_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["vmId"])' <<<"$create_json")
   finished=$(now_ms)
   protocol_vm_create_ms=$((finished - started))
   unset create_json
   vsock="$RUN_STATE_DIR/vms/$vm_id/jailer/$FC_BASENAME/$vm_id/root/v.sock"
-  [[ -S $vsock ]] || die "jailed VM $vm_id has no vsock socket at the documented layout path: $vsock"
+  [[ -S $vsock ]] \
+    || die "guest-protocol vsock check failed after VM create: expected socket at $vsock"
   started=$(now_ms)
   "$ROOT/scripts/accept-guest-linux.sh" --vsock-uds "$vsock" | tee "$EVIDENCE_DIR/guest-protocol.log"
   finished=$(now_ms)
   protocol_accept_ms=$((finished - started))
-  destroy_json=$(client destroy --vm "$vm_id" --json)
+  capture_client_json destroy_json "protocol VM destroy" destroy --vm "$vm_id" --json
   python3 -c 'import json,sys; assert json.load(sys.stdin)["destroyed"] is True' <<<"$destroy_json"
   vm_id=
 
@@ -513,8 +590,9 @@ case ${1:-} in
   preflight) preflight ;;
   artifacts) artifacts ;;
   tests) tests ;;
+  vsock-security) vsock_security ;;
   image) image ;;
   daemon) daemon ;;
   clean) clean ;;
-  *) echo "usage: scripts/ci-acceptance.sh <preflight|artifacts|tests|image|daemon|clean>" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci-acceptance.sh <preflight|artifacts|tests|vsock-security|image|daemon|clean>" >&2; exit 2 ;;
 esac

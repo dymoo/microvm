@@ -53,8 +53,10 @@ A dispatch-only GitHub Actions workflow
 (`.github/workflows/acceptance.yml`) exercises the real path on a hosted
 `ubuntu-24.04` KVM runner: a fail-closed KVM/cgroup preflight; digest-verified
 pinned Firecracker/jailer installed under the dedicated root-owned
-`/var/lib/microvm/bin` prefix; the pinned kernel and image build; the guest
-protocol over a jailered VM's vsock; and the two-VM daemon acceptance. Artifact
+`/var/lib/microvm/bin` prefix; a hosted-only real AF_VSOCK peer-authorization
+gate run as the runner user after a root-only loopback module load; the pinned
+kernel and image build; the guest protocol over a jailed VM's vsock, including
+its idle request-header deadline; and the two-VM daemon acceptance. Artifact
 provenance and trust labels live in
 [docs/runtime-artifacts.md](docs/runtime-artifacts.md);
 what the workflow runs is described in

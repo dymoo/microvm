@@ -173,9 +173,12 @@ job does not depend on or modify shared `/usr/local`), and the pinned kernel
 under `/var/lib/microvm/images` (provenance and trust labels in
 `docs/runtime-artifacts.md`; the kernel digest is a TOFU observation of the
 first-party CI fixture, not an upstream signature), `pnpm test` with the
-kernel-flock test asserted unskipped, guest `go test -race`, the pinned image
-build, the guest exec v1 protocol against a jailed VM the daemon booted, and
-the two-VM daemon acceptance. The daemon's admin token is generated
+kernel-flock test asserted unskipped, guest `go test -race`, a hosted-only
+tagged real-AF_VSOCK peer-authorization test compiled and run as the runner
+user under a hard timeout after a root-only `vsock_loopback` module load, the
+pinned image build, the guest exec v1 protocol (including the idle request-header
+deadline) against a jailed VM the daemon booted, and the two-VM daemon
+acceptance. The daemon's admin token is generated
 ephemerally, masked before any output, and passed only through the config's
 `${ENV}` reference; teardown rides the daemon's native shutdown lifecycle plus
 an always-step cleanup, and the uploaded evidence contains versions,

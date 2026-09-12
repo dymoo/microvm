@@ -5,7 +5,8 @@ import { join } from "node:path"
 import { Effect, Result } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
 import { Firecracker, FirecrackerLive } from "../src/firecracker.js"
-import { ImageManifest, type HostConfig, type ResolvedImage, type VmLayout } from "../src/host.js"
+import { ImageAllowlist, ImageManifest, type HostConfig, type ResolvedImage, type VmLayout } from "../src/host.js"
+import { ImageNotAllowed } from "../src/protocol.js"
 
 const roots: Array<string> = []
 
@@ -135,5 +136,36 @@ describe("Firecracker boot transaction", () => {
     const { result, apiRequests } = await bootResult(true)
     expect(apiRequests).toBe(5)
     expect(Result.isFailure(result) ? result.failure : result).toMatchObject({ _tag: "BootFailed" })
+  })
+})
+
+describe("image allowlist", () => {
+  const writeImage = async (dir: string, manifest: unknown) => {
+    await writeFile(join(dir, "node.json"), JSON.stringify(manifest))
+    await writeFile(join(dir, "node.raw"), "raw-image-bytes")
+  }
+
+  const resolveNode = (dir: string) =>
+    Effect.runPromise(
+      Effect.gen(function*() {
+        const allowlist = yield* ImageAllowlist
+        return yield* allowlist.resolve("node")
+      }).pipe(Effect.provide(ImageAllowlist.layer(dir)))
+    )
+
+  it("resolves a builder manifest that omits optional metadata and serves readable image bytes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mvm-images-"))
+    roots.push(dir)
+    // Both informational fields omitted: the keys must simply be optional.
+    await writeImage(dir, { name: "node", file: "node.raw", arch: "x86_64" })
+    const image = await resolveNode(dir)
+    expect(await readFile(image.absolutePath, "utf8")).toBe("raw-image-bytes")
+  })
+
+  it("rejects a builder manifest whose provided metadata fails validation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mvm-images-"))
+    roots.push(dir)
+    await writeImage(dir, { name: "node", file: "node.raw", arch: "x86_64", sizeBytes: "4 GiB" })
+    await expect(resolveNode(dir)).rejects.toBeInstanceOf(ImageNotAllowed)
   })
 })

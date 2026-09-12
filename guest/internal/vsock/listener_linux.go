@@ -3,10 +3,12 @@
 package vsock
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -15,7 +17,7 @@ import (
 const Port uint32 = 1024
 
 func Listen() (net.Listener, error) {
-	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("create AF_VSOCK socket: %w", err)
 	}
@@ -27,30 +29,95 @@ func Listen() (net.Listener, error) {
 		unix.Close(fd)
 		return nil, fmt.Errorf("listen on AF_VSOCK port %d: %w", Port, err)
 	}
-	return &listener{fd: fd}, nil
+	file := os.NewFile(uintptr(fd), "vsock-listener")
+	if file == nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("wrap AF_VSOCK listener")
+	}
+	return &listener{file: file}, nil
 }
 
 type listener struct {
-	fd        int
+	file      *os.File
 	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 func (l *listener) Accept() (net.Conn, error) {
-	fd, _, err := unix.Accept4(l.fd, unix.SOCK_CLOEXEC)
+	raw, err := l.file.SyscallConn()
 	if err != nil {
-		return nil, os.NewSyscallError("accept4", err)
+		return nil, l.acceptError(err)
 	}
-	file := os.NewFile(uintptr(fd), "vsock-connection")
-	if file == nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("wrap accepted AF_VSOCK connection")
+
+	for {
+		var (
+			fd        int
+			peer      unix.Sockaddr
+			acceptErr error
+		)
+		err := raw.Read(func(listenerFD uintptr) bool {
+			for {
+				fd, peer, acceptErr = unix.Accept4(
+					int(listenerFD),
+					unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK,
+				)
+				if errors.Is(acceptErr, unix.EINTR) {
+					continue
+				}
+				return !errors.Is(acceptErr, unix.EAGAIN) &&
+					!errors.Is(acceptErr, unix.EWOULDBLOCK)
+			}
+		})
+		if err != nil {
+			return nil, l.acceptError(err)
+		}
+		if acceptErr != nil {
+			return nil, os.NewSyscallError("accept4", acceptErr)
+		}
+
+		vmPeer, trusted := peer.(*unix.SockaddrVM)
+		if !trusted || vmPeer.CID != unix.VMADDR_CID_HOST {
+			unix.Close(fd)
+			continue
+		}
+
+		local, err := unix.Getsockname(fd)
+		if err != nil {
+			unix.Close(fd)
+			return nil, os.NewSyscallError("getsockname", err)
+		}
+		vmLocal, ok := local.(*unix.SockaddrVM)
+		if !ok {
+			unix.Close(fd)
+			return nil, fmt.Errorf("accepted AF_VSOCK local address has type %T", local)
+		}
+
+		file := os.NewFile(uintptr(fd), "vsock-connection")
+		if file == nil {
+			unix.Close(fd)
+			return nil, fmt.Errorf("wrap accepted AF_VSOCK connection")
+		}
+		return &connection{
+			file:   file,
+			local:  address{cid: vmLocal.CID, port: vmLocal.Port},
+			remote: address{cid: vmPeer.CID, port: vmPeer.Port},
+		}, nil
 	}
-	return &connection{file: file}, nil
+}
+
+func (l *listener) acceptError(err error) error {
+	if l.closed.Load() || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+		return net.ErrClosed
+	}
+	return os.NewSyscallError("accept4", err)
 }
 
 func (l *listener) Close() error {
 	var err error
-	l.closeOnce.Do(func() { err = unix.Close(l.fd) })
+	l.closeOnce.Do(func() {
+		l.closed.Store(true)
+		err = l.file.Close()
+	})
 	return err
 }
 
@@ -59,14 +126,16 @@ func (l *listener) Addr() net.Addr {
 }
 
 type connection struct {
-	file *os.File
+	file   *os.File
+	local  address
+	remote address
 }
 
 func (c *connection) Read(buffer []byte) (int, error)  { return c.file.Read(buffer) }
 func (c *connection) Write(buffer []byte) (int, error) { return c.file.Write(buffer) }
 func (c *connection) Close() error                     { return c.file.Close() }
-func (c *connection) LocalAddr() net.Addr              { return address{cid: unix.VMADDR_CID_ANY, port: Port} }
-func (c *connection) RemoteAddr() net.Addr             { return address{} }
+func (c *connection) LocalAddr() net.Addr              { return c.local }
+func (c *connection) RemoteAddr() net.Addr             { return c.remote }
 func (c *connection) SetDeadline(value time.Time) error {
 	return c.file.SetDeadline(value)
 }

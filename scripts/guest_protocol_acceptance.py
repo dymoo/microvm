@@ -15,6 +15,7 @@ from typing import Any
 
 PORT = 1024
 MAX_LINE_BYTES = 8 << 20
+IDLE_HEADER_OUTER_BOUND_SECONDS = 8
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,52 @@ def execute(vsock_uds: str, request: dict[str, Any]) -> Result:
             raise AssertionError(f"unknown guest frame type: {frame!r}")
 
 
+def require_idle_header_deadline(vsock_uds: str) -> None:
+    """An accepted host connection must not hold a guest worker forever."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(IDLE_HEADER_OUTER_BOUND_SECONDS)
+        connection.connect(vsock_uds)
+        connection.sendall(f"CONNECT {PORT}\n".encode("ascii"))
+        stream = connection.makefile("rwb", buffering=0)
+        acknowledgement = stream.readline(128)
+        if not re.fullmatch(rb"OK [0-9]+\n", acknowledgement):
+            raise AssertionError(f"invalid Firecracker vsock acknowledgement: {acknowledgement!r}")
+
+        deadline = time.monotonic() + IDLE_HEADER_OUTER_BOUND_SECONDS
+
+        def read_before_deadline(limit: int) -> bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("idle request-header connection remained open beyond the 8s outer bound")
+            connection.settimeout(remaining)
+            try:
+                return stream.readline(limit)
+            except TimeoutError as error:
+                raise AssertionError(
+                    "idle request-header connection remained open beyond the 8s outer bound"
+                ) from error
+
+        first = read_before_deadline(MAX_LINE_BYTES + 2)
+        if not first:
+            return
+        if len(first) > MAX_LINE_BYTES + 1 or not first.endswith(b"\n"):
+            raise AssertionError("idle request-header response exceeded the JSONL line bound")
+        frame = json.loads(first)
+        expected_keys = {"version", "id", "type", "code", "message"}
+        if (
+            not isinstance(frame, dict)
+            or set(frame) != expected_keys
+            or frame["version"] != 1
+            or frame["id"] != ""
+            or frame["type"] != "error"
+            or frame["code"] != "INVALID_REQUEST"
+            or not isinstance(frame["message"], str)
+        ):
+            raise AssertionError(f"unexpected idle request-header response: {frame!r}")
+        if read_before_deadline(1):
+            raise AssertionError("guest sent trailing data instead of closing the idle request-header connection")
+
+
 def request(identifier: str, argv: list[str], **overrides: Any) -> dict[str, Any]:
     value: dict[str, Any] = {
         "version": 1,
@@ -90,6 +137,15 @@ def wait_for_runner(vsock_uds: str) -> None:
     raise AssertionError(f"guest runner did not become ready: {last_error}")
 def run(vsock_uds: str) -> None:
     wait_for_runner(vsock_uds)
+    # The guest enforces a 5s request-header deadline. The harness holds one
+    # valid Firecracker host (CID 2) connection idle, allows an optional
+    # structured INVALID_REQUEST frame, and requires close before its 8s bound.
+    require_idle_header_deadline(vsock_uds)
+
+    # The idle-client rejection must not poison subsequent valid host-CID 2
+    # execution.
+    host_cid = execute(vsock_uds, request("valid-host-cid-2", ["/usr/bin/true"]))
+    require_exit(host_cid)
 
     node = execute(vsock_uds, request("node", ["/usr/bin/node", "--version"]))
     require_exit(node)

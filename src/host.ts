@@ -279,9 +279,10 @@ export class ImageManifest extends Schema.Class<ImageManifest>("ImageManifest")(
   /** Raw disk image file, relative to the allowlist directory. */
   file: Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9._-]*\.raw$/)),
   arch: Schema.Literals(["x86_64", "aarch64"]),
-  sizeBytes: Schema.UndefinedOr(Schema.Number),
+  /** Informational builder metadata; builders may omit either field. */
+  sizeBytes: Schema.optional(Schema.Number),
   /** Guest device the root filesystem appears on (informational). */
-  rootDevice: Schema.UndefinedOr(Schema.String)
+  rootDevice: Schema.optional(Schema.String)
 }) {}
 
 export interface ResolvedImage {

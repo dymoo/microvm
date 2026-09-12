@@ -107,6 +107,12 @@ jobs:
       - name: Portable tests and guest race tests
         run: scripts/ci-acceptance.sh tests
 
+      # Hosted-only real transport gate: compile and run the no-skip peer
+      # check as the runner user with a hard outer timeout; only loading the
+      # loopback VSOCK module needs root.
+      - name: Real VSOCK peer authorization
+        run: scripts/ci-acceptance.sh vsock-security
+
       - name: Build pinned guest image
         run: >-
           sudo env PATH="$PATH"
