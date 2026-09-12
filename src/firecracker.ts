@@ -133,12 +133,18 @@ const apiRequest = (
   // body consumption. The abort signal destroys the request no matter which
   // stage is in flight when the effect is interrupted or times out.
   Effect.callback<ApiResponse, FirecrackerError>((resume, signal) => {
+    const requestBody = body === undefined ? undefined : Buffer.from(JSON.stringify(body)!)
+    const headers: Record<string, string | number> = {
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    }
+    if (requestBody !== undefined) headers["Content-Length"] = requestBody.byteLength
     const req: ClientRequest = httpRequest(
       {
         socketPath: apiSocket,
         method,
         path,
-        headers: { "Content-Type": "application/json", Accept: "application/json" }
+        headers
       },
       (res) => {
         const chunks: Array<Buffer> = []
@@ -169,8 +175,8 @@ const apiRequest = (
     req.on("error", (cause: Error) =>
       resume(Effect.fail(new FirecrackerError({ vmId, reason: `api ${path}: ${String(cause)}` }))))
     signal.addEventListener("abort", () => req.destroy(), { once: true })
-    if (body !== undefined) req.write(JSON.stringify(body))
-    req.end()
+    if (requestBody === undefined) req.end()
+    else req.end(requestBody)
   }).pipe(
     Effect.flatMap((response) =>
       response.status >= 200 && response.status < 300

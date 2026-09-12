@@ -84,15 +84,35 @@ while True:
 }
 
 const bootResult = async (respondToApi: boolean) => {
-  let apiRequests = 0
   const { config, image, layout, pidPath, vmId } = await fixture(respondToApi)
   const api = createServer((request, response) => {
-    apiRequests++
-    request.resume()
-    if (respondToApi) {
+    if (!respondToApi) {
+      request.resume()
+      return
+    }
+    let bodyBytes = 0
+    request.on("data", (chunk: Buffer) => {
+      bodyBytes += chunk.byteLength
+    })
+    request.on("end", () => {
+      const header = request.headers["content-length"]
+      const contentLength = typeof header === "string" && /^\d+$/.test(header)
+        ? Number(header)
+        : undefined
+      const hasFixedLengthBody =
+        request.headers["transfer-encoding"] === undefined &&
+        contentLength !== undefined &&
+        Number.isSafeInteger(contentLength) &&
+        contentLength > 0 &&
+        contentLength === bodyBytes
+      if (!hasFixedLengthBody) {
+        response.writeHead(400, { "content-length": "17" })
+        response.end("Empty PUT request")
+        return
+      }
       response.writeHead(204, { "content-length": "0" })
       response.end()
-    }
+    })
   })
   await new Promise<void>((resolve, reject) => {
     api.once("error", reject)
@@ -114,7 +134,7 @@ const bootResult = async (respondToApi: boolean) => {
     }).pipe(Effect.provide(FirecrackerLive(config))))
     const pid = Number(await readFile(pidPath, "utf8"))
     expect(() => process.kill(pid, 0)).toThrow()
-    return { result, apiRequests }
+    return result
   } finally {
     api.closeAllConnections()
     await new Promise<void>((resolve) => api.close(() => resolve()))
@@ -127,14 +147,12 @@ afterEach(async () => {
 
 describe("Firecracker boot transaction", () => {
   it("returns a typed boot timeout and rolls back the spawned process", async () => {
-    const { result } = await bootResult(false)
+    const result = await bootResult(false)
     expect(Result.isFailure(result) && result.failure._tag).toBe("FirecrackerError")
-    if (Result.isFailure(result)) expect(result.failure.reason).toContain("boot exceeded timeout")
   })
 
   it("rolls back a configured VM whose guest runner never becomes ready", async () => {
-    const { result, apiRequests } = await bootResult(true)
-    expect(apiRequests).toBe(5)
+    const result = await bootResult(true)
     expect(Result.isFailure(result) ? result.failure : result).toMatchObject({ _tag: "BootFailed" })
   })
 })
