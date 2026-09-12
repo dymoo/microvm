@@ -447,8 +447,8 @@ EOF
   client() { MICROVM_URL=$URL MICROVM_TOKEN=$admin_token node "$ROOT/dist/bin/client.js" "$@"; }
 
   # JSON success responses contain sandbox credentials, so keep them in-memory
-  # and silent. On failure, emit only the step, exit code, and validated error
-  # tag; every unstructured field stays redacted.
+  # and silent. On failure, emit only the step, exit code, validated error tag,
+  # and an allowlisted nested boot-cause tag; every unstructured field stays redacted.
   capture_client_json() { # output_var step client_args...
     local output_var=$1 step=$2 output status
     shift 2
@@ -471,7 +471,10 @@ except Exception:
 tag = payload.get("error") if isinstance(payload, dict) else None
 if not isinstance(tag, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", tag) is None:
     tag = "ClientError"
-print(f"ci-acceptance: {step} failed (exit {status}): {tag}; message=<redacted>", file=sys.stderr)
+cause = payload.get("message") if isinstance(payload, dict) and tag == "BootFailed" else None
+safe_causes = {"BootFailed", "BootProcessDied", "FirecrackerError", "VmTeardownFault"}
+cause_suffix = f"; cause={cause}" if cause in safe_causes else ""
+print(f"ci-acceptance: {step} failed (exit {status}): {tag}{cause_suffix}; message=<redacted>", file=sys.stderr)
 ' "$step" "$status" <<<"$output"
       return "$status"
     fi
