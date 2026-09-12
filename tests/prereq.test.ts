@@ -40,22 +40,25 @@ const verifyWith = (config: HostConfig) =>
   )
 
 describe("host prerequisites (fail closed)", () => {
-  it("fails closed with an aggregated reason on a host without KVM/cgroup v2", async () => {
-    const result = await verifyWith(baseConfig()).then(
-      () => "ok",
-      (error) => error
-    )
-    if (result instanceof HostPrereqFailed) {
-      // Development/macOS host: every missing capability is named in one
-      // failure so operators see the full gap at once.
-      expect(result.reason).toMatch(/kvm/)
-      expect(result.reason).toMatch(/cgroup/)
-    } else {
-      // Linux KVM host: prerequisites genuinely hold; the capability probe
-      // must then report honest values.
-      expect(result.kvmDeviceAccess).toBe(true)
-      expect(result.cgroupV2).toBe(true)
-      expect(["x86_64", "aarch64"]).toContain(result.arch)
+  it("aggregates deterministic violations into one failure naming each check", async () => {
+    const config = baseConfig()
+    try {
+      // Both invalid resources are missing files inside the config's own
+      // freshly allocated private runStateDir: they fail on every host and
+      // identity, with no trust/UID/cgroup assumptions in the assertions.
+      const result = await verifyWith({
+        ...config,
+        firecrackerBinary: join(config.runStateDir, "missing-firecracker"),
+        flockBinary: join(config.runStateDir, "missing-flock")
+      }).then(
+        () => "ok",
+        (error) => error
+      )
+      expect(result).toBeInstanceOf(HostPrereqFailed)
+      expect((result as HostPrereqFailed).reason).toMatch(/firecracker/)
+      expect((result as HostPrereqFailed).reason).toMatch(/flock/)
+    } finally {
+      rmSync(config.runStateDir, { recursive: true, force: true })
     }
   })
 
