@@ -119,3 +119,9 @@ No output kernel SHA-256 can be supplied before that native Linux build. After b
 ## Hosted-runner constraint
 
 GitHub's [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories) documents public `ubuntu-24.04` x64 runners as fresh VMs with 4 CPUs, 16 GB RAM, and 14 GB SSD and passwordless `sudo`. It does not make `/dev/kvm` a Firecracker compatibility guarantee. Acceptance should therefore keep the explicit KVM and cgroup-v2 preflight fail-closed, not skip when either capability is absent. Using the small verified CI prebuilt avoids spending the 14 GB workspace and job time on a kernel build while the pinned rootfs builder creates its 2 GiB ext4 image.
+
+The hosted job installs the verified Firecracker and jailer binaries under the
+dedicated `/var/lib/microvm/bin` prefix, which is root-owned and not group- or
+world-writable. It does not depend on or change the runner's shared
+`/usr/local` tree. The pinned
+kernel and generated image remain under `/var/lib/microvm/images`.

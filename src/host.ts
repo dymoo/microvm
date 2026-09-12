@@ -8,7 +8,7 @@
  */
 import { Context, Effect, Layer, Schema } from "effect"
 import { randomBytes } from "node:crypto"
-import { accessSync, constants as fsConstants, statSync, lstatSync, mkdirSync } from "node:fs"
+import { accessSync, constants as fsConstants, statSync, lstatSync, mkdirSync, type Stats } from "node:fs"
 import {
   chmod,
   chown,
@@ -23,7 +23,7 @@ import {
   writeFile
 } from "node:fs/promises"
 import { arch as osArch, tmpdir, userInfo } from "node:os"
-import { basename, join } from "node:path"
+import { basename, isAbsolute, join } from "node:path"
 import { HostPrereqFailed, ImageName, ImageNotAllowed } from "./protocol.js"
 
 // ---------------------------------------------------------------------------
@@ -50,27 +50,41 @@ const isExecutable = (path: string): boolean => {
 
 /**
  * Trusted-input posture per jailer docs: paths the operator supplies must be
- * root-owned, not world-writable, and not symlinks (which could retarget the
- * jail's inputs). Parent directories carry the same requirement.
+ * root-owned, not group- or world-writable, and not symlinks (which could
+ * retarget the jail's inputs). The kernel is the only path interpreter: the
+ * raw path is probed as given, then each bare upward prefix down to `/`,
+ * stripping only redundant separators — never a named component — so any
+ * input the kernel cannot resolve (`file/..`, a trailing slash on a file,
+ * missing paths) fails closed, and nothing a `..`, dot segment, or trailing
+ * slash passes through escapes its own bare probe. Paths of any finite depth
+ * are judged by their whole chain; relative paths are rejected outright.
  */
 const isTrustedLocation = (path: string): boolean => {
+  if (!isAbsolute(path)) return false
   let probe = path
-  for (let depth = 0; depth < 4; depth++) {
-    let stats
+  for (;;) {
+    let stats: Stats
     try {
       stats = lstatSync(probe)
     } catch {
       return false
     }
-    if (stats.isSymbolicLink()) return false
-    if (stats.uid !== 0) return false
+    if (stats.isSymbolicLink() || stats.uid !== 0) return false
     // eslint-disable-next-line no-bitwise
-    if ((stats.mode & 0o002) !== 0) return false
-    const parent = probe.slice(0, probe.lastIndexOf("/"))
-    if (parent === "" || parent === probe) return true
-    probe = parent
+    if ((stats.mode & 0o022) !== 0) return false
+    let end = probe.length
+    while (end > 1 && probe.charCodeAt(end - 1) === 47 /* "/" */) end--
+    if (end === 1) return true
+    if (end !== probe.length) {
+      // Trailing separators made the probe above follow a final symlink; the
+      // bare name has not been probed yet, so probe it before stepping up.
+      probe = probe.slice(0, end)
+      continue
+    }
+    let cut = probe.lastIndexOf("/", end - 1)
+    while (cut > 0 && probe.charCodeAt(cut - 1) === 47 /* "/" */) cut--
+    probe = cut <= 0 ? "/" : probe.slice(0, cut)
   }
-  return false
 }
 
 const runAsRoot = (): boolean => {
@@ -165,12 +179,12 @@ export class HostPrereqs extends Context.Service<HostPrereqs, {
           if (!isExecutable(config.firecrackerBinary)) {
             failures.push({ name: "firecracker", detail: `not executable: ${config.firecrackerBinary}` })
           } else if (!isTrustedLocation(config.firecrackerBinary)) {
-            failures.push({ name: "firecracker", detail: `untrusted location (must be root-owned, non-world-writable, no symlinks): ${config.firecrackerBinary}` })
+            failures.push({ name: "firecracker", detail: `untrusted location (must be root-owned, not group- or world-writable, no symlinks): ${config.firecrackerBinary}` })
           }
           if (!isExecutable(config.jailerBinary)) {
             failures.push({ name: "jailer", detail: `not executable: ${config.jailerBinary}` })
           } else if (!isTrustedLocation(config.jailerBinary)) {
-            failures.push({ name: "jailer", detail: `untrusted location (must be root-owned, non-world-writable, no symlinks): ${config.jailerBinary}` })
+            failures.push({ name: "jailer", detail: `untrusted location (must be root-owned, not group- or world-writable, no symlinks): ${config.jailerBinary}` })
           }
           const flockBinary = config.flockBinary ?? "/usr/bin/flock"
           if (!isExecutable(flockBinary)) {

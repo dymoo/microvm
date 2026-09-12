@@ -25,10 +25,12 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 EVIDENCE_DIR=${MICROVM_CI_EVIDENCE_DIR:-/tmp/microvm-acceptance-evidence}
 STAGE_DIR=
 
-FIRECRACKER_INSTALL=/usr/local/bin/firecracker
-JAILER_INSTALL=/usr/local/bin/jailer
-IMAGES_DIR=/var/lib/microvm/images
-RUN_STATE_DIR=/var/lib/microvm/run
+PRIVATE_PREFIX=/var/lib/microvm
+BIN_DIR=$PRIVATE_PREFIX/bin
+FIRECRACKER_INSTALL=$BIN_DIR/firecracker
+JAILER_INSTALL=$BIN_DIR/jailer
+IMAGES_DIR=$PRIVATE_PREFIX/images
+RUN_STATE_DIR=$PRIVATE_PREFIX/run
 KERNEL_INSTALL=$IMAGES_DIR/microvm.kernel
 CGROUP_SLICE=/sys/fs/cgroup/microvm.slice
 CI_STATE_DIR=/var/lib/microvm/ci
@@ -143,6 +145,10 @@ artifacts() {
   tar -xzf "$STAGE_DIR/firecracker.tgz" -C "$STAGE_DIR"
   verify_sha "$FIRECRACKER_BIN_SHA256" "$STAGE_DIR/$FIRECRACKER_MEMBER" "firecracker binary"
   verify_sha "$JAILER_BIN_SHA256" "$STAGE_DIR/$JAILER_MEMBER" "jailer binary"
+  # Keep acceptance-owned binaries under one root-owned prefix that is not
+  # group- or world-writable. Do not depend on or change the shared
+  # /usr/local tree.
+  install -d -o 0 -g 0 -m 0755 "$PRIVATE_PREFIX" "$BIN_DIR"
   install -o 0 -g 0 -m 0755 "$STAGE_DIR/$FIRECRACKER_MEMBER" "$FIRECRACKER_INSTALL"
   install -o 0 -g 0 -m 0755 "$STAGE_DIR/$JAILER_MEMBER" "$JAILER_INSTALL"
 

@@ -26,7 +26,8 @@ Before listening, the daemon checks and aggregates these failures in one
 1. the process runs as root, `/dev/kvm` opens read/write, and cgroup v2 is
    mounted at `/sys/fs/cgroup`;
 2. configured Firecracker, jailer, and util-linux `flock` paths are executable,
-   root-owned, non-world-writable, and have no symlink in the checked ancestry;
+   root-owned, not group- or world-writable, and have no symlink in the
+   checked ancestry;
 3. the kernel is readable and has the same trusted-path posture;
 4. the image and run-state directories are trusted; the daemon creates the
    run-state directory with mode 0700 when absent;
@@ -166,8 +167,10 @@ scripts/accept-linux.sh
 `.github/workflows/acceptance.yml` is dispatch-only and runs the real path on
 a standard public `ubuntu-24.04` runner with `contents: read` and a bounded
 job timeout: a fail-closed KVM/cgroup/disk preflight (a missing capability
-fails the job, it never skips), digest-verified pinned Firecracker/jailer and
-kernel installs under root-owned paths (provenance and trust labels in
+fails the job, it never skips), digest-verified pinned Firecracker/jailer
+installed under the dedicated root-owned `/var/lib/microvm/bin` prefix (the CI
+job does not depend on or modify shared `/usr/local`), and the pinned kernel
+under `/var/lib/microvm/images` (provenance and trust labels in
 `docs/runtime-artifacts.md`; the kernel digest is a TOFU observation of the
 first-party CI fixture, not an upstream signature), `pnpm test` with the
 kernel-flock test asserted unskipped, guest `go test -race`, the pinned image
