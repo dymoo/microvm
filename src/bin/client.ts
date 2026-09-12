@@ -3,6 +3,7 @@ import { NodeRuntime } from "@effect/platform-node"
 import { Effect, Schema } from "effect"
 import { constants } from "node:os"
 import { decodeExecResult, makeMicrovmClient } from "../client.js"
+import { GuestExecError } from "../protocol.js"
 
 interface ParsedArguments {
   readonly command: string
@@ -15,6 +16,8 @@ interface ParsedArguments {
 class CliUsageError extends Schema.TaggedError<CliUsageError>()("CliUsageError", {
   message: Schema.String
 }) {}
+
+const isGuestExecError = Schema.is(GuestExecError)
 
 const usage = "usage: microvm [--url URL] [--token TOKEN] <create|exec|status|list|destroy|cleanup> [options] [--json]"
 
@@ -184,7 +187,9 @@ const main = Effect.try({
   Effect.flatMap(runCommand),
   Effect.catch((error) => Effect.sync(() => {
     const payload = { error: errorTag(error), message: errorMessage(error) }
-    if (typeof error === "object" && error !== null && "vmId" in error) {
+    if (isGuestExecError(error)) {
+      emit({ ...payload, code: error.code, vmId: error.vmId })
+    } else if (typeof error === "object" && error !== null && "vmId" in error) {
       emit({ ...payload, vmId: error.vmId })
     } else if (process.argv.includes("--json")) {
       emit(payload)

@@ -169,7 +169,7 @@ INVALID_OUTPUT=$(MICROVM_TOKEN=$VM1_TOKEN "$MICROVM_BIN" exec --vm "$VM1_ID" --c
 INVALID_STATUS=$?
 set -e
 [[ $INVALID_STATUS -eq 1 ]] || { echo "unsafe cwd returned $INVALID_STATUS, expected operation error" >&2; exit 1; }
-[[ $INVALID_OUTPUT == *INVALID_REQUEST* ]] || { echo "unsafe cwd did not surface INVALID_REQUEST" >&2; exit 1; }
+assert_json 'import json,sys; v=json.load(sys.stdin); assert v["error"] == "GuestExecError" and v["code"] == "INVALID_REQUEST"' "$INVALID_OUTPUT"
 
 set +e
 SHADOW_JSON=$(MICROVM_TOKEN=$VM1_TOKEN "$MICROVM_BIN" exec --vm "$VM1_ID" --json -- /usr/bin/python3 -c "open('/etc/shadow').read()" 2>/dev/null)
