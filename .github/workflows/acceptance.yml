@@ -1,0 +1,152 @@
+# Real Linux/KVM acceptance on a standard GitHub-hosted runner.
+#
+# Dispatch-only. Fails closed: a missing KVM device, cgroup v2 controller, or
+# pinned-artifact mismatch is a hard failure, never a skip. Every Firecracker
+# boot happens through the daemon's mandatory jailer path (no direct boot
+# anywhere in these scripts).
+#
+# Artifact pins come from docs/runtime-artifacts.md:
+# - Firecracker v1.17.0 x86_64 archive: upstream-published SHA-256.
+# - Guest kernel: first-party Firecracker CI prebuilt (demonstration-only
+#   fixture), digest is a local HTTPS observation (TOFU) promoted by
+#   engineering review for this controlled acceptance run only. It is NOT
+#   upstream-signed and NOT presented as a current production kernel.
+# - Debian archive keyring from the pinned Trixie snapshot so mmdebstrap keeps
+#   verifying snapshot signatures; no unauthenticated apt path exists here.
+#
+# No secrets: the daemon's admin token is generated ephemerally in the job,
+# masked before any output, and only reaches the daemon via a ${ENV} config
+# reference. Uploaded evidence contains versions, checksums, logs, and
+# timings only — never tokens, rootfs images, or daemon config.
+name: hosted-linux-acceptance
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      MICROVM_CI_EVIDENCE_DIR: /tmp/microvm-acceptance-evidence
+      FIRECRACKER_URL: https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz
+      FIRECRACKER_SHA256: 06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+      FIRECRACKER_MEMBER: release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64
+      JAILER_MEMBER: release-v1.17.0-x86_64/jailer-v1.17.0-x86_64
+      FIRECRACKER_BIN_SHA256: 99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5
+      JAILER_BIN_SHA256: 65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67cad8ac4f406c9c8434f
+      KERNEL_URL: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260909-a8e1c3830545-0/x86_64/vmlinux-6.18.44
+      KERNEL_SHA256: d8ced68bd61e27b6813e2c993cc53a4029c59e13210672180591c84109684fe4
+      KERNEL_CONFIG_URL: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260909-a8e1c3830545-0/x86_64/vmlinux-6.18.44.config
+      KERNEL_CONFIG_SHA256: 9fb2be18303d2f6e8ec35b3a20ecf1209f54a4ece10114a893cb37beabee7030
+      KEYRING_URL: https://snapshot.debian.org/archive/debian/20260911T202741Z/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb
+      KEYRING_SHA256: 9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
+        with:
+          version: 10
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      # Current stable go1.27.1 (official go.dev/dl observed 2026-09-12);
+      # the guest's go.mod keeps its 1.25.0 language version. The module is
+      # nested, so point the module cache at guest/go.sum explicitly.
+      - name: Use Go 1.27.1
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: guest/go.sum
+
+      # Runner-owned before any privileged phase so later nonroot test and
+      # upload steps keep working with it.
+      - name: Prepare evidence directory
+        run: mkdir -p "$MICROVM_CI_EVIDENCE_DIR"
+
+      # Same actual root privilege the daemon uses; fails the job when KVM,
+      # cgroup v2 controllers, disk, or tools are missing. Never a skip.
+      - name: Preflight (fail, never skip)
+        run: >-
+          sudo env PATH="$PATH"
+          MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
+          bash scripts/ci-acceptance.sh preflight
+
+      # root: installs mmdebstrap + the pinned Debian keyring, and the
+      # digest-verified Firecracker/jailer/kernel into root-owned paths.
+      - name: Verify and install pinned artifacts
+        run: >-
+          sudo env PATH="$PATH"
+          FIRECRACKER_URL="$FIRECRACKER_URL"
+          FIRECRACKER_SHA256="$FIRECRACKER_SHA256"
+          FIRECRACKER_MEMBER="$FIRECRACKER_MEMBER"
+          JAILER_MEMBER="$JAILER_MEMBER"
+          FIRECRACKER_BIN_SHA256="$FIRECRACKER_BIN_SHA256"
+          JAILER_BIN_SHA256="$JAILER_BIN_SHA256"
+          KERNEL_URL="$KERNEL_URL"
+          KERNEL_SHA256="$KERNEL_SHA256"
+          KERNEL_CONFIG_URL="$KERNEL_CONFIG_URL"
+          KERNEL_CONFIG_SHA256="$KERNEL_CONFIG_SHA256"
+          KEYRING_URL="$KEYRING_URL"
+          KEYRING_SHA256="$KEYRING_SHA256"
+          MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
+          bash scripts/ci-acceptance.sh artifacts
+
+      # The daemon kernel-flock test is skipIf(Linux-only); on this runner it
+      # must actually run, and the phase asserts a zero-skipped summary.
+      - name: Portable tests and guest race tests
+        run: scripts/ci-acceptance.sh tests
+
+      - name: Build pinned guest image
+        run: >-
+          sudo env PATH="$PATH"
+          KERNEL_SHA256="$KERNEL_SHA256"
+          MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
+          bash scripts/ci-acceptance.sh image
+
+      - name: Daemon, jailed guest-protocol, and two-VM acceptance
+        run: >-
+          sudo env PATH="$PATH"
+          FIRECRACKER_URL="$FIRECRACKER_URL"
+          FIRECRACKER_SHA256="$FIRECRACKER_SHA256"
+          FIRECRACKER_MEMBER="$FIRECRACKER_MEMBER"
+          JAILER_MEMBER="$JAILER_MEMBER"
+          FIRECRACKER_BIN_SHA256="$FIRECRACKER_BIN_SHA256"
+          JAILER_BIN_SHA256="$JAILER_BIN_SHA256"
+          KERNEL_URL="$KERNEL_URL"
+          KERNEL_SHA256="$KERNEL_SHA256"
+          KERNEL_CONFIG_URL="$KERNEL_CONFIG_URL"
+          KERNEL_CONFIG_SHA256="$KERNEL_CONFIG_SHA256"
+          KEYRING_URL="$KEYRING_URL"
+          KEYRING_SHA256="$KEYRING_SHA256"
+          MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
+          bash scripts/ci-acceptance.sh daemon
+
+      # Runs on failure and cancellation: SIGTERM lets the daemon's native
+      # shutdown destroy any remaining VMs; best-effort and idempotent.
+      - name: Tear down daemon and VMs
+        if: always()
+        run: >-
+          sudo env PATH="$PATH"
+          MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
+          bash scripts/ci-acceptance.sh clean
+
+      # Nonsecret evidence only: versions, checksums, manifests, logs,
+      # timings. No tokens, no rootfs image, no daemon config.
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hosted-acceptance-evidence
+          path: /tmp/microvm-acceptance-evidence/
+          if-no-files-found: error

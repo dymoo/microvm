@@ -1,0 +1,194 @@
+#!/usr/bin/env node
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect, Schema } from "effect"
+import { constants } from "node:os"
+import { decodeExecResult, makeMicrovmClient } from "../client.js"
+
+interface ParsedArguments {
+  readonly command: string
+  readonly args: ReadonlyArray<string>
+  readonly url: string
+  readonly token: string
+  readonly json: boolean
+}
+
+class CliUsageError extends Schema.TaggedError<CliUsageError>()("CliUsageError", {
+  message: Schema.String
+}) {}
+
+const usage = "usage: microvm [--url URL] [--token TOKEN] <create|exec|status|list|destroy|cleanup> [options] [--json]"
+
+const parseArguments = (argv: ReadonlyArray<string>): ParsedArguments => {
+  let url = process.env["MICROVM_URL"] ?? ""
+  let token = process.env["MICROVM_TOKEN"] ?? ""
+  let json = false
+  const remaining: Array<string> = []
+  let guestArguments = false
+  for (let index = 0; index < argv.length; index++) {
+    const argument = argv[index]
+    if (argument === undefined) continue
+    if (argument === "--") {
+      guestArguments = true
+      remaining.push(argument)
+      continue
+    }
+    if (!guestArguments && argument === "--json") {
+      json = true
+      continue
+    }
+    if (!guestArguments && (argument === "--url" || argument === "--token")) {
+      const value = argv[index + 1]
+      if (value === undefined) throw new CliUsageError({ message: `${argument} requires a value` })
+      if (argument === "--url") url = value
+      else token = value
+      index++
+      continue
+    }
+    remaining.push(argument)
+  }
+  const command = remaining.shift()
+  if (command === undefined || url.length === 0 || token.length === 0) {
+    throw new CliUsageError({ message: `${usage}; MICROVM_URL and MICROVM_TOKEN are required` })
+  }
+  return { command, args: remaining, url, token, json }
+}
+
+const option = (args: ReadonlyArray<string>, name: string): string | undefined => {
+  const index = args.indexOf(name)
+  if (index === -1) return undefined
+  const value = args[index + 1]
+  if (value === undefined || value.startsWith("--")) throw new CliUsageError({ message: `${name} requires a value` })
+  return value
+}
+
+const requiredOption = (args: ReadonlyArray<string>, name: string): string => {
+  const value = option(args, name)
+  if (value === undefined) throw new CliUsageError({ message: `${name} is required` })
+  return value
+}
+
+const integerOption = (args: ReadonlyArray<string>, name: string): number | undefined => {
+  const raw = option(args, name)
+  if (raw === undefined) return undefined
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new CliUsageError({ message: `${name} must be a positive integer` })
+  }
+  return value
+}
+
+const emit = (value: unknown): void => {
+  process.stdout.write(`${JSON.stringify(value)}\n`)
+}
+
+const errorTag = (error: unknown): string => {
+  if (typeof error === "object" && error !== null && "_tag" in error && typeof error._tag === "string") {
+    return error._tag
+  }
+  return "OperationError"
+}
+
+const errorMessage = (error: unknown): string => {
+  if (typeof error === "object" && error !== null) {
+    if ("message" in error && typeof error.message === "string") return error.message
+    if ("reason" in error && typeof error.reason === "string") return error.reason
+  }
+  return String(error)
+}
+
+const exitCodeForError = (error: unknown): number => {
+  switch (errorTag(error)) {
+    case "Unauthenticated":
+    case "Forbidden":
+      return 2
+    case "VmNotFound":
+      return 3
+    case "CapacityExceeded":
+      return 4
+    case "HostPrereqFailed":
+    case "BootFailed":
+      return 5
+    case "RpcClientError":
+      return 10
+    default:
+      return 1
+  }
+}
+
+const runCommand = (parsed: ParsedArguments) =>
+  Effect.scoped(Effect.gen(function*() {
+    const client = yield* makeMicrovmClient({ url: parsed.url, token: parsed.token })
+    switch (parsed.command) {
+      case "create": {
+        const result = yield* client.create({
+          image: requiredOption(parsed.args, "--image"),
+          cpus: integerOption(parsed.args, "--cpus"),
+          memMib: integerOption(parsed.args, "--mem-mib"),
+          ttlSeconds: integerOption(parsed.args, "--ttl-s")
+        })
+        emit({ ...result.vm, sandboxToken: result.sandboxToken })
+        return
+      }
+      case "exec": {
+        const delimiter = parsed.args.indexOf("--")
+        if (delimiter === -1 || delimiter === parsed.args.length - 1) {
+          return yield* Effect.fail(new CliUsageError({ message: "exec requires -- followed by an absolute argv" }))
+        }
+        const result = yield* client.execute({
+          vmId: requiredOption(parsed.args, "--vm"),
+          argv: parsed.args.slice(delimiter + 1),
+          cwd: option(parsed.args.slice(0, delimiter), "--cwd"),
+          env: undefined,
+          timeoutMs: integerOption(parsed.args.slice(0, delimiter), "--timeout-ms"),
+          maxOutputBytes: integerOption(parsed.args.slice(0, delimiter), "--max-output-bytes")
+        })
+        const decoded = decodeExecResult(result)
+        emit(decoded)
+        if (decoded.signal !== undefined) {
+          const signalNumber = constants.signals[decoded.signal as keyof typeof constants.signals]
+          process.exitCode = signalNumber === undefined ? decoded.exitCode : 128 + signalNumber
+        } else {
+          process.exitCode = decoded.exitCode
+        }
+        return
+      }
+      case "status": {
+        emit(yield* client.inspect({ vmId: requiredOption(parsed.args, "--vm") }))
+        return
+      }
+      case "list": {
+        emit(yield* client.list({}))
+        return
+      }
+      case "destroy": {
+        emit(yield* client.destroy({ vmId: requiredOption(parsed.args, "--vm") }))
+        return
+      }
+      case "cleanup": {
+        emit(yield* client.cleanup({}))
+        return
+      }
+      default:
+        return yield* Effect.fail(new CliUsageError({ message: `unknown command ${parsed.command}; ${usage}` }))
+    }
+  }))
+
+const main = Effect.try({
+  try: () => parseArguments(process.argv.slice(2)),
+  catch: (cause) => cause
+}).pipe(
+  Effect.flatMap(runCommand),
+  Effect.catch((error) => Effect.sync(() => {
+    const payload = { error: errorTag(error), message: errorMessage(error) }
+    if (typeof error === "object" && error !== null && "vmId" in error) {
+      emit({ ...payload, vmId: error.vmId })
+    } else if (process.argv.includes("--json")) {
+      emit(payload)
+    } else {
+      process.stderr.write(`${payload.error}: ${payload.message}\n`)
+    }
+    process.exitCode = exitCodeForError(error)
+  }))
+)
+
+NodeRuntime.runMain(main)
