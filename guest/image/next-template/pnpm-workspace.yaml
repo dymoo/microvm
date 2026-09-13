@@ -1,2 +1,6 @@
 allowBuilds:
   msgpackr-extract: false
+cacheDir: /var/lib/microvm/pnpm-cache
+offline: true
+storeDir: /var/lib/microvm/pnpm-store
+trustLockfile: true

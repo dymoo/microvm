@@ -9,6 +9,10 @@ NODE_VERSION=24.21.0
 PNPM_VERSION=11.13.1
 # npm registry dist.integrity sha512-svx2g7imUlQU59E+G6KMqt3elr9m7FQL+ut+cCuB8+C+TR8pXt9/n+A5Z0Co3ORQnFgt33mJH0VD/qMtN2RfJQ==
 PNPM_SHA512=b2fc7683b8a6525414e7d13e1ba28caaddde96bf66ec540bfaeb7e702b81f3e0be4d1f295edf7f9fe0396740a8dce4509c582ddf79891f4543fea32d37645f25
+# Guest-side pnpm store and cache. The shipped template's pnpm-workspace.yaml
+# must resolve to these exact paths; assert_template_setting enforces that.
+GUEST_PNPM_STORE=/var/lib/microvm/pnpm-store
+GUEST_PNPM_CACHE=/var/lib/microvm/pnpm-cache
 IMAGE_SIZE_MIB=2048
 IMAGE_NAME=microvm-agent
 TARGET_ARCH=
@@ -188,38 +192,78 @@ chroot "$ROOTFS" /usr/sbin/useradd \
   --shell /usr/sbin/nologin agent
 install -d -o 1000 -g 1000 -m 0700 "$ROOTFS/workspace"
 install -d -o 1000 -g 1000 -m 0755 \
-  "$ROOTFS/opt/microvm/next-template" "$ROOTFS/var/lib/microvm/pnpm-store"
+  "$ROOTFS/opt/microvm/next-template" \
+  "$ROOTFS$GUEST_PNPM_STORE" "$ROOTFS$GUEST_PNPM_CACHE"
 cp -a "$NEXT_TEMPLATE_SOURCE/." "$ROOTFS/opt/microvm/next-template/"
 chown -R 1000:1000 "$ROOTFS/opt/microvm/next-template"
 
-# The chroot may need the builder's resolver only while fetching the lockfile's
-# pinned public packages. Runtime DNS is removed again before image creation.
+# Image-time pnpm work runs as the guest's own scrubbed UID 1000 identity, so no
+# host HOME, credential, proxy, or registry-auth state can reach the image.
+run_as_agent() {
+  chroot --userspec=1000:1000 "$ROOTFS" /usr/bin/env -i \
+    HOME=/workspace USER=agent LOGNAME=agent \
+    PATH=/usr/local/bin:/usr/bin:/bin CI=true "$@"
+}
+assert_template_setting() { # setting expected-value
+  local actual
+  actual=$(run_as_agent /usr/local/bin/pnpm \
+    --dir /opt/microvm/next-template config get "$1") || {
+    echo "cannot read template setting $1" >&2
+    exit 1
+  }
+  [[ $actual == "$2" ]] || {
+    echo "shipped Next.js template must resolve $1 to '$2' (got '$actual')" >&2
+    exit 1
+  }
+}
+
+# The chroot may reach the builder's resolver only while the online fetch both
+# downloads the pinned packages and verifies the lockfile against pnpm's
+# supply-chain policies. Runtime DNS is removed again before the offline work.
 BUILD_RESOLV_CONF=/etc/resolv.conf
 [[ -r /run/systemd/resolve/resolv.conf ]] && BUILD_RESOLV_CONF=/run/systemd/resolve/resolv.conf
 cp -L "$BUILD_RESOLV_CONF" "$ROOTFS/etc/resolv.conf"
-chroot --userspec=1000:1000 "$ROOTFS" /usr/bin/env -i \
-  HOME=/workspace USER=agent LOGNAME=agent \
-  PATH=/usr/local/bin:/usr/bin:/bin CI=true \
-  /usr/local/bin/pnpm --dir /opt/microvm/next-template fetch \
-    --frozen-lockfile --config.offline=false
+# Trust ordering: this online fetch is forced to re-verify the operator-owned
+# lockfile (trustLockfile=false) and to allow the one registry read that
+# verification needs (offline=false). Everything after it is offline and reads
+# only the store this fetch just verified and populated; the shipped template
+# carries trustLockfile=true with offline=true because re-verification needs
+# registry metadata the final image deliberately cannot reach.
+run_as_agent /usr/local/bin/pnpm --dir /opt/microvm/next-template fetch \
+  --frozen-lockfile --config.offline=false --config.trust-lockfile=false \
+  --store-dir "$GUEST_PNPM_STORE" --config.cache-dir="$GUEST_PNPM_CACHE"
 rm -f "$ROOTFS/etc/resolv.conf"
 : >"$ROOTFS/etc/resolv.conf"
+
+# Fail closed before the resolver-less work: the shipped template must resolve
+# to exactly the policy the offline contract depends on, or the image would
+# attempt registry-backed re-verification it can never complete offline.
+assert_template_setting trustLockfile true
+assert_template_setting offline true
+assert_template_setting storeDir "$GUEST_PNPM_STORE"
+assert_template_setting cacheDir "$GUEST_PNPM_CACHE"
+
 # pnpm fetch may create a virtual store without project links. Recreate
-# node_modules strictly from the now-prewarmed content-addressed store.
+# node_modules strictly from the now-prewarmed content-addressed store, with
+# retries disabled so any accidental network use fails immediately instead of
+# waiting out DNS timeouts.
 rm -rf "$ROOTFS/opt/microvm/next-template/node_modules"
-chroot --userspec=1000:1000 "$ROOTFS" /usr/bin/env -i \
-  HOME=/workspace USER=agent LOGNAME=agent \
-  PATH=/usr/local/bin:/usr/bin:/bin CI=true \
-  /usr/local/bin/pnpm --dir /opt/microvm/next-template install \
-    --offline --frozen-lockfile --config.package-import-method=copy
-chroot --userspec=1000:1000 "$ROOTFS" /usr/bin/env -i \
-  HOME=/workspace USER=agent LOGNAME=agent \
-  PATH=/usr/local/bin:/usr/bin:/bin CI=true \
-  /usr/local/bin/pnpm --dir /opt/microvm/next-template run typecheck
+run_as_agent /usr/local/bin/pnpm --dir /opt/microvm/next-template install \
+  --offline --frozen-lockfile --config.package-import-method=copy \
+  --config.fetch-retries=0 \
+  --store-dir "$GUEST_PNPM_STORE" --config.cache-dir="$GUEST_PNPM_CACHE"
+run_as_agent /usr/local/bin/pnpm --dir /opt/microvm/next-template run typecheck
+
+# microvm-next-init materializes the template into an empty target, so pnpm's
+# store and cache must stay outside the guest home.
+[[ -z $(find "$ROOTFS/workspace" -mindepth 1 -print -quit) ]] || {
+  echo "image-time pnpm work left files in /workspace; microvm-next-init requires an empty target" >&2
+  exit 1
+}
 
 chown -R 0:0 "$ROOTFS/opt/microvm/next-template"
 chmod -R u=rwX,go=rX "$ROOTFS/opt/microvm/next-template"
-chown -R 1000:1000 "$ROOTFS/var/lib/microvm/pnpm-store"
+chown -R 1000:1000 "$ROOTFS$GUEST_PNPM_STORE" "$ROOTFS$GUEST_PNPM_CACHE"
 install -d -o 0 -g 0 -m 0755 \
   "$ROOTFS/dev/pts" "$ROOTFS/proc" "$ROOTFS/run" \
   "$ROOTFS/sys/fs/cgroup/microvm-exec" "$ROOTFS/tmp"

@@ -107,6 +107,18 @@ Notes:
   `/opt/microvm/next-template`. Run `microvm-next-init` once against an empty
   `/workspace`; it never merges into existing source. `pnpm dev` then binds
   guest loopback `127.0.0.1:3000`.
+- The lockfile is policy-verified exactly once, during the image build's
+  resolver-enabled online fetch, which forces `trustLockfile=false`. Every
+  later pnpm step — the image's own offline materialization and any in-guest
+  install — runs with the template's `trustLockfile: true` and `offline: true`;
+  the lockfile is root-owned and baked into the image, and re-verification is
+  registry-backed, which the no-NIC guest cannot do. A missing store entry
+  fails with `ERR_PNPM_NO_OFFLINE_TARBALL` rather than reaching a registry, and
+  the builder refuses to build if the shipped template stops resolving those
+  settings.
+- The UID-1000-writable pnpm store and cache live at
+  `/var/lib/microvm/pnpm-store` and `/var/lib/microvm/pnpm-cache`, outside
+  `/workspace` so `microvm-next-init` still sees an empty target.
 - Git comes from the same pinned Debian snapshot. A pre-destroy guest-local
   checkpoint must set a non-secret repository-local author, commit, prove a
   clean index/worktree, and record `git rev-parse HEAD`. It is still ephemeral
@@ -118,8 +130,9 @@ Notes:
 - `runStateDir` stores one private logical full-size root disk per live VM.
   Provisioning requests a copy-on-write reflink and automatically falls back
   to an ordinary private copy when unsupported. That private disk also isolates
-  the UID-1000-writable `/var/lib/microvm/pnpm-store`; never replace it with a
-  store shared across VMs. Put `runStateDir` on disk-backed storage and size for
+  the UID-1000-writable `/var/lib/microvm/pnpm-store` and
+  `/var/lib/microvm/pnpm-cache`; never replace either with a path shared across
+  VMs. Put `runStateDir` on disk-backed storage and size for
   the worst case: `maxVms × image size` plus headroom, because fallback copies,
   dependency-store writes, and project writes can consume the full space.
 - `create` returns only after the guest runner answers a readiness probe

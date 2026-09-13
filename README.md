@@ -47,9 +47,11 @@ not create a second manifest manually. It verifies Debian snapshot metadata,
 the pinned official Node.js checksum, pnpm **11.13.1**'s official npm
 `dist.integrity`, the template lockfile, and the supplied kernel digest. The
 image contains Git from the pinned Debian snapshot, an operator-owned Next.js
-template, its ready `node_modules`, and a private writable pnpm store. In a new
-VM, run `microvm-next-init` once in the empty `/workspace`, then `pnpm dev`; the
-app binds only `127.0.0.1:3000`. Neither command downloads packages.
+template, its ready `node_modules`, and a private writable pnpm store and cache.
+The lockfile is supply-chain verified once by the build's resolver-enabled
+fetch; the shipped template then installs strictly offline. In a new VM, run
+`microvm-next-init` once in the empty `/workspace`, then `pnpm dev`; the app
+binds only `127.0.0.1:3000`. Neither command downloads packages.
 
 Before destroying a VM, Git can create a coherent guest-local checkpoint:
 configure a non-secret local author, `git add --all`, commit, require a clean

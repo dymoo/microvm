@@ -64,14 +64,36 @@ Free Vibecode generated-site family: Next.js 16.3.3, React and React DOM
 19.2.8, Effect 4.0.0-beta.107, TypeScript 6.0.3, and the matching pinned type
 packages. The public lockfile graph is fetched on the native target builder,
 then `node_modules` is materialized offline. The final image has an empty
-`/etc/resolv.conf`; `.npmrc` also forces pnpm offline at runtime.
+`/etc/resolv.conf`.
+
+The template's pnpm settings live in `pnpm-workspace.yaml`, which is where
+pnpm 11 reads project configuration; a shipped `.npmrc` would be dead
+configuration. The trust ordering is explicit and one-directional:
+
+1. The image build forces `trustLockfile=false` and `offline=false` on a single
+   online `pnpm fetch`, so pnpm verifies the operator-owned lockfile against
+   its supply-chain policies while registry metadata is still reachable. That
+   fetch is the only registry read in the image's life.
+2. Everything after it is offline. The shipped template sets
+   `trustLockfile: true`, because re-verification is registry-backed and the
+   final image deliberately has no network; the lockfile being trusted is the
+   recorded result of step 1 plus its root-owned, image-baked immutability.
+3. `offline: true` keeps later installs fail-closed: a missing store entry ends
+   in a deterministic `ERR_PNPM_NO_OFFLINE_TARBALL`, never a registry fallback.
+
+Nothing globally disables supply-chain verification; only the post-verification
+offline phase skips it, and the builder fails closed if the shipped template
+ever stops resolving `trustLockfile`, `offline`, `storeDir`, or `cacheDir` to
+the expected values.
 
 Run `microvm-next-init` to copy the ready template into an empty `/workspace`.
 It rejects symbolic links and non-empty targets instead of merging or
 overwriting source. The copied project uses the per-image
-`/var/lib/microvm/pnpm-store`, owned by UID/GID 1000. Because every VM receives
-a private copy-on-write root disk, this writable store is isolated per VM and
-is never a shared host cache. `pnpm dev` binds only `127.0.0.1:3000`.
+`/var/lib/microvm/pnpm-store` and `/var/lib/microvm/pnpm-cache`, both owned by
+UID/GID 1000 and kept outside the guest home so materialization starts from an
+empty target. Because every VM receives a private copy-on-write root disk,
+these writable paths are isolated per VM and are never shared host caches.
+`pnpm dev` binds only `127.0.0.1:3000`.
 
 For a pre-destroy checkpoint, initialize a repository in the materialized
 workspace, configure a non-secret repository-local author, stage and commit,

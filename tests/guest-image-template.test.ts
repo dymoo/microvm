@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -25,7 +26,6 @@ const packageManifest = JSON.parse(
   devDependencies: Record<string, string>
 }
 const lockfile = readFileSync(join(templateDirectory, "pnpm-lock.yaml"), "utf8")
-const npmrc = readFileSync(join(templateDirectory, ".npmrc"), "utf8")
 const workspacePolicy = readFileSync(
   join(templateDirectory, "pnpm-workspace.yaml"),
   "utf8"
@@ -109,23 +109,48 @@ describe("Next.js guest image inputs", () => {
     expect(buildScript).toContain('chroot "$ROOTFS" /usr/bin/git --version')
   })
 
-  it("bakes an offline install while keeping the per-VM store writable by UID 1000", () => {
-    expect(npmrc).toContain("offline=true")
-    expect(npmrc).toContain("store-dir=/var/lib/microvm/pnpm-store")
-    expect(workspacePolicy).toBe("allowBuilds:\n  msgpackr-extract: false\n")
-    expect(buildScript).toContain(
-      "fetch \\\n    --frozen-lockfile --config.offline=false"
+  it("verifies the lockfile once online and stays trusted and offline afterwards", () => {
+    expect(workspacePolicy).toBe(
+      [
+        "allowBuilds:",
+        "  msgpackr-extract: false",
+        "cacheDir: /var/lib/microvm/pnpm-cache",
+        "offline: true",
+        "storeDir: /var/lib/microvm/pnpm-store",
+        "trustLockfile: true",
+        ""
+      ].join("\n")
     )
-    expect(buildScript).toContain(
-      "install \\\n    --offline --frozen-lockfile --config.package-import-method=copy"
+    // pnpm 11 reads project settings from pnpm-workspace.yaml, not .npmrc; a
+    // shipped .npmrc would be dead configuration.
+    expect(existsSync(join(templateDirectory, ".npmrc"))).toBe(false)
+    expect(buildScript).toMatch(
+      /next-template fetch \\\n  --frozen-lockfile --config\.offline=false --config\.trust-lockfile=false/
     )
+    expect(buildScript).toMatch(
+      /next-template install \\\n  --offline --frozen-lockfile --config\.package-import-method=copy \\\n  --config\.fetch-retries=0/
+    )
+    // The builder fails closed when the shipped template stops resolving to the
+    // trusted/offline policy, before any resolver-less pnpm work.
+    expect(buildScript).toContain("assert_template_setting trustLockfile true")
+    expect(buildScript).toContain("assert_template_setting offline true")
+    expect(buildScript).toContain('assert_template_setting storeDir "$GUEST_PNPM_STORE"')
+    expect(buildScript).toContain('assert_template_setting cacheDir "$GUEST_PNPM_CACHE"')
+    const store = buildScript.match(/^GUEST_PNPM_STORE=(\S+)$/m)?.[1]
+    const cache = buildScript.match(/^GUEST_PNPM_CACHE=(\S+)$/m)?.[1]
+    expect(store).toBe("/var/lib/microvm/pnpm-store")
+    expect(cache).toBe("/var/lib/microvm/pnpm-cache")
+    expect(workspacePolicy).toContain(`storeDir: ${store}\n`)
+    expect(workspacePolicy).toContain(`cacheDir: ${cache}\n`)
     expect(buildScript).toContain('chown -R 0:0 "$ROOTFS/opt/microvm/next-template"')
     expect(buildScript).toContain(
-      'chown -R 1000:1000 "$ROOTFS/var/lib/microvm/pnpm-store"'
+      'chown -R 1000:1000 "$ROOTFS$GUEST_PNPM_STORE" "$ROOTFS$GUEST_PNPM_CACHE"'
     )
     expect(buildScript).toMatch(
       /fetch[\s\S]*--config\.offline=false[\s\S]*rm -f "\$ROOTFS\/etc\/resolv\.conf"[\s\S]*: >"\$ROOTFS\/etc\/resolv\.conf"[\s\S]*install[\s\S]*--offline/
     )
+    // Image-time pnpm work must leave the materializer's target empty.
+    expect(buildScript).toContain('find "$ROOTFS/workspace" -mindepth 1')
   })
 
   it("binds development and production servers only to guest loopback port 3000", () => {
@@ -148,7 +173,7 @@ describe("microvm-next-init", () => {
     writeFileSync(join(source, "app/page.tsx"), "export default 1\n")
     writeFileSync(join(source, "node_modules/.pnpm/ready"), "prewarmed\n")
     symlinkSync(".pnpm/ready", join(source, "node_modules/ready-link"))
-    writeFileSync(join(source, ".npmrc"), npmrc)
+    writeFileSync(join(source, "pnpm-workspace.yaml"), workspacePolicy)
     mkdirSync(target)
 
     const result = spawnSync(process.execPath, [initializer, target], {
@@ -165,7 +190,9 @@ describe("microvm-next-init", () => {
     )
     expect(readlinkSync(join(target, "node_modules/ready-link"))).toBe(".pnpm/ready")
     expect(readFileSync(join(target, "node_modules/ready-link"), "utf8")).toBe("prewarmed\n")
-    expect(readFileSync(join(target, ".npmrc"), "utf8")).toContain("offline=true")
+    expect(readFileSync(join(target, "pnpm-workspace.yaml"), "utf8")).toBe(
+      workspacePolicy
+    )
   })
 
   it("supports a coherent ephemeral checkpoint without a remote", () => {
