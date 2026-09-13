@@ -1,8 +1,10 @@
 # Vercel AI SDK tools
 
 `createSandboxTools` binds tools to an existing `MicrovmClient`, one VM ID, and
-a guest working directory. Construct it in trusted application code after
-create; never let model text select those values.
+a guest working directory. Construct it in trusted application code after a
+successful create (which requires `imageDigest`); never let model text select
+those values. Closing the RPC `Scope` does not destroy the VM; destroy remains
+an explicit caller step when the agent session ends.
 
 ```ts
 import {

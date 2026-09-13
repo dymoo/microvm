@@ -18,6 +18,7 @@ import type { VmId } from "../src/protocol.js"
 
 const createPayload = {
   image: "node",
+  imageDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   cpus: undefined,
   memMib: undefined,
   ttlSeconds: undefined

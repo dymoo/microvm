@@ -34,7 +34,8 @@ import {
   MAX_JSONL_LINE_BYTES,
   MAX_OUTPUT_BYTES_PER_STREAM,
   MAX_SERVICE_CONTROL_LINE_BYTES,
-  MAX_TIMEOUT_MS
+  MAX_TIMEOUT_MS,
+  type ImageDigest
 } from "./protocol.js"
 import {
   openGuestExecSocket,
@@ -231,6 +232,8 @@ export interface VmHandle {
   readonly stop: () => Effect.Effect<void, VmTeardownFault>
   /** Completes when the jailer/firecracker process exits for any reason. */
   readonly exited: Effect.Effect<{ readonly exitCode: number | null; readonly signal: string | null }>
+  /** Measured private-copy digest from provision; never a request echo. */
+  readonly imageDigest: ImageDigest
 }
 
 export class Firecracker extends Context.Service<Firecracker, {
@@ -279,8 +282,16 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
           }))
         }
 
-        // 1. Private root disk + kernel copy inside the chroot.
-        yield* provisionChroot(vmId, layout, image, config.kernelImage, spec.uid, spec.gid).pipe(
+        // 1. Private root disk + kernel copy inside the chroot. Hash the
+        //    actual copy before spawn; mismatch never starts the jailer.
+        const provisioned = yield* provisionChroot(
+          vmId,
+          layout,
+          image,
+          config.kernelImage,
+          spec.uid,
+          spec.gid
+        ).pipe(
           Effect.mapError((disk) => new FirecrackerError({ vmId, reason: disk.reason }))
         )
 
@@ -376,7 +387,12 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
             yield* removeCgroup
           })
 
-        const handle: VmHandle = { pid: child.pid ?? -1, stop, exited }
+        const handle: VmHandle = {
+          pid: child.pid ?? -1,
+          stop,
+          exited,
+          imageDigest: provisioned.imageDigest
+        }
 
         // 3. Configure + start. Every failure path tears the process tree
         //    and cgroup down; a teardown that cannot be proven complete

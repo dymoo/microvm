@@ -119,11 +119,12 @@ Notes:
 - The UID-1000-writable pnpm store and cache live at
   `/var/lib/microvm/pnpm-store` and `/var/lib/microvm/pnpm-cache`, outside
   `/workspace` so `microvm-next-init` still sees an empty target.
-- Git comes from the same pinned Debian snapshot. A pre-destroy guest-local
-  checkpoint must set a non-secret repository-local author, commit, prove a
-  clean index/worktree, and record `git rev-parse HEAD`. It is still ephemeral
-  until a trusted external export verifies and persists it; that export is not
-  implemented. Guests have no Git credentials, remote, NIC, DNS, or push path.
+- Git comes from the same pinned Debian snapshot. A guest-local commit is
+  optional and ephemeral: set a non-secret repository-local author, commit,
+  prove a clean index/worktree, and record `git rev-parse HEAD` if you need a
+  coherent local revision for inspection. This repository does not export that
+  commit and does not block destroy on it. Guests have no Git credentials,
+  remote, NIC, DNS, or push path.
 - `memory.max` per VM = guest `memMib` + the configured `vmmOverheadMib`; do
   not drop the overhead or the OOM killer can take valid VMs.
 - `jailerFsizeBytes` must be at least the largest allowed root image.
@@ -137,6 +138,11 @@ Notes:
   dependency-store writes, and project writes can consume the full space.
 - `create` returns only after the guest runner answers a readiness probe
   bounded by `guestReadinessTimeoutMs`.
+- `create` requires `imageDigest` from the image manifest (`sha256:` and 64
+  lowercase hex of the final raw rootfs). The daemon resolves the allowlisted
+  name against that digest, then hashes the private rootfs copy before boot.
+  `VmInfo.imageDigest` is the measured copy. `--print-manifest` requires the
+  already-measured `--image-digest` and never invents a placeholder.
 - `maxTtlSeconds` is both the default lifetime when `create` omits a TTL and
   the hard upper bound.
 - The daemon holds an advisory kernel `flock` on
@@ -181,6 +187,7 @@ sudo scripts/build-guest-image.sh \
 export MICROVM_URL='https://192.0.2.10:9443'
 export MICROVM_TOKEN='<admin token from the secret manager>'
 export MICROVM_IMAGE='node'
+export MICROVM_IMAGE_MANIFEST='/var/lib/microvm/images/node.json'
 export MICROVM_RUN_STATE_DIR='/var/lib/microvm/run'
 export MICROVM_CGROUP_ROOT='/sys/fs/cgroup/microvm.slice'
 scripts/accept-linux.sh

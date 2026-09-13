@@ -14,14 +14,16 @@ One Firecracker runtime, three credential scopes, four trust boundaries.
 | `src/daemon-http-proxy.ts` | Authenticated `/http/v1/vms/:id/*` HTTP and WebSocket ingress | Admission quotas, semantic parsing, sanitization, streaming, frame validation |
 | `src/daemon.ts` | `daemonLayer(config)` | Registry, quotas, request leases, service serialization, TTL reaper, recovery, HTTP(S) serving |
 | `src/http-proxy.ts` | `SandboxHttpProxy` handlers for Node's `request`, `upgrade`, `connect`, and `checkContinue` events | Ingress capability injection and the trusted Node reverse-proxy hop |
-| `src/client.ts` | `makeMicrovmClient` | Endpoint resolution, TLS enforcement, wire decoding |
-| `src/cluster.ts` | `SandboxHandle`, `WebServiceHandle` | Endpoint ownership, hidden credentials, semantic HTTP and durable service APIs, normalization of omitted optional request keys |
+| `src/client.ts` | `makeMicrovm`, `makeMicrovmClient`, public `SandboxHandle` / `WebServiceHandle` and create/execute/service inputs | Single-daemon constructors, TLS, scoped RPC clients; `create` is one RPC to the configured origin |
+| `src/sandbox-binding.ts` | private; not a supported public constructor | Shared post-create handle binding and request normalizers |
+| `src/cluster.ts` | `makeMicrovmCluster` | Bounded health polling, static placement, capacity-only create failover; reuses the private binder |
 | `src/ai.ts` | `createSandboxTools`, prompt exports | Tool schemas, bounds, cancellation wiring |
 
 All outward adapters depend inward on `protocol.ts`: the daemon composes
-`auth`, `host`, and `firecracker`; the client composes auth and RPC transport;
-`cluster` and `ai` build only on the typed client. No runtime module imports
-from either higher-level consumer.
+`auth`, `host`, and `firecracker`; the client composes auth and RPC transport
+and exposes the single-daemon convenience constructor; `cluster` reuses the
+private binder and remains a supported multi-daemon path; `ai` builds only on
+the typed client. No runtime module imports from either higher-level consumer.
 
 ## Trust boundaries
 
@@ -74,9 +76,21 @@ from either higher-level consumer.
   deliberate defence in depth: a bug in one boundary's parser must not become
   the next boundary's trust assumption, and each layer's refusals stay
   observable on its own. Do not de-duplicate these validators.
-- **No blind retries.** `create`, exec, service control, and individual HTTP
-  exchanges are never replayed. Exec interruption poisons and destroys the VM
-  instead of leaving unowned work running.
+- **No blind retries.** Direct `makeMicrovm` `create`, exec, service control,
+  and individual HTTP exchanges are never replayed, including
+  `CapacityExceeded`. `makeMicrovmCluster` retries create only after an
+  explicit capacity rejection; transport and boot failures return immediately.
+  Exec interruption poisons and destroys the VM instead of leaving unowned
+  work running.
+- **Pinned image identity.** `create` requires `imageDigest`. The allowlist
+  rejects a name/digest mismatch before allocation. Provisioning hashes the
+  private rootfs copy before chown or jailer spawn; `VmInfo.imageDigest` is
+  that measured digest, never a request echo. A mismatch fails closed without
+  starting the jailer.
+- **Known bind, uncertain rollback.** After a create reply names a `vmId`, a
+  bind failure attempts exactly one admin destroy. `SandboxBindingError`
+  preserves the id, the binding failure, and an optional cleanup cause; do
+  not treat the VM as absent while rollback is uncertain.
 
 ## Guest protocols
 
@@ -104,6 +118,10 @@ request and response per connection while the supervised process outlives it.
 - `tests/integration.test.ts` and `tests/cluster.test.ts` — real HTTP RPC
   listeners and public handles with Firecracker/guest services replaced only
   at their Context seams.
+- `tests/direct-client.test.ts` — single-daemon `makeMicrovm` create/bind
+  without health, list, placement, failover, or retry.
+- `tests/image-identity.test.ts` — required digest on create, manifest, and
+  measured `VmInfo`, plus private-copy hash before boot.
 - `tests/ai.test.ts` — actual AI SDK `generateText` and `streamText` tool
   execution through a scoped authenticated RPC client.
 - `tests/lock.test.ts` — Linux-only util-linux `flock` race and holder-death

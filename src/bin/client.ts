@@ -144,6 +144,7 @@ const buildCommand = (parsed: ParsedArguments): CliCommand => {
         _tag: "create",
         request: {
           image: requiredOption(parsed.args, "--image"),
+          imageDigest: requiredOption(parsed.args, "--image-digest"),
           cpus: integerOption(parsed.args, "--cpus"),
           memMib: integerOption(parsed.args, "--mem-mib"),
           ttlSeconds: integerOption(parsed.args, "--ttl-s")

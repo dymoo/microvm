@@ -21,6 +21,9 @@ KERNEL=
 KERNEL_SHA256=
 OUTPUT_DIR=
 PRINT_MANIFEST=false
+IMAGE_DIGEST=
+TEMPLATE_OVERLAY=
+IMAGE_DIGEST_RE='^sha256:[0-9a-f]{64}$'
 
 usage() {
   cat >&2 <<'USAGE'
@@ -29,21 +32,51 @@ Usage: sudo scripts/build-guest-image.sh \
   --kernel /path/to/operator-built-kernel \
   --kernel-sha256 64_HEX_DIGEST \
   --output-dir /path/to/images \
-  [--name microvm-agent] [--size-mib 2048]
-   or: scripts/build-guest-image.sh --print-manifest --arch x86_64|aarch64 \
-       [--name microvm-agent]
+  [--name microvm-agent] [--size-mib 2048] [--template-overlay DIR]
+   or: scripts/build-guest-image.sh --print-manifest --image-digest sha256:HEX \
+       --arch x86_64|aarch64 [--name microvm-agent]
 
 Builds a pinned Debian 13 (Trixie) snapshot root image containing the maintained
 Node.js 24 LTS, Python 3.13, and Git runtimes, pnpm 11, an offline-ready
 Next.js template, the minimal PID 1, and the AF_VSOCK guest runner. The kernel
 is deliberately not downloaded: an operator must supply a Firecracker-compatible
 kernel and its trusted SHA-256 digest.
+
+The image digest is the SHA-256 of the final raw rootfs bytes. Build mode
+hashes after those writes. --print-manifest never invents a digest: pass the
+already-measured sha256:<64 lowercase hex> with --image-digest.
+
+--template-overlay is an optional out-of-tree directory copied onto the public
+Next.js template before the offline pnpm fetch. It must not be used to put
+private application source into a public image.
 USAGE
 }
 
 render_manifest() {
-  printf '{"name":"%s","file":"%s.raw","arch":"%s","rootDevice":"/dev/vda","httpEndpoints":{"web":{"port":%d}}}\n' \
-    "$IMAGE_NAME" "$IMAGE_NAME" "$TARGET_ARCH" "$STANDARD_NODE_GUEST_WEB_PORT"
+  printf '{"name":"%s","file":"%s.raw","arch":"%s","rootDevice":"/dev/vda","httpEndpoints":{"web":{"port":%d}},"imageDigest":"%s"}\n' \
+    "$IMAGE_NAME" "$IMAGE_NAME" "$TARGET_ARCH" "$STANDARD_NODE_GUEST_WEB_PORT" "$IMAGE_DIGEST"
+}
+
+apply_template_overlay() {
+  local dest=$1 overlay=$2 path rel
+  [[ -d $overlay && ! -L $overlay ]] || {
+    echo "--template-overlay must be a real directory, not a symlink" >&2
+    exit 2
+  }
+  overlay=$(cd -- "$overlay" && pwd)
+  while IFS= read -r -d '' path; do
+    [[ $path == "$overlay" ]] && continue
+    rel=${path#"$overlay"/}
+    [[ $rel != *..* ]] || {
+      echo "template overlay path is not allowed: $rel" >&2
+      exit 2
+    }
+    if [[ -L $path ]]; then
+      echo "template overlay must not contain symbolic links: $rel" >&2
+      exit 2
+    fi
+  done < <(find "$overlay" -print0)
+  cp -a "$overlay/." "$dest/"
 }
 
 while (($#)); do
@@ -54,6 +87,8 @@ while (($#)); do
     --output-dir) OUTPUT_DIR=${2:-}; shift 2 ;;
     --name) IMAGE_NAME=${2:-}; shift 2 ;;
     --size-mib) IMAGE_SIZE_MIB=${2:-}; shift 2 ;;
+    --image-digest) IMAGE_DIGEST=${2:-}; shift 2 ;;
+    --template-overlay) TEMPLATE_OVERLAY=${2:-}; shift 2 ;;
     --print-manifest) PRINT_MANIFEST=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
@@ -63,10 +98,22 @@ done
 if [[ $PRINT_MANIFEST == true ]]; then
   [[ $TARGET_ARCH == x86_64 || $TARGET_ARCH == aarch64 ]] || { echo "--arch must be x86_64 or aarch64" >&2; exit 2; }
   [[ $IMAGE_NAME =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || { echo "--name must match [a-z0-9][a-z0-9._-]{0,63}" >&2; exit 2; }
+  [[ $IMAGE_DIGEST =~ $IMAGE_DIGEST_RE ]] || {
+    echo "--print-manifest requires --image-digest sha256:<64 lowercase hex>; refusing a placeholder" >&2
+    exit 2
+  }
+  [[ -z $TEMPLATE_OVERLAY ]] || {
+    echo "--template-overlay cannot be combined with --print-manifest" >&2
+    exit 2
+  }
   render_manifest
   exit 0
 fi
 
+[[ -z $IMAGE_DIGEST ]] || {
+  echo "build mode hashes the final raw image; pass --image-digest only with --print-manifest" >&2
+  exit 2
+}
 [[ $(uname -s) == Linux ]] || { echo "guest images can only be built on Linux" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || { echo "guest image build requires root" >&2; exit 1; }
 [[ $TARGET_ARCH == x86_64 || $TARGET_ARCH == aarch64 ]] || { echo "--arch must be x86_64 or aarch64" >&2; exit 2; }
@@ -75,6 +122,12 @@ fi
 [[ -n $OUTPUT_DIR ]] || { echo "--output-dir is required" >&2; exit 2; }
 [[ $IMAGE_NAME =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || { echo "--name must match [a-z0-9][a-z0-9._-]{0,63}" >&2; exit 2; }
 [[ $IMAGE_SIZE_MIB =~ ^[0-9]+$ && $IMAGE_SIZE_MIB -ge 512 && $IMAGE_SIZE_MIB -le 16384 ]] || { echo "--size-mib must be between 512 and 16384" >&2; exit 2; }
+if [[ -n $TEMPLATE_OVERLAY ]]; then
+  [[ -d $TEMPLATE_OVERLAY && ! -L $TEMPLATE_OVERLAY ]] || {
+    echo "--template-overlay must be a real directory, not a symlink" >&2
+    exit 2
+  }
+fi
 
 for tool in chroot cp curl file find go install mke2fs mmdebstrap sha256sum sha512sum tar truncate xz; do
   command -v "$tool" >/dev/null || { echo "required tool not found: $tool" >&2; exit 1; }
@@ -212,6 +265,9 @@ install -d -o 1000 -g 1000 -m 0755 \
   "$ROOTFS/opt/microvm/next-template" \
   "$ROOTFS$GUEST_PNPM_STORE" "$ROOTFS$GUEST_PNPM_CACHE"
 cp -a "$NEXT_TEMPLATE_SOURCE/." "$ROOTFS/opt/microvm/next-template/"
+if [[ -n $TEMPLATE_OVERLAY ]]; then
+  apply_template_overlay "$ROOTFS/opt/microvm/next-template" "$TEMPLATE_OVERLAY"
+fi
 chown -R 1000:1000 "$ROOTFS/opt/microvm/next-template"
 
 # Image-time pnpm work runs as the guest's own scrubbed UID 1000 identity, so no
@@ -306,11 +362,21 @@ MANIFEST_OUTPUT=$OUTPUT_DIR/$IMAGE_NAME.json
 CHECKSUM_OUTPUT=$OUTPUT_DIR/$IMAGE_NAME.sha256
 install -o 0 -g 0 -m 0644 "$IMAGE_TMP" "$IMAGE_OUTPUT"
 install -o 0 -g 0 -m 0644 "$KERNEL" "$KERNEL_OUTPUT"
+IMAGE_SHA256=$(sha256sum -- "$IMAGE_OUTPUT")
+IMAGE_SHA256=${IMAGE_SHA256%% *}
+IMAGE_DIGEST=sha256:$IMAGE_SHA256
+[[ $IMAGE_DIGEST =~ $IMAGE_DIGEST_RE ]] || {
+  echo "computed imageDigest is not sha256:<64 lowercase hex>" >&2
+  exit 1
+}
 render_manifest >"$MANIFEST_OUTPUT"
 (
   cd "$OUTPUT_DIR"
-  sha256sum "$IMAGE_NAME.raw" "$IMAGE_NAME.kernel" "$IMAGE_NAME.json" >"$IMAGE_NAME.sha256"
+  {
+    printf '%s  %s\n' "$IMAGE_SHA256" "$IMAGE_NAME.raw"
+    sha256sum -- "$IMAGE_NAME.kernel" "$IMAGE_NAME.json"
+  } >"$IMAGE_NAME.sha256"
 )
 
-printf 'root image: %s\nkernel: %s\nmanifest: %s\nchecksums: %s\n' \
-  "$IMAGE_OUTPUT" "$KERNEL_OUTPUT" "$MANIFEST_OUTPUT" "$CHECKSUM_OUTPUT"
+printf 'root image: %s\nkernel: %s\nmanifest: %s\nchecksums: %s\nimageDigest: %s\n' \
+  "$IMAGE_OUTPUT" "$KERNEL_OUTPUT" "$MANIFEST_OUTPUT" "$CHECKSUM_OUTPUT" "$IMAGE_DIGEST"

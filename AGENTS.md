@@ -56,10 +56,11 @@ v4 idioms proven in this codebase (copy these, do not guess):
 - `src/daemon.ts` — daemon assembly: config, kernel-held single-daemon lock,
   VM registry (quotas, reservations, TTL reaper, recovery), RPC handlers, and
   bounded HTTP/TLS serving.
-- `src/client.ts` — scoped typed client for one authenticated daemon endpoint.
-- `src/cluster.ts` — bounded health polling, static multi-daemon placement,
-  capacity-only create failover, VM owner binding, and the source-revision
+- `src/client.ts` — scoped RPC client and direct single-daemon sandbox creation.
+- `src/sandbox-binding.ts` — private shared handle binding, rollback, and
   `http()`/`startWebService` handles.
+- `src/cluster.ts` — bounded health polling, static multi-daemon placement,
+  and capacity-only create failover.
 - `src/http-proxy.ts` — the trusted Node reverse-proxy hop: binds one VM's
   ingress capability and exposes `request`, `upgrade`, `connect`, and
   `checkContinue` handlers that can reach only the image's fixed HTTP target.
@@ -75,9 +76,10 @@ HTTP preview, and durable web-service contracts exactly as specified in
 ## Security invariants (load-bearing — never weaken)
 
 1. Callers can never pass host paths, kernel paths, kernel boot args, or image
-   paths; images are operator-allowlisted by name only.
+   paths; creation requires an allowlisted image name and its raw-image digest.
 2. Jailer is mandatory for every Firecracker boot; no direct-firecracker path.
-3. Every VM gets a private root disk copy; the base image is never shared RW.
+3. Every VM gets a private root disk copy verified against the requested digest
+   before boot; the base image is never shared RW.
 4. No guest network interfaces are ever configured (no egress); guest I/O is
    vsock-only.
 5. Missing KVM device access, cgroup v2, or jailer => daemon fails closed (no

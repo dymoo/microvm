@@ -43,6 +43,23 @@ command -v timeout >/dev/null || { echo "abuse-linux: GNU timeout is required" >
   exit 1
 }
 
+IMAGE_DIGEST=${MICROVM_IMAGE_DIGEST:-}
+if [[ -n ${MICROVM_IMAGE_MANIFEST:-} ]]; then
+  [[ -f $MICROVM_IMAGE_MANIFEST ]] || { echo "abuse-linux: MICROVM_IMAGE_MANIFEST is not a file" >&2; exit 2; }
+  IMAGE_DIGEST=$(python3 -c '
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    digest = json.load(handle).get("imageDigest", "")
+if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("imageDigest must be sha256:<64 lowercase hex>")
+print(digest)
+' "$MICROVM_IMAGE_MANIFEST")
+fi
+[[ $IMAGE_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || {
+  echo "abuse-linux: set MICROVM_IMAGE_DIGEST=sha256:<64 lowercase hex> or MICROVM_IMAGE_MANIFEST" >&2
+  exit 2
+}
+
 WORK_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/microvm-abuse.XXXXXXXX")
 
 pass() {
@@ -204,7 +221,7 @@ wait_background_cli() {
 create_vm() {
   local id_var=$1 token_var=$2 cpus=$3 mem_mib=$4 ttl_seconds=${5:-600} id token refs
   (( ${#ACTIVE_VM_TOKENS[@]} < 2 )) || die "refusing to own more than two VMs"
-  capture_cli "$ADMIN_TOKEN" create --image "$MICROVM_IMAGE" --cpus "$cpus" --mem-mib "$mem_mib" --ttl-s "$ttl_seconds" --json
+  capture_cli "$ADMIN_TOKEN" create --image "$MICROVM_IMAGE" --image-digest "$IMAGE_DIGEST" --cpus "$cpus" --mem-mib "$mem_mib" --ttl-s "$ttl_seconds" --json
   (( CLI_STATUS == 0 )) || die "VM create failed with client status $CLI_STATUS"
   assert_json "VM create" '
 import json, re, sys
@@ -297,11 +314,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ---------------------------------------------------------------- credentials
-create_vm ATTACKER_ID ATTACKER_TOKEN 4 2048 7200
+create_vm ATTACKER_ID ATTACKER_TOKEN 4 4096 7200
 assert_json "resource-capped create response" '
 import json, sys
 payload = json.load(sys.stdin)
-assert payload["cpus"] == 2 and payload["memMib"] == 1024
+assert payload["cpus"] == 2 and payload["memMib"] == 2048
 assert payload["expiresAtEpochMs"] - payload["createdAtEpochMs"] == 3_600_000
 ' "$CLI_OUTPUT"
 pass "oversized public create request is capped in its returned VM values"
@@ -311,7 +328,7 @@ capture_cli "$ATTACKER_TOKEN" status --vm "$ATTACKER_ID" --json
 assert_json "resource-capped VM status" '
 import json, sys
 payload = json.load(sys.stdin)
-assert payload["cpus"] == 2 and payload["memMib"] == 1024
+assert payload["cpus"] == 2 and payload["memMib"] == 2048
 assert payload["expiresAtEpochMs"] - payload["createdAtEpochMs"] == 3_600_000
 ' "$CLI_OUTPUT"
 pass "resource caps persist in public status"
@@ -323,7 +340,7 @@ cpus = os.cpu_count()
 with open("/proc/meminfo") as handle:
     mem_kib = int(next(line.split()[1] for line in handle if line.startswith("MemTotal:")))
 assert cpus is not None and 1 <= cpus <= 2
-assert 1 <= mem_kib <= 1024 * 1024
+assert 1 <= mem_kib <= 2048 * 1024
 print(json.dumps({"cpus": cpus, "memKiB": mem_kib}))
 '
 expect_exec_ok "guest-visible processors and memory do not exceed daemon caps"
@@ -332,13 +349,13 @@ import json, sys
 outer = json.load(sys.stdin)
 visible = json.loads(outer["stdout"])
 assert 1 <= visible["cpus"] <= 2
-assert 1 <= visible["memKiB"] <= 1024 * 1024
+assert 1 <= visible["memKiB"] <= 2048 * 1024
 ' "$CLI_OUTPUT"
 
 create_vm VICTIM_ID VICTIM_TOKEN 1 512
 [[ $ATTACKER_ID != "$VICTIM_ID" ]] || die "daemon returned duplicate VM identifiers"
 
-capture_cli "$ATTACKER_TOKEN" create --image "$MICROVM_IMAGE" --cpus 1 --mem-mib 512 --ttl-s 60 --json
+capture_cli "$ATTACKER_TOKEN" create --image "$MICROVM_IMAGE" --image-digest "$IMAGE_DIGEST" --cpus 1 --mem-mib 512 --ttl-s 60 --json
 expect_error "sandbox credential cannot create VMs" 2 Forbidden
 
 capture_cli "$ATTACKER_TOKEN" cleanup --json

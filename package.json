@@ -1,6 +1,6 @@
 {
   "name": "microvm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Effect v4 Firecracker microVM runtime: authenticated RPC cluster daemons, jailed sandboxed Linux VMs, Vercel AI SDK sandbox tools",
   "private": true,
   "type": "module",

@@ -1,31 +1,28 @@
 import { Effect, Result, Schema, Scope } from "effect"
-import { RpcClientError } from "effect/unstable/rpc"
-import { makeMicrovmClient, type MicrovmClient } from "./client.js"
-import { secureOrigin } from "./endpoint.js"
-import { makeSandboxHttpProxy, type SandboxHttpProxy } from "./http-proxy.js"
+import type { RpcClientError } from "effect/unstable/rpc"
 import {
-  BootFailed,
+  makeMicrovmClient,
+  type MicrovmClient,
+  type SandboxCreateError,
+  type SandboxCreateInput,
+  type SandboxDestroyError,
+  type SandboxExecuteError,
+  type SandboxExecuteInput,
+  type SandboxHandle,
+  type SandboxInspectError
+} from "./client.js"
+import { secureOrigin } from "./endpoint.js"
+import {
   CapacityExceeded,
-  ClusterServiceError,
-  DestroyUncertain,
-  Forbidden,
-  GuestExecError,
-  HostPrereqFailed,
-  HttpNotConfigured,
-  ImageNotAllowed,
-  Unauthenticated,
   VmNotFound,
-  VmPoisoned,
   type DestroyResult,
   type ExecResult,
+  type Forbidden,
+  type Unauthenticated,
   type VmId,
-  type VmInfo,
-  type CreateRequest,
-  type ExecuteRequest,
-  type StartWebServiceRpcRequest,
-  type StopWebServiceResult,
-  type WebServiceStatus
+  type VmInfo
 } from "./protocol.js"
+import { bindSandboxHandle, createWireRequest, executeWireRequest } from "./sandbox-binding.js"
 
 export interface ClusterEndpoint {
   /** Operator-configured daemon origin. Response metadata never replaces it. */
@@ -56,96 +53,15 @@ interface EndpointRuntime {
 }
 
 export type ClusterCreateError =
-  | BootFailed | CapacityExceeded | Forbidden | HostPrereqFailed | ImageNotAllowed
-  | Unauthenticated | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
+  | SandboxCreateError | ClusterRoutingError | ClusterEndpointUnavailable
 export type ClusterInspectError =
-  Forbidden | Unauthenticated | VmNotFound | RpcClientError.RpcClientError
-  | ClusterRoutingError | ClusterEndpointUnavailable
+  | SandboxInspectError | ClusterRoutingError | ClusterEndpointUnavailable
 export type ClusterExecuteError =
-  Forbidden | GuestExecError | Unauthenticated | VmNotFound | VmPoisoned | CapacityExceeded
-  | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
+  | SandboxExecuteError | ClusterRoutingError | ClusterEndpointUnavailable
 export type ClusterDestroyError =
-  DestroyUncertain | Forbidden | Unauthenticated | VmNotFound
-  | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
+  | SandboxDestroyError | ClusterRoutingError | ClusterEndpointUnavailable
 export type ClusterListError =
   Forbidden | Unauthenticated | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
-export type ClusterServiceOperationError =
-  | ClusterServiceError | Forbidden | Unauthenticated | VmNotFound | VmPoisoned
-  | RpcClientError.RpcClientError
-
-/**
- * Public request inputs for the cluster convenience API. These are the shapes a
- * plain-JavaScript consumer builds, so every property beyond the required core
- * is optional: the cluster normalizes the keys the RPC payload declares as
- * required-with-`undefined` before the wire schema sees them.
- */
-export interface SandboxCreateInput {
-  readonly image: string
-  readonly cpus?: number | undefined
-  readonly memMib?: number | undefined
-  readonly ttlSeconds?: number | undefined
-}
-
-export interface SandboxExecuteInput {
-  /** Executed directly, with no shell; `argv[0]` is an absolute guest path. */
-  readonly argv: ReadonlyArray<string>
-  readonly cwd?: string | undefined
-  readonly env?: Readonly<Record<string, string>> | undefined
-  readonly timeoutMs?: number | undefined
-  readonly maxOutputBytes?: number | undefined
-}
-
-export interface SandboxStartWebServiceInput {
-  readonly argv: ReadonlyArray<string>
-  readonly cwd?: string | undefined
-  readonly env?: Readonly<Record<string, string>> | undefined
-}
-
-const createWireRequest = (input: SandboxCreateInput): CreateRequest => ({
-  image: input.image,
-  cpus: input.cpus,
-  memMib: input.memMib,
-  ttlSeconds: input.ttlSeconds
-})
-
-const executeWireRequest = (input: SandboxExecuteInput, vmId: VmId): ExecuteRequest => ({
-  vmId,
-  argv: input.argv,
-  cwd: input.cwd,
-  env: input.env,
-  timeoutMs: input.timeoutMs,
-  maxOutputBytes: input.maxOutputBytes
-})
-
-const startWebServiceWireRequest = (
-  input: SandboxStartWebServiceInput,
-  vmId: VmId
-): StartWebServiceRpcRequest => ({
-  vmId,
-  argv: input.argv,
-  cwd: input.cwd,
-  env: input.env
-})
-
-export interface WebServiceHandle {
-  readonly status: () => Effect.Effect<WebServiceStatus, ClusterServiceOperationError>
-  readonly stop: () => Effect.Effect<StopWebServiceResult, ClusterServiceOperationError>
-}
-
-export interface SandboxHandle {
-  readonly vm: VmInfo
-  /** Sandbox-scoped client closed over the selected configured daemon. */
-  readonly client: MicrovmClient
-  /** Binds the image's immutable `web` endpoint; callers cannot select a target. */
-  readonly http: () => Effect.Effect<SandboxHttpProxy, HttpNotConfigured>
-  /** Starts the single durable `web` service while ordinary execute remains available. */
-  readonly startWebService: (
-    request: SandboxStartWebServiceInput
-  ) => Effect.Effect<WebServiceHandle, ClusterServiceOperationError>
-  readonly execute: (request: SandboxExecuteInput) => Effect.Effect<ExecResult, ClusterExecuteError>
-  readonly inspect: () => Effect.Effect<VmInfo, ClusterInspectError>
-  readonly destroy: () => Effect.Effect<DestroyResult, ClusterDestroyError>
-}
 
 export interface MicrovmCluster {
   readonly create: (request: SandboxCreateInput) => Effect.Effect<SandboxHandle, ClusterCreateError | ClusterListError>
@@ -159,24 +75,6 @@ export interface MicrovmCluster {
 
 const isCapacityExceeded = (error: unknown): error is CapacityExceeded =>
   error instanceof CapacityExceeded
-
-const serviceError = (vmId: VmId, error: unknown): ClusterServiceOperationError => {
-  if (
-    error instanceof ClusterServiceError ||
-    error instanceof Forbidden ||
-    error instanceof Unauthenticated ||
-    error instanceof VmNotFound ||
-    error instanceof VmPoisoned ||
-    error instanceof RpcClientError.RpcClientError
-  ) {
-    return error
-  }
-  return new ClusterServiceError({
-    vmId,
-    code: "INTERNAL",
-    message: "web service control request failed"
-  })
-}
 
 /**
  * Acquires a client for a static daemon set. Placement health checks are safe
@@ -264,87 +162,66 @@ export const makeMicrovmCluster = (
     const create = (
       request: SandboxCreateInput
     ): Effect.Effect<SandboxHandle, ClusterCreateError | ClusterListError> =>
-      Effect.gen(function*() {
-        const wireRequest = createWireRequest(request)
-        const health = yield* poll()
-        const available = health.filter((entry) => Result.isSuccess(entry.result))
-        if (available.length === 0) {
-          const first = health[0]
-          if (first !== undefined && Result.isFailure(first.result)) return yield* Effect.fail(first.result.failure)
-          return yield* Effect.fail(new ClusterRoutingError({ reason: "no cluster endpoint is available" }))
-        }
-        available.sort((left, right) => {
-          const leftCount = Result.isSuccess(left.result) ? left.result.success.vms.length : Number.MAX_SAFE_INTEGER
-          const rightCount = Result.isSuccess(right.result) ? right.result.success.vms.length : Number.MAX_SAFE_INTEGER
-          if (leftCount !== rightCount) return leftCount - rightCount
-          const leftTurn = (left.index - placementCursor + runtimes.length) % runtimes.length
-          const rightTurn = (right.index - placementCursor + runtimes.length) % runtimes.length
-          return leftTurn - rightTurn
-        })
-        let capacityFailure: CapacityExceeded | undefined
-        for (const candidate of available) {
-          const result = yield* Effect.result(candidate.endpoint.client.create(wireRequest))
-          if (Result.isFailure(result)) {
-            if (isCapacityExceeded(result.failure)) {
-              capacityFailure = result.failure
-              continue
+      Effect.uninterruptibleMask((restore) => {
+        const selected = Effect.gen(function*() {
+          const wireRequest = createWireRequest(request)
+          const health = yield* restore(poll())
+          const available = health.filter((entry) => Result.isSuccess(entry.result))
+          if (available.length === 0) {
+            const first = health[0]
+            if (first !== undefined && Result.isFailure(first.result)) return yield* Effect.fail(first.result.failure)
+            return yield* Effect.fail(new ClusterRoutingError({ reason: "no cluster endpoint is available" }))
+          }
+          available.sort((left, right) => {
+            const leftCount = Result.isSuccess(left.result) ? left.result.success.vms.length : Number.MAX_SAFE_INTEGER
+            const rightCount = Result.isSuccess(right.result) ? right.result.success.vms.length : Number.MAX_SAFE_INTEGER
+            if (leftCount !== rightCount) return leftCount - rightCount
+            const leftTurn = (left.index - placementCursor + runtimes.length) % runtimes.length
+            const rightTurn = (right.index - placementCursor + runtimes.length) % runtimes.length
+            return leftTurn - rightTurn
+          })
+          let capacityFailure: CapacityExceeded | undefined
+          for (const candidate of available) {
+            const result = yield* Effect.result(restore(candidate.endpoint.client.create(wireRequest)))
+            if (Result.isFailure(result)) {
+              if (isCapacityExceeded(result.failure)) {
+                capacityFailure = result.failure
+                continue
+              }
+              return yield* Effect.fail(result.failure)
             }
-            return yield* Effect.fail(result.failure)
+            return {
+              endpoint: candidate.endpoint,
+              index: candidate.index,
+              created: result.success
+            }
           }
-          placementCursor = (candidate.index + 1) % runtimes.length
-          const vmId = result.success.vm.vmId
-          owners.set(vmId, candidate.endpoint)
-          const sandboxClientResult = yield* Effect.result(makeMicrovmClient({
-            url: candidate.endpoint.origin,
-            token: result.success.sandboxToken,
-            ca: candidate.endpoint.ca
-          }).pipe(Effect.provideService(Scope.Scope, clusterScope)))
-          if (Result.isFailure(sandboxClientResult)) {
-            const rollback = yield* Effect.result(candidate.endpoint.client.destroy({ vmId }))
-            owners.delete(vmId)
-            const rollbackDetail = Result.isFailure(rollback)
-              ? `; rollback failed with ${rollback.failure._tag}`
-              : ""
-            return yield* Effect.fail(new ClusterRoutingError({
-              reason: `created VM could not be bound to a sandbox client${rollbackDetail}`
-            }))
-          }
-          const sandboxClient = sandboxClientResult.success
-          const httpProxy = result.success.httpIngressToken === undefined
-            ? undefined
-            : makeSandboxHttpProxy({
-              daemonOrigin: new URL(candidate.endpoint.origin),
-              vmId,
-              httpIngressToken: result.success.httpIngressToken,
-              ca: candidate.endpoint.ca
-            })
-          const webService: WebServiceHandle = {
-            status: () => sandboxClient.webServiceStatus({ vmId }).pipe(
-              Effect.mapError((error) => serviceError(vmId, error))
-            ),
-            stop: () => sandboxClient.stopWebService({ vmId }).pipe(
-              Effect.mapError((error) => serviceError(vmId, error))
+          if (capacityFailure !== undefined) return yield* Effect.fail(capacityFailure)
+          return yield* Effect.fail(new ClusterRoutingError({ reason: "no cluster endpoint accepted create" }))
+        })
+        return selected.pipe(
+          Effect.flatMap(({ endpoint, index, created }) => {
+            placementCursor = (index + 1) % runtimes.length
+            const vmId = created.vm.vmId
+            owners.set(vmId, endpoint)
+            return bindSandboxHandle({
+              adminClient: endpoint.client,
+              makeSandboxClient: (token) => makeMicrovmClient({
+                url: endpoint.origin,
+                token,
+                ca: endpoint.ca
+              }).pipe(Effect.provideService(Scope.Scope, clusterScope)),
+              created,
+              origin: endpoint.origin,
+              ca: endpoint.ca
+            }).pipe(
+              Effect.catchCause((cause) => {
+                owners.delete(vmId)
+                return Effect.failCause(cause)
+              })
             )
-          }
-          return {
-            vm: result.success.vm,
-            client: sandboxClient,
-            execute: (input) => sandboxClient.execute(executeWireRequest(input, vmId)),
-            http: () => httpProxy === undefined
-              ? Effect.fail(new HttpNotConfigured({ vmId }))
-              : Effect.succeed(httpProxy),
-            startWebService: (input) => sandboxClient
-              .startWebService(startWebServiceWireRequest(input, vmId))
-              .pipe(
-                Effect.mapError((error) => serviceError(vmId, error)),
-                Effect.map(() => webService)
-              ),
-            inspect: () => sandboxClient.inspect({ vmId }),
-            destroy: () => sandboxClient.destroy({ vmId })
-          }
-        }
-        if (capacityFailure !== undefined) return yield* Effect.fail(capacityFailure)
-        return yield* Effect.fail(new ClusterRoutingError({ reason: "no cluster endpoint accepted create" }))
+          })
+        )
       })
 
     const inspect = (

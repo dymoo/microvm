@@ -1,4 +1,5 @@
 import { createServer } from "node:http"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -19,6 +20,8 @@ import {
 import { HostPrereqs } from "../src/host.js"
 
 const adminToken = "admin-token-for-ai-integration"
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
 const usage = {
   inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
   outputTokens: { total: 1, text: 1, reasoning: undefined }
@@ -168,13 +171,14 @@ describe("Vercel AI SDK sandbox tools", () => {
     await mkdir(join(root, "run"), { recursive: true })
     await mkdir(workspace)
     await writeFile(join(root, "vmlinux"), "test")
-    await writeFile(join(root, "images", "node.raw"), "test")
+    await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
     await writeFile(join(root, "images", "node.json"), JSON.stringify({
       name: "node",
       file: "node.raw",
       arch: process.arch === "arm64" ? "aarch64" : "x86_64",
       sizeBytes: 4,
-      rootDevice: "/dev/vda"
+      rootDevice: "/dev/vda",
+      imageDigest: fixtureImageDigest
     }))
     try {
       await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
@@ -182,7 +186,7 @@ describe("Vercel AI SDK sandbox tools", () => {
         const firecracker = Layer.succeed(Firecracker, Firecracker.of({
           boot: (spec) => Effect.promise(async () => {
             await mkdir(spec.layout.vmDir, { recursive: true })
-            return { pid: 49, stop: () => Effect.void, exited: Effect.never }
+            return { pid: 49, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
           })
         }))
         const guest = Layer.succeed(GuestExecChannel, GuestExecChannel.of({
@@ -204,7 +208,7 @@ describe("Vercel AI SDK sandbox tools", () => {
         )
         const url = `http://127.0.0.1:${yield* waitForListener(server)}`
         const admin = yield* makeMicrovmClient({ url, token: adminToken })
-        const created = yield* admin.create({ image: "node", cpus: undefined, memMib: undefined, ttlSeconds: undefined })
+        const created = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
         const sandbox = yield* makeMicrovmClient({ url, token: created.sandboxToken })
         const tools = createSandboxTools({ client: sandbox, vmId: created.vm.vmId, workdir: "/workspace" })
 

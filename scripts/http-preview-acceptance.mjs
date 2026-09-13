@@ -64,9 +64,14 @@ process.once("unhandledRejection", (error) => exitWithPendingOperation("unhandle
 const daemonUrl = process.env.MICROVM_URL
 const adminToken = process.env.MICROVM_TOKEN
 const image = process.env.MICROVM_IMAGE ?? "node"
+const imageDigest = process.env.MICROVM_IMAGE_DIGEST ?? ""
 if (!daemonUrl || !adminToken) {
   throw new Error("MICROVM_URL and MICROVM_TOKEN are required")
 }
+if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) {
+  throw new Error("MICROVM_IMAGE_DIGEST must be sha256:<64 lowercase hex> from the image manifest")
+}
+const createInput = (cpus, memMib, ttlSeconds) => ({ image, imageDigest, cpus, memMib, ttlSeconds })
 
 const assert = (condition, message) => {
   if (!condition) throw new Error(message)
@@ -267,7 +272,7 @@ const program = Effect.scoped(Effect.gen(function*() {
 
   const next = yield* boundedRpc(
     "cluster create (next preview)",
-    cluster.create({ image, cpus: 1, memMib: 768, ttlSeconds: 900 }),
+    cluster.create(createInput(2, 2048, 900)),
     DEADLINES.rpcCreateMs
   )
   const nextCleanup = yield* armVmCleanup("Next VM", () => next.destroy())
@@ -346,7 +351,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   step("Next preview phase completed")
   const protocol = yield* boundedRpc(
     "cluster create (protocol service)",
-    cluster.create({ image, cpus: 1, memMib: 512, ttlSeconds: 900 }),
+    cluster.create(createInput(1, 512, 900)),
     DEADLINES.rpcCreateMs
   )
   const protocolCleanup = yield* armVmCleanup("protocol VM", () => protocol.destroy())
@@ -385,7 +390,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   operationStarted("token donor creation")
   const tokenDonor = yield* boundedRpc(
     currentOperation,
-    adminClient.create({ image, cpus: 1, memMib: 256, ttlSeconds: 300 }),
+    adminClient.create(createInput(1, 256, 300)),
     DEADLINES.rpcCreateMs
   )
   const donorCleanup = yield* armVmCleanup("token donor VM", () =>

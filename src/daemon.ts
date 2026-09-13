@@ -20,7 +20,7 @@ import { randomBytes } from "node:crypto"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { existsSync } from "node:fs"
 import { mkdir, readFile, readdir, rmdir, writeFile } from "node:fs/promises"
-import { createServer as createHttpServer, type Server as NodeServer } from "node:http"
+import { createServer as createHttpServer, type IncomingMessage, type Server as NodeServer, type ServerResponse } from "node:http"
 import { createServer as createHttpsServer } from "node:https"
 import type { Socket } from "node:net"
 import { join } from "node:path"
@@ -321,9 +321,44 @@ const LOCK_HELPER_SCRIPT =
   "process.stdout.write('READY\\n'); process.stdin.resume(); process.stdin.once('end', () => process.exit(0))"
 
 const MAX_RPC_BODY_BYTES = 1_048_576
+const MAX_HTTP_HEADER_COUNT = 64
 const MAX_HTTP_HEADER_BYTES = 16_384
 const HTTP_HEADERS_TIMEOUT_MS = 5_000
 const HTTP_REQUEST_TIMEOUT_MS = 30_000
+
+const HTTP_ADMISSION_REJECT_BODY = Buffer.from("Bad Request\n", "utf8")
+
+const incomingHeaderOverflow = (request: IncomingMessage): boolean => {
+  const raw = request.rawHeaders
+  if (raw.length > MAX_HTTP_HEADER_COUNT * 2 || raw.length % 2 !== 0) return true
+  let bytes = 0
+  for (let index = 0; index < raw.length; index += 2) {
+    bytes += Buffer.byteLength(raw[index]!, "latin1") + Buffer.byteLength(raw[index + 1]!, "latin1") + 4
+    if (bytes > MAX_HTTP_HEADER_BYTES) return true
+  }
+  return false
+}
+
+const rejectRequestAdmission = (request: IncomingMessage, response: ServerResponse): void => {
+  request.resume()
+  if (response.headersSent || response.writableEnded) return
+  response.writeHead(400, {
+    "cache-control": "no-store",
+    connection: "close",
+    "content-type": "text/plain; charset=utf-8",
+    "content-length": HTTP_ADMISSION_REJECT_BODY.byteLength
+  })
+  response.end(HTTP_ADMISSION_REJECT_BODY)
+}
+
+const rejectSocketAdmission = (socket: Duplex): void => {
+  if (socket.destroyed) return
+  socket.end(
+    `HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\n` +
+      `Content-Type: text/plain; charset=utf-8\r\nContent-Length: ${HTTP_ADMISSION_REJECT_BODY.byteLength}\r\n\r\n` +
+      HTTP_ADMISSION_REJECT_BODY.toString("utf8")
+  )
+}
 
 const killLockProcessGroup = (child: ChildProcessWithoutNullStreams): void => {
   if (child.pid === undefined) return
@@ -797,6 +832,10 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
 
     const createAuthorized = (request: CreateRequest) =>
       Effect.gen(function*() {
+        const image = yield* images.resolve(request.image, request.imageDigest)
+        if (image.manifest.arch !== capabilities.arch) {
+          return yield* Effect.fail(new ImageNotAllowed({ image: request.image }))
+        }
         const hasCapacity = yield* capacity.takeIfAvailable(1)
         if (!hasCapacity) {
           return yield* Effect.fail(new CapacityExceeded({ message: "maximum running VM capacity reached" }))
@@ -833,10 +872,6 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         })
 
         return yield* Effect.gen(function*() {
-          const image = yield* images.resolve(request.image)
-          if (image.manifest.arch !== capabilities.arch) {
-            return yield* Effect.fail(new ImageNotAllowed({ image: request.image }))
-          }
           vmId = yield* allocateVmId
           allocation = yield* Effect.try({
             try: () => {
@@ -889,6 +924,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
           yield* saveVmState(layout.statePath, {
             vmId,
             image: request.image,
+            imageDigest: handle.imageDigest,
             cpus,
             memMib,
             guestCid: allocation.cid,
@@ -901,6 +937,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             owningHost: secureOrigin(config.advertisedUrl).origin,
             state: "running",
             image: request.image,
+            imageDigest: handle.imageDigest,
             cpus,
             memMib,
             createdAtEpochMs,
@@ -1300,7 +1337,10 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
       ca: config.tls.ca,
       maxHeaderSize: MAX_HTTP_HEADER_BYTES
     }))
-  nodeServer.maxHeadersCount = 64
+  // Node 24 silently truncates at maxHeadersCount instead of rejecting. Keep one
+  // extra pair so admission can fail closed on overflow without collecting an
+  // unbounded header list. Node 26+ reports the same overflow via clientError.
+  nodeServer.maxHeadersCount = MAX_HTTP_HEADER_COUNT + 1
   nodeServer.headersTimeout = HTTP_HEADERS_TIMEOUT_MS
   nodeServer.requestTimeout = HTTP_REQUEST_TIMEOUT_MS
 
@@ -1347,6 +1387,10 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
           request: Parameters<typeof rpcHandler>[0],
           response: Parameters<typeof rpcHandler>[1]
         ): void => {
+          if (incomingHeaderOverflow(request)) {
+            rejectRequestAdmission(request, response)
+            return
+          }
           if (proxy.isIngressTarget(request.url)) proxy.handleRequest(request, response)
           else rpcHandler(request, response)
         }
@@ -1361,22 +1405,29 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
         }
         const upgradeHandler: typeof proxy.handleUpgrade = (request, socket, head) => {
           trackDetached(socket)
+          if (incomingHeaderOverflow(request)) {
+            rejectSocketAdmission(socket)
+            return
+          }
           proxy.handleUpgrade(request, socket, head)
         }
         const connectHandler: typeof proxy.handleConnect = (request, socket, head) => {
           trackDetached(socket)
+          if (incomingHeaderOverflow(request)) {
+            rejectSocketAdmission(socket)
+            return
+          }
           proxy.handleConnect(request, socket, head)
         }
-        const checkContinueHandler: typeof proxy.handleCheckContinue = (request, response) =>
+        const checkContinueHandler: typeof proxy.handleCheckContinue = (request, response) => {
+          if (incomingHeaderOverflow(request)) {
+            rejectRequestAdmission(request, response)
+            return
+          }
           proxy.handleCheckContinue(request, response)
+        }
         const clientErrorHandler = (_cause: Error, socket: Socket): void => {
-          if (socket.destroyed) return
-          const body = Buffer.from("Bad Request\n", "utf8")
-          socket.end(
-            `HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\n` +
-              `Content-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.byteLength}\r\n\r\n` +
-              body.toString("utf8")
-          )
+          rejectSocketAdmission(socket)
         }
         nodeServer.on("request", requestHandler)
         nodeServer.on("upgrade", upgradeHandler)

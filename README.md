@@ -43,22 +43,31 @@ sudo scripts/build-guest-image.sh \
 ```
 
 The builder emits `node.raw`, `node.kernel`, `node.json`, and `node.sha256`; do
-not create a second manifest manually. It verifies Debian snapshot metadata,
-the pinned official Node.js checksum, pnpm **11.13.1**'s official npm
-`dist.integrity`, the template lockfile, and the supplied kernel digest. The
-image contains Git from the pinned Debian snapshot, an operator-owned Next.js
-template, its ready `node_modules`, and a private writable pnpm store and cache.
-The lockfile is supply-chain verified once by the build's resolver-enabled
-fetch; the shipped template then installs strictly offline. In a new VM, run
-`microvm-next-init` once in the empty `/workspace`, then `pnpm dev`; the app
-binds only `127.0.0.1:3000`. Neither command downloads packages.
+not create a second manifest manually. After the final raw writes it hashes
+those bytes, writes `imageDigest` (`sha256:` plus 64 lowercase hex) into
+`node.json`, and reuses that digest for the raw sidecar entry. Kernel
+checksums stay separate trusted operator input; they are not folded into
+`imageDigest`. `--print-manifest` reprints a manifest only when you pass that
+already-measured `--image-digest`; it never invents a placeholder. Create
+callers must supply the same digest from the operator-held manifest — never a
+made-up hash.
 
-Before destroying a VM, Git can create a coherent guest-local checkpoint:
-configure a non-secret local author, `git add --all`, commit, require a clean
-status, and record `git rev-parse HEAD`. That commit remains ephemeral with the
-private VM disk until a trusted external export verifies and persists it; that
-export is not implemented here. The guest has no remote, Git credentials, NIC,
-DNS, or push path.
+It verifies Debian snapshot metadata, the pinned official Node.js checksum,
+pnpm **11.13.1**'s official npm `dist.integrity`, the template lockfile, and
+the supplied kernel digest. The image contains Git from the pinned Debian
+snapshot, an operator-owned Next.js template, its ready `node_modules`, and a
+private writable pnpm store and cache. The lockfile is supply-chain verified
+once by the build's resolver-enabled fetch; the shipped template then installs
+strictly offline. In a new VM, run `microvm-next-init` once in the empty
+`/workspace`, then `pnpm dev`; the app binds only `127.0.0.1:3000`. Neither
+command downloads packages.
+
+A guest-local Git commit is optional and ephemeral with the private VM disk.
+Configure a non-secret local author, `git add --all`, commit, require a clean
+status, and record `git rev-parse HEAD` if you need a coherent local revision
+for inspection. The guest has no remote, Git credentials, NIC, DNS, or push
+path. This repository does not export that commit and does not block destroy
+on it.
 
 ## Hosted acceptance
 
@@ -144,8 +153,9 @@ See [operations](docs/operations.md) for deployment and failure semantics.
 ```sh
 export MICROVM_URL=http://127.0.0.1:9443
 export MICROVM_TOKEN="$MICROVM_ADMIN_TOKEN"
+export MICROVM_IMAGE_DIGEST='sha256:<64 lowercase hex from the image manifest>'
 
-microvm create --image node --cpus 1 --mem-mib 256 --ttl-s 300 --json
+microvm create --image node --image-digest "$MICROVM_IMAGE_DIGEST" --cpus 1 --mem-mib 256 --ttl-s 300 --json
 microvm status --vm mvm-example --json
 microvm exec --vm mvm-example --cwd /workspace -- /usr/bin/node --version
 microvm list --json
@@ -153,12 +163,70 @@ microvm destroy --vm mvm-example --json
 microvm cleanup --json
 ```
 
-`create` returns a sandbox token only in its response. Store it as a secret; it
-can be reused only for that VM and is revoked on destroy. Admin credentials
-are required for create and cleanup. Commands are argv arrays executed
-directly; no shell is inserted.
+`create` requires `--image-digest` matching the allowlisted image manifest.
+Omitting it fails before any network call with a usage error. It returns a
+sandbox token only in its response. Store it as a secret; it can be reused
+only for that VM and is revoked on destroy. Admin credentials are required
+for create and cleanup. Commands are argv arrays executed directly; no shell
+is inserted. `list` and `cleanup` are admin RPC commands, not part of the
+single-daemon `makeMicrovm` convenience client.
 
 ## TypeScript client
+
+The primary public constructor is `makeMicrovm({ url, token, ca? })`. It
+acquires a single-daemon convenience client. `create` is exactly one RPC to
+the configured secure origin: no health, list, placement, failover, or retry,
+including `CapacityExceeded`. The surrounding `Scope` owns the admin and
+sandbox RPC clients. Closing that scope ends those transports; it does not
+destroy the remote VM and does not revoke independently request-owned HTTP
+ingress. Explicit `destroy` or the daemon TTL owns VM and ingress revocation.
+
+`image` and `imageDigest` are required. `imageDigest` is the exact raw rootfs
+bytes before boot (`sha256:` and 64 lowercase hex) copied from the operator
+image manifest. Optional `cpus`, `memMib`, and `ttlSeconds` may be omitted;
+the client normalizes required-with-`undefined` wire keys.
+
+```ts
+import { Effect } from "effect"
+import { makeMicrovm } from "microvm"
+
+const program = Effect.scoped(Effect.gen(function* () {
+  const microvm = yield* makeMicrovm({
+    url: "https://host-a.example:9443",
+    token: process.env.MICROVM_TOKEN!
+  })
+  const sandbox = yield* microvm.create({
+    image: "node",
+    imageDigest: process.env.MICROVM_IMAGE_DIGEST!,
+    cpus: 1,
+    memMib: 256,
+    ttlSeconds: 300
+  })
+  return yield* sandbox.execute({
+    argv: ["/usr/bin/node", "--version"],
+    cwd: "/workspace"
+  })
+}))
+
+await Effect.runPromise(program)
+```
+
+A successful `create` returns a `SandboxHandle` with `vm`, `client`,
+`execute`, `inspect`, `destroy`, `http`, and `startWebService`. `inspect`
+returns `VmInfo` whose `imageDigest` is the digest measured from the private
+rootfs copy before boot, not an echo of the request.
+
+If create succeeds enough to name a `vmId` but binding the sandbox client
+fails or is cancelled before the handle is delivered, the constructor attempts
+exactly one admin `destroy`. The typed `SandboxBindingError` preserves that
+`vmId`, the binding failure, and an optional `cleanup` cause when rollback
+itself is uncertain. Do not treat the VM as absent while cleanup is missing
+or failed. An ambiguous create with no usable reply cannot invent an id and
+is not retried.
+
+`makeMicrovmClient` remains a distinct supported RPC interface to one daemon
+(the same shape the CLI uses). It does not bind a handle, start HTTP, or own
+remote VM lifetime:
 
 ```ts
 import { Effect } from "effect"
@@ -170,7 +238,11 @@ const program = Effect.scoped(Effect.gen(function* () {
     token: process.env.MICROVM_TOKEN!
   })
   const created = yield* client.create({
-    image: "node", cpus: 1, memMib: 256, ttlSeconds: 300
+    image: "node",
+    imageDigest: process.env.MICROVM_IMAGE_DIGEST!,
+    cpus: 1,
+    memMib: 256,
+    ttlSeconds: 300
   })
   return created
 }))
@@ -183,8 +255,11 @@ silently reroute to the `owningHost` supplied in a response.
 
 ## Static cluster client
 
-`makeMicrovmCluster` polls a configured daemon set with bounded health checks,
-places on a responsive host, and retries only an explicit capacity rejection:
+`makeMicrovmCluster` remains supported for a static multi-daemon set. It polls
+configured endpoints with bounded health checks, places on a responsive host,
+and retries create only after an explicit `CapacityExceeded` response.
+Transport and boot failures return immediately. A single-daemon integration
+should use `makeMicrovm` instead.
 
 ```ts
 import { Effect } from "effect"
@@ -199,7 +274,11 @@ const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     healthTimeoutMs: 2000
   })
   const sandbox = yield* cluster.create({
-    image: "node", cpus: 1, memMib: 256, ttlSeconds: 300
+    image: "node",
+    imageDigest: process.env.MICROVM_IMAGE_DIGEST!,
+    cpus: 1,
+    memMib: 256,
+    ttlSeconds: 300
   })
   return yield* sandbox.execute({
     argv: ["/usr/bin/node", "--version"],
@@ -211,38 +290,47 @@ const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
 })))
 ```
 
-## HTTP preview and durable web service (current `main` source)
+## HTTP preview and durable web service
 
 These APIs are **not in the immutable `v0.1.0` release**. The published
 `microvm-0.1.0-*.tgz` asset contains the typed RPC client, cluster placement,
 and AI tools, but no `SandboxHandle.http()`, `startWebService`, or guest HTTP
-bridge. The example below is a source-revision contract on `main`; treat it as
-unreleased until a later tag contains it.
+bridge. Current source exposes them on the public handle returned by
+`makeMicrovm` and `makeMicrovmCluster`. This document does not claim a later
+package publication or Linux/KVM qualification of the current tree.
 
 `sandbox.http()` binds the VM's ingress capability to the image's immutable
 `web` endpoint. No caller supplies a socket path, guest host, or guest TCP
 port, and an image without `httpEndpoints.web.port` fails with
-`HttpNotConfigured` before any guest I/O. `startWebService` runs one durable
-service per VM with direct argv execution; a second start is refused, and the
-service outlives the control connection that started it.
+`HttpNotConfigured` before any guest I/O. `startWebService` starts the single
+unnamed durable `web` service. Public input is `argv` plus optional `cwd` and
+`env`; there is no process name, readiness probe, source-revision, arbitrary
+target, or signal field. The image manifest fixes the guest port. Caller
+`HOSTNAME` and `PORT` entries are rejected; the guest injects
+`HOSTNAME=127.0.0.1` and the manifest port. A second start is refused. The
+service outlives the control connection that started it. Ordinary `execute`
+remains available.
 
 ```ts
 import { Effect } from "effect"
 import { createServer, type Server } from "node:http"
 import type { Socket } from "node:net"
-import { makeMicrovmCluster } from "microvm"
+import { makeMicrovm } from "microvm"
 
 const program = Effect.scoped(Effect.gen(function* () {
-  const cluster = yield* makeMicrovmCluster({
-    endpoints: [
-      { url: "https://host-a.example:9443", token: process.env.HOST_A_TOKEN! }
-    ]
+  const microvm = yield* makeMicrovm({
+    url: "https://host-a.example:9443",
+    token: process.env.MICROVM_TOKEN!
   })
-  const sandbox = yield* cluster.create({
-    image: "node", cpus: 1, memMib: 512, ttlSeconds: 900
+  const sandbox = yield* microvm.create({
+    image: "node",
+    imageDigest: process.env.MICROVM_IMAGE_DIGEST!,
+    cpus: 1,
+    memMib: 512,
+    ttlSeconds: 900
   })
 
-  // One durable service per VM; argv runs directly, with no shell.
+  // One unnamed durable service per VM; argv runs directly, with no shell.
   const service = yield* sandbox.startWebService({
     argv: ["/usr/local/bin/pnpm", "dev"],
     cwd: "/workspace"
@@ -291,10 +379,9 @@ const program = Effect.scoped(Effect.gen(function* () {
     })
   )
 
-  // Destroy is the caller's explicit step, and this example destroys only when
-  // no checkpoint is unexported: a guest-local commit stays ephemeral until a
-  // trusted external export verifies it. Leaving the scope closes the
-  // listener, its sockets, and the scoped clients; it never destroys the VM.
+  // Destroy is the caller's explicit step. Leaving the scope closes the
+  // listener, its sockets, and the scoped RPC clients; it never destroys the
+  // VM and does not revoke independently request-owned HTTP ingress.
   yield* service.stop()
   return yield* sandbox.destroy()
 }))
@@ -311,15 +398,19 @@ For model-bound `run_command`, `read_file`, and `write_file` tools using
 
 ## Trust boundaries
 
-- RPC callers select an allowlisted image name, never host paths or kernel args.
+- RPC callers select an allowlisted image name and its required `imageDigest`,
+  never host paths or kernel args. The daemon hashes the private rootfs copy
+  before boot; `VmInfo.imageDigest` is that measured digest.
 - Every VM receives a private root disk copy and no network interface.
 - Guest I/O is vsock-only; exec has bounded time, frame size, chunk count, and
   per-stream output.
 - HTTP ingress is capability-scoped to one VM and can dial only that image's
   fixed manifest target; callers never receive a guest socket or choose a
-  target.
+  target. Scope closure of the RPC clients does not revoke that ingress.
 - Transport uncertainty poisons the VM. Destroy stops the VMM promptly and
-  queued execs re-check liveness before reaching the guest.
+  queued execs re-check liveness before reaching the guest. Destroy is
+  explicit; a failed bind after a named `vmId` attempts one rollback and
+  surfaces `SandboxBindingError` when cleanup is uncertain.
 - Failed cleanup retains capacity, UID/GID, CID, and VM-ID reservations in
   quarantine until cleanup is proven complete.
 - AI tools close over a sandbox-scoped client and VM ID; model input cannot

@@ -20,7 +20,7 @@ Usage: scripts/accept-guest-linux.sh --vsock-uds /path/to/v.sock [--python /usr/
 Exercises the guest exec v1 protocol through the real vsock of a jailed VM the
 microvm daemon already booted. The caller owns the VM lifecycle:
 
-  id=$(microvm create --image <name> ... --json | jq -r .vmId)
+  id=$(microvm create --image <name> --image-digest sha256:<64hex> ... --json | jq -r .vmId)
   sock="<runStateDir>/vms/$id/jailer/<firecracker-basename>/$id/root/v.sock"
   scripts/accept-guest-linux.sh --vsock-uds "$sock"
   microvm destroy --vm "$id" --json   # cleanup stays with the caller

@@ -6,7 +6,8 @@ const decodeManifest = Schema.decodeUnknownResult(ImageManifest)
 const baseManifest = {
   name: "node",
   file: "node.raw",
-  arch: "aarch64" as const
+  arch: "aarch64" as const,
+  imageDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 }
 
 describe("image HTTP endpoint manifest", () => {

@@ -28,6 +28,8 @@ import {
 import { HostPrereqs } from "../src/host.js"
 
 const adminToken = "daemon-http-ingress-admin-token"
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
 const roots: Array<string> = []
 
 const configFor = (root: string) => new DaemonConfig({
@@ -70,11 +72,12 @@ const prepareFixture = async (): Promise<string> => {
   await mkdir(join(root, "images"), { recursive: true })
   await mkdir(join(root, "run"), { recursive: true })
   await writeFile(join(root, "vmlinux"), "test")
-  await writeFile(join(root, "images", "node.raw"), "test")
+  await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
   await writeFile(join(root, "images", "node.json"), JSON.stringify({
     name: "node",
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
+    imageDigest: fixtureImageDigest,
     httpEndpoints: { web: { port: 3000 } }
   }))
   return root
@@ -173,6 +176,7 @@ const startDaemon = (
         await mkdir(spec.layout.vmDir, { recursive: true })
         return {
           pid: 91,
+          imageDigest: fixtureImageDigest,
           stop: () => Effect.sync(() => {
             stops++
           }),
@@ -227,6 +231,7 @@ const createVm = (port: number) =>
     })
     const created = yield* admin.create({
       image: "node",
+      imageDigest: fixtureImageDigest,
       cpus: undefined,
       memMib: undefined,
       ttlSeconds: undefined

@@ -14,6 +14,7 @@
  * - reservations released without a proven teardown.
  */
 import { createServer, type Server } from "node:http"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -32,8 +33,11 @@ import { HostPrereqs } from "../src/host.js"
 import type { CreateRequest, ExecuteRequest, VmId } from "../src/protocol.js"
 
 const adminToken = "admin-token-for-api-abuse-tests"
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
 const createPayload = {
   image: "node",
+  imageDigest: fixtureImageDigest,
   cpus: undefined,
   memMib: undefined,
   ttlSeconds: undefined
@@ -82,13 +86,14 @@ const fixture = async (): Promise<string> => {
   await mkdir(join(root, "images"), { recursive: true })
   await mkdir(join(root, "run"), { recursive: true })
   await writeFile(join(root, "vmlinux"), "test")
-  await writeFile(join(root, "images", "node.raw"), "test")
+  await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
   await writeFile(join(root, "images", "node.json"), JSON.stringify({
     name: "node",
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
     sizeBytes: 4,
-    rootDevice: "/dev/vda"
+    rootDevice: "/dev/vda",
+    imageDigest: fixtureImageDigest
   }))
   return root
 }
@@ -142,6 +147,7 @@ const startHarness = (root: string, options: HarnessOptions = {}) =>
         await mkdir(spec.layout.vmDir, { recursive: true })
         return {
           pid: 51_000 + boots,
+          imageDigest: fixtureImageDigest,
           stop: () => {
             stops += 1
             return options.stop === undefined ? Effect.void : options.stop(spec.vmId, stops)
@@ -298,12 +304,12 @@ describe("daemon RPC abuse", () => {
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
 
       const invalidCreates: ReadonlyArray<readonly [string, CreateRequest]> = [
-        ["unknown image", { image: "not-on-host", cpus: undefined, memMib: undefined, ttlSeconds: undefined }],
-        ["traversal image", { image: "../images/node", cpus: undefined, memMib: undefined, ttlSeconds: undefined }],
-        ["zero cpus", { image: "node", cpus: 0, memMib: undefined, ttlSeconds: undefined }],
-        ["negative memory", { image: "node", cpus: undefined, memMib: -1, ttlSeconds: undefined }],
-        ["fractional cpus", { image: "node", cpus: 1.5, memMib: undefined, ttlSeconds: undefined }],
-        ["zero ttl", { image: "node", cpus: undefined, memMib: undefined, ttlSeconds: 0 }]
+        ["unknown image", { image: "not-on-host", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined }],
+        ["traversal image", { image: "../images/node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined }],
+        ["zero cpus", { image: "node", imageDigest: fixtureImageDigest, cpus: 0, memMib: undefined, ttlSeconds: undefined }],
+        ["negative memory", { image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: -1, ttlSeconds: undefined }],
+        ["fractional cpus", { image: "node", imageDigest: fixtureImageDigest, cpus: 1.5, memMib: undefined, ttlSeconds: undefined }],
+        ["zero ttl", { image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: 0 }]
       ]
       for (const [label, request] of invalidCreates) {
         // Wire-schema violations may surface as typed failures or client-side
@@ -397,23 +403,25 @@ describe("daemon RPC abuse", () => {
       expect(overCap.body).not.toContain("_tag")
       expect((yield* admin.list({})).vms.length).toBe(2)
 
-      // Header count and header size are bounded at the same boundary: the
-      // body that is answered below yields no RPC envelope when headers flood.
+      // Header count and header size are bounded at the same boundary: a
+      // protocol-valid create must not dispatch when headers overflow.
       const control = yield* post({ "content-type": "application/json" }, "{}")
       expect(control.body).toContain("_tag")
-      const floodHeaders: Record<string, string> = { "content-type": "application/json" }
+      const floodHeaders: Record<string, string> = { ...authHeaders }
       for (let index = 0; index < 100; index++) floodHeaders[`x-flood-${index}`] = "1"
-      const flooded = yield* post(floodHeaders, "{}")
+      const flooded = yield* post(floodHeaders, captured.body)
       expect(flooded.status).toBeGreaterThanOrEqual(400)
       expect(flooded.status).toBeLessThan(500)
       expect(flooded.body).not.toContain("_tag")
+      expect((yield* admin.list({})).vms.length).toBe(2)
       const hugeHeader = yield* post(
-        { "content-type": "application/json", "x-huge": "a".repeat(32_768) },
-        "{}"
+        { ...authHeaders, "x-huge": "a".repeat(32_768) },
+        captured.body
       )
       expect(hugeHeader.status).toBeGreaterThanOrEqual(400)
       expect(hugeHeader.status).toBeLessThan(500)
       expect(hugeHeader.body).not.toContain("_tag")
+      expect((yield* admin.list({})).vms.length).toBe(2)
 
       // Recovery: the daemon still serves a real authenticated RPC end to end.
       const vms = yield* admin.list({})
@@ -461,7 +469,7 @@ describe("daemon RPC abuse", () => {
       const harness = yield* startHarness(root, { maxVms: 2 })
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
 
-      const abusive = yield* admin.create({ image: "node", cpus: 64, memMib: 999_999, ttlSeconds: 999_999 })
+      const abusive = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: 64, memMib: 999_999, ttlSeconds: 999_999 })
       const info = yield* admin.inspect({ vmId: abusive.vm.vmId })
       expect(info.cpus).toBe(2)
       expect(info.memMib).toBe(256)

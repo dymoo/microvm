@@ -10,6 +10,7 @@
  *   cannot create, clean up, list other VMs, or touch another sandbox.
  */
 import { createServer, type Server } from "node:http"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -21,8 +22,11 @@ import { Firecracker, GuestExecChannel } from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
 
 const adminToken = "admin-token-for-cluster-abuse-tests"
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
 const createPayload = {
   image: "node",
+  imageDigest: fixtureImageDigest,
   cpus: undefined,
   memMib: undefined,
   ttlSeconds: undefined
@@ -44,13 +48,14 @@ const fixture = async (): Promise<string> => {
   await mkdir(join(root, "images"), { recursive: true })
   await mkdir(join(root, "run"), { recursive: true })
   await writeFile(join(root, "vmlinux"), "test")
-  await writeFile(join(root, "images", "node.raw"), "test")
+  await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
   await writeFile(join(root, "images", "node.json"), JSON.stringify({
     name: "node",
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
     sizeBytes: 4,
-    rootDevice: "/dev/vda"
+    rootDevice: "/dev/vda",
+    imageDigest: fixtureImageDigest
   }))
   return root
 }
@@ -133,7 +138,7 @@ const startDaemon = (root: string, advertisedUrl: string) =>
       firecracker: Layer.succeed(Firecracker, Firecracker.of({
         boot: (spec) => Effect.promise(async () => {
           await mkdir(spec.layout.vmDir, { recursive: true })
-          return { pid: 53_000, stop: () => Effect.void, exited: Effect.never }
+          return { pid: 53_000, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
         })
       })),
       guestExec: Layer.succeed(GuestExecChannel, GuestExecChannel.of({

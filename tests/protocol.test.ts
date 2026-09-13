@@ -126,6 +126,7 @@ describe("durable web-service wire schemas", () => {
       owningHost: "local",
       state: "running" as const,
       image: "node",
+      imageDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       cpus: 1,
       memMib: 512,
       createdAtEpochMs: 1,

@@ -1,16 +1,17 @@
 import { createServer, type Server } from "node:http"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Deferred, Effect, Fiber, Layer, Result } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
-import { makeMicrovmClient } from "../src/client.js"
 import {
-  makeMicrovmCluster,
+  makeMicrovmClient,
   type SandboxCreateInput,
   type SandboxExecuteInput,
   type SandboxStartWebServiceInput
-} from "../src/cluster.js"
+} from "../src/client.js"
+import { makeMicrovmCluster } from "../src/cluster.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import {
   Firecracker,
@@ -25,7 +26,15 @@ import { MAX_SERVICE_CONTROL_LINE_BYTES } from "../src/protocol.js"
 
 const adminToken = "admin-token-for-cluster-integration"
 const roots: Array<string> = []
-const createPayload = { image: "node", cpus: undefined, memMib: undefined, ttlSeconds: undefined } as const
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
+const createPayload = {
+  image: "node",
+  imageDigest: fixtureImageDigest,
+  cpus: undefined,
+  memMib: undefined,
+  ttlSeconds: undefined
+} as const
 
 const fixture = async (webPort?: number): Promise<string> => {
   const root = await mkdtemp(join(tmpdir(), "microvm-cluster-"))
@@ -33,13 +42,14 @@ const fixture = async (webPort?: number): Promise<string> => {
   await mkdir(join(root, "images"), { recursive: true })
   await mkdir(join(root, "run"), { recursive: true })
   await writeFile(join(root, "vmlinux"), "test")
-  await writeFile(join(root, "images", "node.raw"), "test")
+  await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
   await writeFile(join(root, "images", "node.json"), JSON.stringify({
     name: "node",
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
     sizeBytes: 4,
     rootDevice: "/dev/vda",
+    imageDigest: fixtureImageDigest,
     ...(webPort === undefined ? {} : { httpEndpoints: { web: { port: webPort } } })
   }))
   return root
@@ -99,7 +109,7 @@ const firecrackerLayer = (onBoot?: (server: Server) => void) => (server: Server)
     boot: (spec) => Effect.promise(async () => {
       await mkdir(spec.layout.vmDir, { recursive: true })
       onBoot?.(server)
-      return { pid: 44, stop: () => Effect.void, exited: Effect.never }
+      return { pid: 44, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
     })
   }))
 
@@ -330,7 +340,7 @@ describe("static microVM cluster", () => {
       yield* start(root, 1, server, firecrackerLayer()(server), guestLayer("still-usable"), serviceLayer)
       const url = `http://127.0.0.1:${yield* listeningPort(server)}`
       const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
-      const sandbox = yield* cluster.create({ image: "node" })
+      const sandbox = yield* cluster.create({ image: "node", imageDigest: fixtureImageDigest })
 
       const rejected = yield* Effect.result(sandbox.startWebService({ argv, env }))
       if (Result.isSuccess(rejected)) throw new Error("oversized service wire request must be rejected")
@@ -373,7 +383,7 @@ describe("static microVM cluster", () => {
       // argv-only literals must type-check (enforced by tsconfig.tests.json).
       // Before the cluster normalized omitted keys, the execute RPC payload
       // rejected the object client-side with MissingKey for `cwd`.
-      const createInput: SandboxCreateInput = { image: "node" }
+      const createInput: SandboxCreateInput = { image: "node", imageDigest: fixtureImageDigest }
       const executeInput: SandboxExecuteInput = { argv: ["/marker"] }
       const serviceInput: SandboxStartWebServiceInput = { argv: ["/usr/bin/node", "server.js"] }
 
@@ -409,7 +419,7 @@ describe("static microVM cluster", () => {
       yield* start(root, 1, server, firecrackerLayer()(server), guestLayer("still-usable"), serviceLayer)
       const url = `http://127.0.0.1:${yield* listeningPort(server)}`
       const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
-      const sandbox = yield* cluster.create({ image: "node" })
+      const sandbox = yield* cluster.create({ image: "node", imageDigest: fixtureImageDigest })
       const service = yield* sandbox.startWebService({ argv: ["/usr/bin/node", "server.js"] })
 
       const stopped = yield* Effect.result(service.stop())
@@ -446,7 +456,7 @@ describe("static microVM cluster", () => {
       yield* start(root, 1, server, firecrackerLayer()(server), guestLayer("unused"), faultingService)
       const url = `http://127.0.0.1:${yield* listeningPort(server)}`
       const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
-      const sandbox = yield* cluster.create({ image: "node" })
+      const sandbox = yield* cluster.create({ image: "node", imageDigest: fixtureImageDigest })
 
       const failed = yield* Effect.result(sandbox.startWebService({ argv: ["/usr/bin/node", "server.js"] }))
       expect(Result.isFailure(failed) && failed.failure._tag).toBe("VmPoisoned")
@@ -478,7 +488,7 @@ describe("static microVM cluster", () => {
           boot: (spec) => Effect.promise(async () => {
             availableBoots++
             await mkdir(spec.layout.vmDir, { recursive: true })
-            return { pid: 45, stop: () => Effect.void, exited: Effect.never }
+            return { pid: 45, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
           })
         }))
         yield* start(availableRoot, 2, availableServer, countedFirecracker, guestLayer("available"))
@@ -512,14 +522,14 @@ describe("static microVM cluster", () => {
           ambiguousBoots++
           await mkdir(spec.layout.vmDir, { recursive: true })
           ambiguousServer.closeAllConnections()
-          return { pid: 46, stop: () => Effect.void, exited: Effect.never }
+          return { pid: 46, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
         })
       }))
       const fallbackFirecracker = Layer.succeed(Firecracker, Firecracker.of({
         boot: (spec) => Effect.promise(async () => {
           fallbackBoots++
           await mkdir(spec.layout.vmDir, { recursive: true })
-          return { pid: 47, stop: () => Effect.void, exited: Effect.never }
+          return { pid: 47, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
         })
       }))
       yield* start(ambiguousRoot, 2, ambiguousServer, ambiguousFirecracker, guestLayer("ambiguous"))
@@ -550,6 +560,7 @@ describe("static microVM cluster", () => {
           await mkdir(spec.layout.vmDir, { recursive: true })
           return {
             pid: 48,
+            imageDigest: fixtureImageDigest,
             stop: () => Effect.sync(() => { stops++ }),
             exited: Effect.never
           }

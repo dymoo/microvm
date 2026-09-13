@@ -50,6 +50,12 @@ The per-command cgroup limits do not replace the daemon's VM-wide vCPU, memory, 
 
 Run `scripts/build-guest-image.sh --help` on a native Linux builder. The script refuses macOS, non-root execution, implicit foreign-architecture chroots, a missing kernel, and a kernel whose operator-provided SHA-256 does not match. It supports x86_64 and aarch64 explicitly; the deployment architecture is never inferred from a developer workstation.
 
+After the final raw writes, the builder hashes those bytes and writes
+`imageDigest` (`sha256:` plus 64 lowercase hex) into the image manifest. Create
+and `--print-manifest` require that measured digest from the operator-held
+manifest; the builder never invents a placeholder. Kernel SHA-256 remains
+separate operator input.
+
 The userspace archive is pinned to Debian 13 (Trixie) snapshots [`20260911T202741Z`](https://snapshot.debian.org/archive/debian/20260911T202741Z/) and Debian Security [`20260911T204307Z`](https://snapshot.debian.org/archive/debian-security/20260911T204307Z/). Debian identifies Trixie as its current stable release, and the image uses its maintained Python 3.13 runtime. Debian 13's Node.js 20 package is upstream end-of-life, so the builder instead installs Node.js **24.21.0 LTS** from the [official release archive](https://nodejs.org/dist/v24.21.0/) and verifies the architecture-specific SHA-256 published in Node.js's [`SHASUMS256.txt`](https://nodejs.org/dist/v24.21.0/SHASUMS256.txt). It installs pnpm **11.13.1** from the official npm tarball and verifies npm's published `dist.integrity` SHA-512. `SOURCE_DATE_EPOCH`, filesystem UUID, lazy initialization, file mtimes, and pinned lockfile inputs make builds repeatable; the emitted checksum remains the artifact identity operators promote.
 The [pnpm 11.13.1 registry metadata](https://registry.npmjs.org/pnpm/11.13.1)
 requires Node.js `>=22.13`, so it is compatible with the pinned Node.js 24
@@ -95,13 +101,13 @@ empty target. Because every VM receives a private copy-on-write root disk,
 these writable paths are isolated per VM and are never shared host caches.
 `pnpm dev` binds only `127.0.0.1:3000`.
 
-For a pre-destroy checkpoint, initialize a repository in the materialized
-workspace, configure a non-secret repository-local author, stage and commit,
-require both index and worktree to be clean, and record `git rev-parse HEAD`.
-This proves a coherent guest-local revision only. The commit remains ephemeral
-on the VM's private root disk until a trusted external export verifies and
-persists it; that export is not implemented here. The image supplies no Git
-credentials or remote, and the guest has no NIC, DNS, or push path.
+A guest-local Git commit is optional and ephemeral with the private VM disk.
+Initialize a repository in the materialized workspace, configure a non-secret
+repository-local author, stage and commit, require both index and worktree to
+be clean, and record `git rev-parse HEAD` if you need a coherent local
+revision for inspection. The image supplies no Git credentials or remote, and
+the guest has no NIC, DNS, or push path. This repository does not export that
+commit and does not block destroy on it.
 
 `@free-vibecode/site-sdk@0.2.0` is not published on the public npm registry and
 is deliberately absent. A trusted Free Vibecode project materializer must
@@ -130,8 +136,12 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/microvm-guest ./cmd/microvm
 
 A real VM smoke test is unavailable on macOS because Firecracker requires Linux KVM. Nothing in the portable tests claims KVM success. On a Linux KVM host, boot a VM through the real daemon (the jailer is mandatory; no direct-Firecracker path exists anywhere in this repository), then exercise the protocol against that already-booted jailed VM's vsock:
 
+Set `MICROVM_IMAGE_DIGEST` to the operator-held `imageDigest` from the built
+image manifest (`sha256:` and 64 lowercase hex). Omitting `--image-digest`
+fails before any network call.
+
 ```sh
-id=$(MICROVM_URL=... MICROVM_TOKEN=... microvm create --image node --cpus 1 --mem-mib 512 --ttl-s 900 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["vmId"])')
+id=$(MICROVM_URL=... MICROVM_TOKEN=... microvm create --image node --image-digest "$MICROVM_IMAGE_DIGEST" --cpus 1 --mem-mib 512 --ttl-s 900 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["vmId"])')
 sock="/var/lib/microvm/run/vms/$id/jailer/firecracker/$id/root/v.sock"
 scripts/accept-guest-linux.sh --vsock-uds "$sock"
 MICROVM_URL=... MICROVM_TOKEN=... microvm destroy --vm "$id" --json   # cleanup stays with the caller
@@ -151,7 +161,9 @@ external network, `setsid` descendant cleanup, and concurrent cgroup isolation
 through the real vsock protocol; it boots nothing itself.
 
 For full daemon/client acceptance on the Linux host, set `MICROVM_URL`, an
-admin `MICROVM_TOKEN`, `MICROVM_IMAGE`, the local `MICROVM_RUN_STATE_DIR`, and
+admin `MICROVM_TOKEN`, `MICROVM_IMAGE`, `MICROVM_IMAGE_DIGEST` (`sha256:` and
+64 lowercase hex from the image manifest) or `MICROVM_IMAGE_MANIFEST` pointing
+at the built `node.json`, the local `MICROVM_RUN_STATE_DIR`, and
 `MICROVM_CGROUP_ROOT` to the daemon's jailer cgroup parent directory (below
 `/sys/fs/cgroup`), then run `scripts/accept-linux.sh`. It uses the real client
 and daemon, checks sandbox authorization and process identity, and confirms

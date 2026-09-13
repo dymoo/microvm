@@ -1,4 +1,5 @@
 import { createServer } from "node:http"
+import { createHash } from "node:crypto"
 import { existsSync, watch } from "node:fs"
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -70,8 +71,10 @@ const fixture = async (respondToApi: boolean, bootTimeoutMs = 500) => {
   await mkdir(chrootRoot, { recursive: true })
   await mkdir(cgroupDir)
   await writeFile(firecracker, "fake")
+  const imageBytes = "image"
+  const imageDigest = `sha256:${createHash("sha256").update(imageBytes).digest("hex")}`
   await writeFile(kernel, "kernel")
-  await writeFile(imagePath, "image")
+  await writeFile(imagePath, imageBytes)
   if (respondToApi) {
     await mkdir(chrootBase, { recursive: true })
     await writeFile(join(chrootBase, "respond"), "1")
@@ -117,9 +120,11 @@ while true; do sleep 1; done
       file: "node.raw",
       arch: process.arch === "arm64" ? "aarch64" : "x86_64",
       sizeBytes: undefined,
-      rootDevice: undefined
+      rootDevice: undefined,
+      imageDigest
     }),
-    absolutePath: imagePath
+    absolutePath: imagePath,
+    imageDigest
   }
   return { config, image, layout, pidPath, vmId }
 }
@@ -235,16 +240,19 @@ describe("Firecracker boot transaction", () => {
 })
 
 describe("image allowlist", () => {
+  const rawImageBytes = "raw-image-bytes"
+  const rawImageDigest = `sha256:${createHash("sha256").update(rawImageBytes).digest("hex")}`
+
   const writeImage = async (dir: string, manifest: unknown) => {
     await writeFile(join(dir, "node.json"), JSON.stringify(manifest))
-    await writeFile(join(dir, "node.raw"), "raw-image-bytes")
+    await writeFile(join(dir, "node.raw"), rawImageBytes)
   }
 
-  const resolveNode = (dir: string) =>
+  const resolveNode = (dir: string, expectedDigest = rawImageDigest) =>
     Effect.runPromise(
       Effect.gen(function*() {
         const allowlist = yield* ImageAllowlist
-        return yield* allowlist.resolve("node")
+        return yield* allowlist.resolve("node", expectedDigest)
       }).pipe(Effect.provide(ImageAllowlist.layer(dir)))
     )
 
@@ -252,15 +260,15 @@ describe("image allowlist", () => {
     const dir = await mkdtemp(join(tmpdir(), "mvm-images-"))
     roots.push(dir)
     // Both informational fields omitted: the keys must simply be optional.
-    await writeImage(dir, { name: "node", file: "node.raw", arch: "x86_64" })
+    await writeImage(dir, { name: "node", file: "node.raw", arch: "x86_64", imageDigest: rawImageDigest })
     const image = await resolveNode(dir)
-    expect(await readFile(image.absolutePath, "utf8")).toBe("raw-image-bytes")
+    expect(await readFile(image.absolutePath, "utf8")).toBe(rawImageBytes)
   })
 
   it("rejects a builder manifest whose provided metadata fails validation", async () => {
     const dir = await mkdtemp(join(tmpdir(), "mvm-images-"))
     roots.push(dir)
-    await writeImage(dir, { name: "node", file: "node.raw", arch: "x86_64", sizeBytes: "4 GiB" })
+    await writeImage(dir, { name: "node", file: "node.raw", arch: "x86_64", sizeBytes: "4 GiB", imageDigest: rawImageDigest })
     await expect(resolveNode(dir)).rejects.toBeInstanceOf(ImageNotAllowed)
   })
 })

@@ -1,4 +1,5 @@
 import { createServer } from "node:http"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -10,8 +11,11 @@ import { Firecracker, GuestExecChannel, VmTeardownFault } from "../src/firecrack
 import { HostPrereqs } from "../src/host.js"
 
 const adminToken = "admin-token-for-integration-tests"
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
 const createPayload = {
   image: "node",
+  imageDigest: fixtureImageDigest,
   cpus: undefined,
   memMib: undefined,
   ttlSeconds: undefined
@@ -55,13 +59,14 @@ const prepareFixture = async (root: string): Promise<void> => {
   await mkdir(join(root, "images"), { recursive: true })
   await mkdir(join(root, "run"), { recursive: true })
   await writeFile(join(root, "vmlinux"), "test")
-  await writeFile(join(root, "images", "node.raw"), "test")
+  await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
   await writeFile(join(root, "images", "node.json"), JSON.stringify({
     name: "node",
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
     sizeBytes: 4,
-    rootDevice: "/dev/vda"
+    rootDevice: "/dev/vda",
+    imageDigest: fixtureImageDigest
   }))
 }
 
@@ -100,6 +105,7 @@ describe("daemon RPC integration", () => {
             await mkdir(spec.layout.vmDir, { recursive: true })
             return {
               pid: 42,
+              imageDigest: fixtureImageDigest,
               stop: () => Effect.gen(function*() {
                 stopCalls++
                 yield* Deferred.succeed(stopBlocking, undefined)
@@ -237,6 +243,7 @@ describe("daemon RPC integration", () => {
             await mkdir(spec.layout.statePath)
             return {
               pid: 43,
+              imageDigest: fixtureImageDigest,
               stop: () => Effect.fail(new VmTeardownFault({
                 vmId: spec.vmId,
                 phase: "signal",

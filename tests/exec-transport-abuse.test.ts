@@ -15,6 +15,7 @@
  * AF_UNIX sun_path limit on every platform, including macOS.
  */
 import { createServer, type Server } from "node:http"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { createServer as createUnixServer, type Server as UnixServer, type Socket } from "node:net"
 import { dirname, join } from "node:path"
@@ -27,8 +28,11 @@ import { HostPrereqs, vmLayout } from "../src/host.js"
 import type { ExecuteRequest, VmId } from "../src/protocol.js"
 
 const adminToken = "admin-token-for-transport-abuse-tests"
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
 const createPayload = {
   image: "node",
+  imageDigest: fixtureImageDigest,
   cpus: undefined,
   memMib: undefined,
   ttlSeconds: undefined
@@ -46,13 +50,14 @@ const fixture = async (): Promise<string> => {
   await mkdir(join(root, "images"), { recursive: true })
   await mkdir(join(root, "run"), { recursive: true })
   await writeFile(join(root, "vmlinux"), "test")
-  await writeFile(join(root, "images", "node.raw"), "test")
+  await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
   await writeFile(join(root, "images", "node.json"), JSON.stringify({
     name: "node",
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
     sizeBytes: 4,
-    rootDevice: "/dev/vda"
+    rootDevice: "/dev/vda",
+    imageDigest: fixtureImageDigest
   }))
   return root
 }
@@ -191,7 +196,7 @@ const startDaemon = (root: string) =>
       firecracker: Layer.succeed(Firecracker, Firecracker.of({
         boot: (spec) => Effect.promise(async () => {
           await mkdir(spec.layout.vmDir, { recursive: true })
-          return { pid: 52_000, stop: () => Effect.void, exited: Effect.never }
+          return { pid: 52_000, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
         })
       })),
       guestExec: GuestExecChannelLive,

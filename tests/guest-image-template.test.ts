@@ -110,6 +110,8 @@ describe("Next.js guest image inputs", () => {
     const rendered = spawnSync("bash", [
       imageBuilder,
       "--print-manifest",
+      "--image-digest",
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "--arch",
       process.arch === "arm64" ? "aarch64" : "x86_64",
       "--name",

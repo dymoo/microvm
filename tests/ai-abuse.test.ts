@@ -9,6 +9,7 @@
  * model see a credential or VM id it did not create, fails these tests.
  */
 import { createServer, type Server } from "node:http"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -23,6 +24,8 @@ import { Firecracker, GuestExecChannel } from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
 
 const adminToken = "admin-token-for-ai-abuse-tests"
+const fixtureImageBytes = "test"
+const fixtureImageDigest = `sha256:${createHash("sha256").update(fixtureImageBytes).digest("hex")}`
 const usage = {
   inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
   outputTokens: { total: 1, text: 1, reasoning: undefined }
@@ -71,13 +74,14 @@ const fixture = async (): Promise<string> => {
   await mkdir(join(root, "run"), { recursive: true })
   await mkdir(join(root, "workspace"))
   await writeFile(join(root, "vmlinux"), "test")
-  await writeFile(join(root, "images", "node.raw"), "test")
+  await writeFile(join(root, "images", "node.raw"), fixtureImageBytes)
   await writeFile(join(root, "images", "node.json"), JSON.stringify({
     name: "node",
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
     sizeBytes: 4,
-    rootDevice: "/dev/vda"
+    rootDevice: "/dev/vda",
+    imageDigest: fixtureImageDigest
   }))
   return root
 }
@@ -111,7 +115,7 @@ const startHarness = (root: string) =>
       firecracker: Layer.succeed(Firecracker, Firecracker.of({
         boot: (spec) => Effect.promise(async () => {
           await mkdir(spec.layout.vmDir, { recursive: true })
-          return { pid: 54_000, stop: () => Effect.void, exited: Effect.never }
+          return { pid: 54_000, imageDigest: fixtureImageDigest, stop: () => Effect.void, exited: Effect.never }
         })
       })),
       guestExec: Layer.succeed(GuestExecChannel, GuestExecChannel.of({
@@ -166,8 +170,8 @@ describe("sandbox tool abuse", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const harness = yield* startHarness(root)
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
-      const bound = yield* admin.create({ image: "node", cpus: undefined, memMib: undefined, ttlSeconds: undefined })
-      const other = yield* admin.create({ image: "node", cpus: undefined, memMib: undefined, ttlSeconds: undefined })
+      const bound = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
+      const other = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
       const sandbox = yield* makeMicrovmClient({ url: harness.url, token: bound.sandboxToken })
       const tools = createSandboxTools({ client: sandbox, vmId: bound.vm.vmId, workdir: workspace })
 
@@ -217,7 +221,7 @@ describe("sandbox tool abuse", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const harness = yield* startHarness(root)
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
-      const created = yield* admin.create({ image: "node", cpus: undefined, memMib: undefined, ttlSeconds: undefined })
+      const created = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
       const sandbox = yield* makeMicrovmClient({ url: harness.url, token: created.sandboxToken })
       const tools = createSandboxTools({ client: sandbox, vmId: created.vm.vmId, workdir: workspace })
 
@@ -257,7 +261,7 @@ describe("sandbox tool abuse", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const harness = yield* startHarness(root)
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
-      const created = yield* admin.create({ image: "node", cpus: undefined, memMib: undefined, ttlSeconds: undefined })
+      const created = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
       const sandbox = yield* makeMicrovmClient({ url: harness.url, token: created.sandboxToken })
       const tools = createSandboxTools({ client: sandbox, vmId: created.vm.vmId, workdir: workspace })
       const vmId = created.vm.vmId

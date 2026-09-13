@@ -131,6 +131,11 @@ The image manifest may declare exactly one immutable endpoint:
 {"httpEndpoints":{"web":{"port":3000}}}
 ```
 
+The operator image manifest that declares this endpoint also requires
+`imageDigest` (`sha256:` and 64 lowercase hex of the final raw rootfs). Public
+create inputs use that digest; the guest HTTP bridge never sees it. Do not
+invent a placeholder hash.
+
 The port is an integer from 1024 through 65535. PID 1 raises loopback before
 starting the HTTP bridge as UID/GID 1001. The bridge dials only
 `tcp4 127.0.0.1:<manifest-port>` and handles one HTTP/1.1 exchange per vsock
@@ -226,6 +231,10 @@ Start request:
 descendant. The daemon supplies the immutable manifest `port`; caller
 `HOSTNAME` and `PORT` environment entries are rejected and the guest injects
 `HOSTNAME=127.0.0.1` plus the manifest port. Exactly one web service may run.
+The public `SandboxStartWebServiceInput` is `argv`, optional `cwd`, and
+optional `env` only. Callers cannot send `port`, a process name, or
+`HOSTNAME`/`PORT`.
+
 The standard Node guest port is `3000` (`STANDARD_NODE_GUEST_WEB_PORT`). The
 TypeScript protocol, image builder, and template manifest cannot share imports
 across their language/tool boundaries, so a conformance test verifies that all

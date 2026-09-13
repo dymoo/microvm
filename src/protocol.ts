@@ -94,6 +94,10 @@ export const ExecId = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{1,1
 /** Operator image names as they appear in the daemon's allowlist directory. */
 export const ImageName = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9._-]{0,63}$/))
 
+/** Exact raw rootfs bytes before boot: `sha256:` and 64 lowercase hex digits. */
+export const ImageDigest = Schema.String.check(Schema.isPattern(/^sha256:[0-9a-f]{64}$/))
+export type ImageDigest = typeof ImageDigest.Type
+
 const positiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
 const boundedArg = Schema.String.check(Schema.isMaxLength(MAX_ARG_BYTES))
 const boundedArgv = Schema.Array(boundedArg).check(
@@ -115,6 +119,7 @@ export class VmInfo extends Schema.Class<VmInfo>("VmInfo")({
   owningHost: Schema.String,
   state: Schema.Literals(["running", "poisoned", "terminated"]),
   image: ImageName,
+  imageDigest: ImageDigest,
   cpus: positiveInt,
   memMib: positiveInt,
   createdAtEpochMs: Schema.Number,
@@ -379,6 +384,7 @@ export class MicrovmRpc extends RpcGroup.make(
   Rpc.make("create", {
     payload: Schema.Struct({
       image: ImageName,
+      imageDigest: ImageDigest,
       cpus: Schema.UndefinedOr(positiveInt),
       memMib: Schema.UndefinedOr(positiveInt),
       /** Seconds of idle lifetime; destroyed by the reaper when elapsed. */

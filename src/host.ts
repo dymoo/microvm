@@ -7,8 +7,8 @@
  * to run VMs rather than degrade.
  */
 import { Context, Effect, Layer, Schema } from "effect"
-import { randomBytes } from "node:crypto"
-import { accessSync, constants as fsConstants, statSync, lstatSync, mkdirSync, type Stats } from "node:fs"
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import { accessSync, constants as fsConstants, createReadStream, statSync, lstatSync, mkdirSync, type Stats } from "node:fs"
 import {
   chmod,
   chown,
@@ -24,7 +24,8 @@ import {
 } from "node:fs/promises"
 import { arch as osArch, tmpdir, userInfo } from "node:os"
 import { basename, isAbsolute, join } from "node:path"
-import { HostPrereqFailed, ImageName, ImageNotAllowed } from "./protocol.js"
+import { pipeline } from "node:stream/promises"
+import { HostPrereqFailed, ImageDigest, ImageName, ImageNotAllowed } from "./protocol.js"
 
 // ---------------------------------------------------------------------------
 // Trusted-path probes
@@ -280,6 +281,7 @@ export class ImageManifest extends Schema.Class<ImageManifest>("ImageManifest")(
   name: ImageName,
   /** Raw disk image file, relative to the allowlist directory. */
   file: Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9._-]*\.raw$/)),
+  imageDigest: ImageDigest,
   arch: Schema.Literals(["x86_64", "aarch64"]),
   /** Informational builder metadata; builders may omit either field. */
   sizeBytes: Schema.optional(Schema.Number),
@@ -298,21 +300,38 @@ export interface ResolvedImage {
   readonly manifest: ImageManifest
   /** Absolute path of the raw base image. Never exposed to RPC callers. */
   readonly absolutePath: string
+  /** Manifest-declared digest. Not a hash of the source path at resolve time. */
+  readonly imageDigest: ImageDigest
 }
 
 const decodeManifest = Schema.decodeUnknownResult(ImageManifest)
 const isImageName = Schema.is(ImageName)
+const isImageDigest = Schema.is(ImageDigest)
+
+const digestEquals = (left: string, right: string): boolean => {
+  if (left.length !== right.length) return false
+  return timingSafeEqual(Buffer.from(left), Buffer.from(right))
+}
+
+/** Bounded streaming SHA-256 of the private rootfs copy. Never a full readFile. */
+const HASH_HIGH_WATER_MARK = 64 * 1024
+
+const hashPrivateRootfs = async (path: string): Promise<string> => {
+  const hash = createHash("sha256")
+  await pipeline(createReadStream(path, { highWaterMark: HASH_HIGH_WATER_MARK }), hash)
+  return `sha256:${hash.digest("hex")}`
+}
 
 export class ImageAllowlist extends Context.Service<ImageAllowlist, {
-  readonly resolve: (name: string) => Effect.Effect<ResolvedImage, ImageNotAllowed>
+  readonly resolve: (name: string, expectedDigest: string) => Effect.Effect<ResolvedImage, ImageNotAllowed>
   readonly names: () => Effect.Effect<Array<string>, ImageNotAllowed>
 }>()("microvm/host/ImageAllowlist") {
   static readonly layer = (imagesDir: string): Layer.Layer<ImageAllowlist> =>
     Layer.effect(ImageAllowlist)(Effect.sync(() => {
-      const resolve = (name: string): Effect.Effect<ResolvedImage, ImageNotAllowed> =>
+      const resolve = (name: string, expectedDigest: string): Effect.Effect<ResolvedImage, ImageNotAllowed> =>
         Effect.gen(function*() {
           const notAllowed = new ImageNotAllowed({ image: name })
-          if (!isImageName(name)) return yield* Effect.fail(notAllowed)
+          if (!isImageName(name) || !isImageDigest(expectedDigest)) return yield* Effect.fail(notAllowed)
 
           const raw = yield* Effect.tryPromise({
             try: () => readFile(join(imagesDir, `${name}.json`), "utf8"),
@@ -326,10 +345,11 @@ export class ImageAllowlist extends Context.Service<ImageAllowlist, {
           if (decoded._tag === "Failure") return yield* Effect.fail(notAllowed)
           const manifest = decoded.success
           if (manifest.name !== name) return yield* Effect.fail(notAllowed)
+          if (!digestEquals(manifest.imageDigest, expectedDigest)) return yield* Effect.fail(notAllowed)
 
           const absolutePath = join(imagesDir, manifest.file)
           if (!isReadable(absolutePath)) return yield* Effect.fail(notAllowed)
-          return { manifest, absolutePath }
+          return { manifest, absolutePath, imageDigest: manifest.imageDigest }
         })
 
       const names = (): Effect.Effect<Array<string>, ImageNotAllowed> =>
@@ -405,9 +425,9 @@ export class VmDiskError extends Schema.TaggedError<VmDiskError>()("VmDiskError"
 /**
  * Provisions the jail chroot: per-VM private root disk (best-effort CoW
  * reflink with ordinary-copy fallback) and a kernel copy — per jailer docs
- * both must live inside the jail — then hands ownership to the unprivileged
- * jailer user. The base image and kernel are never opened writable by the
- * guest.
+ * both must live inside the jail — then verifies the actual private rootfs
+ * bytes before handing ownership to the unprivileged jailer user. The base
+ * image and kernel are never opened writable by the guest.
  */
 export const provisionChroot = (
   vmId: string,
@@ -416,21 +436,41 @@ export const provisionChroot = (
   kernelSourcePath: string,
   uid: number,
   gid: number
-): Effect.Effect<void, VmDiskError> =>
-  Effect.tryPromise({
-    try: async () => {
-      await mkdir(layout.chrootRoot, { recursive: true, mode: 0o700 })
-      // A reflink has independent identity; Node falls back to a private copy when unsupported.
-      await copyFile(image.absolutePath, layout.rootfsPath, fsConstants.COPYFILE_FICLONE)
-      await copyFile(kernelSourcePath, layout.kernelPath)
-      await chmod(layout.rootfsPath, 0o600)
-      await chmod(layout.kernelPath, 0o444)
-      await chown(layout.chrootRoot, uid, gid)
-      await chown(layout.rootfsPath, uid, gid)
-      await chown(layout.kernelPath, uid, gid)
-    },
-    catch: (cause) => new VmDiskError({ vmId, reason: `chroot provisioning failed: ${String(cause)}` })
-  })
+): Effect.Effect<{ readonly imageDigest: ImageDigest }, VmDiskError> =>
+  Effect.uninterruptible(
+    Effect.gen(function*() {
+      yield* Effect.tryPromise({
+        try: async () => {
+          await mkdir(layout.chrootRoot, { recursive: true, mode: 0o700 })
+          // A reflink has independent identity; Node falls back to a private copy when unsupported.
+          await copyFile(image.absolutePath, layout.rootfsPath, fsConstants.COPYFILE_FICLONE)
+          await copyFile(kernelSourcePath, layout.kernelPath)
+        },
+        catch: (cause) => new VmDiskError({ vmId, reason: `chroot provisioning failed: ${String(cause)}` })
+      })
+      const measured = yield* Effect.tryPromise({
+        try: () => hashPrivateRootfs(layout.rootfsPath),
+        catch: (cause) => new VmDiskError({ vmId, reason: `chroot provisioning failed: ${String(cause)}` })
+      })
+      if (!isImageDigest(measured) || !digestEquals(measured, image.imageDigest)) {
+        return yield* Effect.fail(new VmDiskError({
+          vmId,
+          reason: "private rootfs digest mismatch"
+        }))
+      }
+      yield* Effect.tryPromise({
+        try: async () => {
+          await chmod(layout.rootfsPath, 0o600)
+          await chmod(layout.kernelPath, 0o444)
+          await chown(layout.chrootRoot, uid, gid)
+          await chown(layout.rootfsPath, uid, gid)
+          await chown(layout.kernelPath, uid, gid)
+        },
+        catch: (cause) => new VmDiskError({ vmId, reason: `chroot provisioning failed: ${String(cause)}` })
+      })
+      return { imageDigest: measured }
+    })
+  )
 
 /** Removes a VM directory tree; refuses paths outside the VM root. */
 export const destroyVmDir = (runStateDir: string, vmId: string): Effect.Effect<void, VmDiskError> =>
@@ -454,6 +494,7 @@ export const destroyVmDir = (runStateDir: string, vmId: string): Effect.Effect<v
 export class VmStateFile extends Schema.Class<VmStateFile>("VmStateFile")({
   vmId: Schema.String,
   image: ImageName,
+  imageDigest: ImageDigest,
   cpus: Schema.Number,
   memMib: Schema.Number,
   guestCid: Schema.Number,

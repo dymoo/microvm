@@ -124,6 +124,7 @@ jobs:
       - name: Daemon, HTTP preview, jailed acceptance, and hostile guest abuse
         run: >-
           sudo env PATH="$PATH"
+          GITHUB_ACTIONS="$GITHUB_ACTIONS"
           FIRECRACKER_URL="$FIRECRACKER_URL"
           FIRECRACKER_SHA256="$FIRECRACKER_SHA256"
           FIRECRACKER_MEMBER="$FIRECRACKER_MEMBER"

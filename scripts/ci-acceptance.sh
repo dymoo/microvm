@@ -71,6 +71,44 @@ verify_sha() { # expected file label
     || die "SHA-256 mismatch for $3 (pinned digest does not match the downloaded artifact)"
 }
 
+manifest_image_digest() { # manifest-file
+  python3 -c '
+import json, re, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    digest = json.load(handle).get("imageDigest", "")
+if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit(f"ci-acceptance: {path} imageDigest must be sha256:<64 lowercase hex>")
+print(digest)
+' "$1"
+}
+
+verify_image_digest_sidecar() { # manifest sidecar raw-name
+  python3 -c '
+import json, re, sys
+manifest_path, sidecar_path, raw_name = sys.argv[1:4]
+with open(manifest_path, encoding="utf-8") as handle:
+    digest = json.load(handle).get("imageDigest", "")
+match = re.fullmatch(r"sha256:([0-9a-f]{64})", digest)
+if match is None:
+    raise SystemExit(f"ci-acceptance: {manifest_path} imageDigest must be sha256:<64 lowercase hex>")
+expected = match.group(1)
+raw_line = None
+with open(sidecar_path, encoding="utf-8") as handle:
+    for line in handle:
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == raw_name:
+            raw_line = parts[0]
+            break
+if raw_line is None:
+    raise SystemExit(f"ci-acceptance: {sidecar_path} is missing the {raw_name} digest")
+if raw_line != expected:
+    raise SystemExit(
+        "ci-acceptance: sidecar raw digest does not reuse the manifest imageDigest"
+    )
+' "$1" "$2" "$3"
+}
+
 now_ms() { date +%s%3N; }
 
 # ---------------------------------------------------------------- preflight --
@@ -268,7 +306,7 @@ image() {
   pin_hex KERNEL_SHA256 "${KERNEL_SHA256:-}"
   [[ -f $KERNEL_INSTALL ]] || die "kernel missing at $KERNEL_INSTALL; run the artifacts phase first"
   mkdir -p "$EVIDENCE_DIR"
-  local started finished
+  local started finished digest
   started=$(now_ms)
   "$ROOT/scripts/build-guest-image.sh" \
     --arch x86_64 \
@@ -277,9 +315,12 @@ image() {
     --output-dir "$IMAGES_DIR" \
     --name node
   finished=$(now_ms)
+  digest=$(manifest_image_digest "$IMAGES_DIR/node.json")
+  verify_image_digest_sidecar "$IMAGES_DIR/node.json" "$IMAGES_DIR/node.sha256" node.raw
   {
     echo "image build ms: $((finished - started))"
     echo "image size MiB: 2048 (builder default; jailerFsizeBytes 2GiB ceiling matches)"
+    echo "imageDigest: $digest"
   } >"$EVIDENCE_DIR/image-build.txt"
   cp "$IMAGES_DIR/node.json" "$IMAGES_DIR/node.sha256" "$EVIDENCE_DIR/"
   echo "guest image built"
@@ -404,9 +445,13 @@ daemon() {
   # reaches the daemon through the config's ${MICROVM_ADMIN_TOKEN} reference.
   local admin_token started finished create_json vm_id vsock destroy_json
   local daemon_listen_ms protocol_vm_create_ms protocol_accept_ms http_preview_ms two_vm_accept_ms hostile_abuse_ms
-  local daemon_pid
+  local daemon_pid image_digest
+  image_digest=$(manifest_image_digest "$IMAGES_DIR/node.json")
+  verify_image_digest_sidecar "$IMAGES_DIR/node.json" "$IMAGES_DIR/node.sha256" node.raw
   admin_token=$(openssl rand -hex 32)
-  printf '::add-mask::%s\n' "$admin_token"
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    printf '::add-mask::%s\n' "$admin_token"
+  fi
 
   cat >"$CI_STATE_DIR/daemon.json" <<EOF
 {
@@ -437,7 +482,7 @@ daemon() {
     "defaultCpus": 1,
     "maxCpus": 2,
     "defaultMemMib": 512,
-    "maxMemMib": 1024,
+    "maxMemMib": 2048,
     "maxTtlSeconds": 3600
   }
 }
@@ -583,7 +628,7 @@ print(
   # vmLayout in src/host.ts — this only resolves the documented path.
   started=$(now_ms)
   capture_client_json create_json "protocol VM create" \
-    create --image node --cpus 1 --mem-mib 512 --ttl-s 900 --json
+    create --image node --image-digest "$image_digest" --cpus 1 --mem-mib 512 --ttl-s 900 --json
   vm_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["vmId"])' <<<"$create_json")
   finished=$(now_ms)
   protocol_vm_create_ms=$((finished - started))
@@ -607,6 +652,7 @@ print(
   # second layer, so a stall is reported here rather than at the job cap.
   started=$(now_ms)
   MICROVM_URL=$URL MICROVM_TOKEN=$admin_token MICROVM_IMAGE=node \
+    MICROVM_IMAGE_DIGEST=$image_digest MICROVM_IMAGE_MANIFEST=$IMAGES_DIR/node.json \
     timeout --signal=TERM --kill-after=30s 10m \
     node "$ROOT/scripts/http-preview-acceptance.mjs" \
     | tee "$EVIDENCE_DIR/http-preview.log"
@@ -617,6 +663,7 @@ print(
   # denial, timeouts, output bounds, process/cgroup/disk release).
   started=$(now_ms)
   MICROVM_URL=$URL MICROVM_TOKEN=$admin_token MICROVM_IMAGE=node \
+    MICROVM_IMAGE_DIGEST=$image_digest MICROVM_IMAGE_MANIFEST=$IMAGES_DIR/node.json \
     MICROVM_RUN_STATE_DIR="$RUN_STATE_DIR" MICROVM_CGROUP_ROOT="$CGROUP_SLICE" \
     MICROVM_BIN="$ROOT/dist/bin/client.js" \
     bash "$ROOT/scripts/accept-linux.sh" | tee "$EVIDENCE_DIR/accept-linux.log"
@@ -630,6 +677,7 @@ print(
   # create responses, credentials, guest output, or daemon configuration.
   started=$(now_ms)
   MICROVM_URL=$URL MICROVM_TOKEN=$admin_token MICROVM_IMAGE=node \
+    MICROVM_IMAGE_DIGEST=$image_digest MICROVM_IMAGE_MANIFEST=$IMAGES_DIR/node.json \
     MICROVM_RUN_STATE_DIR="$RUN_STATE_DIR" MICROVM_CGROUP_ROOT="$CGROUP_SLICE" \
     MICROVM_BIN="$ROOT/dist/bin/client.js" \
     timeout --signal=TERM --kill-after=30s 8m \

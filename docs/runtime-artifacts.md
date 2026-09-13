@@ -1,6 +1,6 @@
 # Runtime artifact pins for Linux/KVM acceptance
 
-Research status: 2026-09-12; acceptance status: 2026-09-13. This note records provenance, configuration evidence, and the current successful hosted Linux/KVM acceptance run for the exact pinned inputs below. Runtime compatibility evidence does not change an artifact's provenance label.
+Research status: 2026-09-12; acceptance status: 2026-09-13. This note records provenance, configuration evidence, and the hosted Linux/KVM acceptance run for commit [`b6afe4fff591763e178a29bb98e51aed635b5fed`](https://github.com/dymoo/microvm/commit/b6afe4fff591763e178a29bb98e51aed635b5fed) with the exact pinned inputs below. That run is historical evidence for those pins and that commit. It is not a publication of a later package version, and it does not qualify later source revisions.
 
 ## Trust labels
 

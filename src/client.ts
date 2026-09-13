@@ -1,9 +1,32 @@
 import { NodeHttpClient } from "@effect/platform-node"
-import { Effect, Layer, Schema, type Scope } from "effect"
+import { Effect, Layer, Schema, Scope } from "effect"
 import { RpcClient, RpcClientError, RpcSerialization } from "effect/unstable/rpc"
 import { secureOrigin } from "./endpoint.js"
 import { clientAuthLayer } from "./auth.js"
-import { MicrovmRpc, type ExecResult } from "./protocol.js"
+import type { SandboxHttpProxy } from "./http-proxy.js"
+import {
+  MicrovmRpc,
+  type BootFailed,
+  type CapacityExceeded,
+  type ClusterServiceError,
+  type DestroyUncertain,
+  type DestroyResult,
+  type ExecResult,
+  type Forbidden,
+  type GuestExecError,
+  type HostPrereqFailed,
+  type HttpNotConfigured,
+  type ImageNotAllowed,
+  type StopWebServiceResult,
+  type Unauthenticated,
+  type VmInfo,
+  type VmNotFound,
+  type VmPoisoned,
+  type WebServiceStatus
+} from "./protocol.js"
+import { bindSandboxHandle, createWireRequest, SandboxBindingError } from "./sandbox-binding.js"
+
+export { SandboxBindingError }
 
 export interface MicrovmClientOptions {
   readonly url: string
@@ -18,6 +41,75 @@ export class ClientConfigurationError extends Schema.TaggedError<ClientConfigura
 ) {}
 
 export type MicrovmClient = RpcClient.FromGroup<typeof MicrovmRpc, RpcClientError.RpcClientError>
+
+/**
+ * Public request inputs for the convenience API. These are the shapes a
+ * plain-JavaScript consumer builds, so every property beyond the required core
+ * is optional: the client normalizes the keys the RPC payload declares as
+ * required-with-`undefined` before the wire schema sees them.
+ */
+export interface SandboxCreateInput {
+  readonly image: string
+  /** Exact raw rootfs bytes before boot: `sha256:` and 64 lowercase hex digits. */
+  readonly imageDigest: string
+  readonly cpus?: number | undefined
+  readonly memMib?: number | undefined
+  readonly ttlSeconds?: number | undefined
+}
+
+export interface SandboxExecuteInput {
+  /** Executed directly, with no shell; `argv[0]` is an absolute guest path. */
+  readonly argv: ReadonlyArray<string>
+  readonly cwd?: string | undefined
+  readonly env?: Readonly<Record<string, string>> | undefined
+  readonly timeoutMs?: number | undefined
+  readonly maxOutputBytes?: number | undefined
+}
+
+export interface SandboxStartWebServiceInput {
+  readonly argv: ReadonlyArray<string>
+  readonly cwd?: string | undefined
+  readonly env?: Readonly<Record<string, string>> | undefined
+}
+
+export type SandboxCreateError =
+  | BootFailed | CapacityExceeded | Forbidden | HostPrereqFailed | ImageNotAllowed
+  | Unauthenticated | RpcClientError.RpcClientError | SandboxBindingError
+export type SandboxInspectError =
+  Forbidden | Unauthenticated | VmNotFound | RpcClientError.RpcClientError
+export type SandboxExecuteError =
+  Forbidden | GuestExecError | Unauthenticated | VmNotFound | VmPoisoned | CapacityExceeded
+  | RpcClientError.RpcClientError
+export type SandboxDestroyError =
+  DestroyUncertain | Forbidden | Unauthenticated | VmNotFound
+  | RpcClientError.RpcClientError
+export type SandboxServiceOperationError =
+  | ClusterServiceError | Forbidden | Unauthenticated | VmNotFound | VmPoisoned
+  | RpcClientError.RpcClientError
+
+export interface WebServiceHandle {
+  readonly status: () => Effect.Effect<WebServiceStatus, SandboxServiceOperationError>
+  readonly stop: () => Effect.Effect<StopWebServiceResult, SandboxServiceOperationError>
+}
+
+export interface SandboxHandle {
+  readonly vm: VmInfo
+  /** Sandbox-scoped client closed over the selected configured daemon. */
+  readonly client: MicrovmClient
+  /** Binds the image's immutable `web` endpoint; callers cannot select a target. */
+  readonly http: () => Effect.Effect<SandboxHttpProxy, HttpNotConfigured>
+  /** Starts the single durable `web` service while ordinary execute remains available. */
+  readonly startWebService: (
+    request: SandboxStartWebServiceInput
+  ) => Effect.Effect<WebServiceHandle, SandboxServiceOperationError>
+  readonly execute: (request: SandboxExecuteInput) => Effect.Effect<ExecResult, SandboxExecuteError>
+  readonly inspect: () => Effect.Effect<VmInfo, SandboxInspectError>
+  readonly destroy: () => Effect.Effect<DestroyResult, SandboxDestroyError>
+}
+
+export interface Microvm {
+  readonly create: (request: SandboxCreateInput) => Effect.Effect<SandboxHandle, SandboxCreateError>
+}
 
 const clientEndpoint = (input: string): Effect.Effect<string, ClientConfigurationError> =>
   Effect.try({
@@ -52,6 +144,42 @@ export const makeMicrovmClient = (
       Effect.provide([protocol, clientAuthLayer(options.token)])
     )
   })
+
+/**
+ * Acquires a single-daemon convenience client. Create is one RPC to the
+ * configured origin: no health, list, placement, failover, or retry.
+ * Scope closure ends RPC transports; it does not destroy the remote VM or
+ * revoke independently request-owned HTTP ingress.
+ */
+export const makeMicrovm = Effect.fn("makeMicrovm")(
+  function*(options: MicrovmClientOptions): Effect.fn.Return<Microvm, ClientConfigurationError, Scope.Scope> {
+    const scope = yield* Scope.Scope
+    const adminClient = yield* makeMicrovmClient(options)
+    const origin = secureOrigin(options.url).origin
+    const create = (
+      request: SandboxCreateInput
+    ): Effect.Effect<SandboxHandle, SandboxCreateError> =>
+      Effect.uninterruptibleMask((restore) =>
+        restore(adminClient.create(createWireRequest(request))).pipe(
+          Effect.flatMap((created) =>
+            bindSandboxHandle({
+              adminClient,
+              makeSandboxClient: (token) =>
+                makeMicrovmClient({
+                  url: origin,
+                  token,
+                  ca: options.ca
+                }).pipe(Effect.provideService(Scope.Scope, scope)),
+              created,
+              origin,
+              ca: options.ca
+            })
+          )
+        )
+      )
+    return { create }
+  }
+)
 
 export interface DecodedExecResult {
   readonly execId: string

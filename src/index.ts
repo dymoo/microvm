@@ -7,13 +7,26 @@ export type { SandboxToolLimits, SandboxToolsOptions } from "./ai.js"
 
 export {
   ClientConfigurationError,
+  SandboxBindingError,
   decodeExecResult,
+  makeMicrovm,
   makeMicrovmClient
 } from "./client.js"
 export type {
   DecodedExecResult,
+  Microvm,
   MicrovmClient,
-  MicrovmClientOptions
+  MicrovmClientOptions,
+  SandboxCreateError,
+  SandboxCreateInput,
+  SandboxDestroyError,
+  SandboxExecuteError,
+  SandboxExecuteInput,
+  SandboxHandle,
+  SandboxInspectError,
+  SandboxServiceOperationError,
+  SandboxStartWebServiceInput,
+  WebServiceHandle
 } from "./client.js"
 
 export {
@@ -23,19 +36,13 @@ export {
 } from "./cluster.js"
 export type {
   ClusterCreateError,
-  ClusterServiceOperationError,
   ClusterDestroyError,
   ClusterEndpoint,
   ClusterExecuteError,
   ClusterInspectError,
   ClusterListError,
   MicrovmCluster,
-  MicrovmClusterOptions,
-  SandboxCreateInput,
-  SandboxExecuteInput,
-  SandboxHandle,
-  SandboxStartWebServiceInput,
-  WebServiceHandle
+  MicrovmClusterOptions
 } from "./cluster.js"
 
 export type { SandboxHttpProxy } from "./http-proxy.js"
@@ -51,6 +58,7 @@ export {
   ExecResult,
   Forbidden,
   HttpNotConfigured,
+  ImageDigest,
   ImageNotAllowed,
   HostPrereqFailed,
   ImageName,

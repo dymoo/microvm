@@ -24,6 +24,23 @@ command -v python3 >/dev/null || { echo "host python3 is required" >&2; exit 1; 
   exit 1
 }
 
+IMAGE_DIGEST=${MICROVM_IMAGE_DIGEST:-}
+if [[ -n ${MICROVM_IMAGE_MANIFEST:-} ]]; then
+  [[ -f $MICROVM_IMAGE_MANIFEST ]] || { echo "MICROVM_IMAGE_MANIFEST is not a file" >&2; exit 2; }
+  IMAGE_DIGEST=$(python3 -c '
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    digest = json.load(handle).get("imageDigest", "")
+if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("imageDigest must be sha256:<64 lowercase hex>")
+print(digest)
+' "$MICROVM_IMAGE_MANIFEST")
+fi
+[[ $IMAGE_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || {
+  echo "set MICROVM_IMAGE_DIGEST=sha256:<64 lowercase hex> or MICROVM_IMAGE_MANIFEST" >&2
+  exit 2
+}
+
 json_field() {
   local field=$1
   local document=$2
@@ -118,10 +135,10 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-CREATE1_JSON=$(MICROVM_TOKEN=$ADMIN_TOKEN "$MICROVM_BIN" create --image "$MICROVM_IMAGE" --cpus 2 --mem-mib 1024 --ttl-s 300 --json)
+CREATE1_JSON=$(MICROVM_TOKEN=$ADMIN_TOKEN "$MICROVM_BIN" create --image "$MICROVM_IMAGE" --image-digest "$IMAGE_DIGEST" --cpus 2 --mem-mib 2048 --ttl-s 300 --json)
 VM1_ID=$(json_field vmId "$CREATE1_JSON")
 VM1_TOKEN=$(json_field sandboxToken "$CREATE1_JSON")
-CREATE2_JSON=$(MICROVM_TOKEN=$ADMIN_TOKEN "$MICROVM_BIN" create --image "$MICROVM_IMAGE" --cpus 1 --mem-mib 768 --ttl-s 300 --json)
+CREATE2_JSON=$(MICROVM_TOKEN=$ADMIN_TOKEN "$MICROVM_BIN" create --image "$MICROVM_IMAGE" --image-digest "$IMAGE_DIGEST" --cpus 1 --mem-mib 768 --ttl-s 300 --json)
 VM2_ID=$(json_field vmId "$CREATE2_JSON")
 VM2_TOKEN=$(json_field sandboxToken "$CREATE2_JSON")
 [[ -n $VM1_ID && -n $VM1_TOKEN && -n $VM2_ID && -n $VM2_TOKEN && $VM1_ID != "$VM2_ID" ]] || {
