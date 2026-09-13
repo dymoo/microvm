@@ -5,9 +5,10 @@ import { once } from "node:events"
 import { writeSync } from "node:fs"
 import { request as httpRequest } from "node:http"
 import { connect } from "node:net"
-import { Effect, Result } from "effect"
+import { Effect, Exit, Result } from "effect"
 import { makeMicrovmClient, makeMicrovmCluster } from "../dist/index.js"
 import { listenTrustedProxy, rawStatus, requestStatus } from "./http-preview-proxy.mjs"
+import { guestProtocolService } from "./http-preview-fixture.mjs"
 
 let currentOperation = "initialization"
 let exiting = false
@@ -39,16 +40,26 @@ const operationFailed = () => {
   step(`${failed} failed`)
 }
 
-const exitWithPendingOperation = (reason, exitCode) => {
+const genericErrorMessage = (value) => {
+  if (!(value instanceof Error)) return "Error: non-Error rejection"
+  if (/tim(?:e|ed) ?out|exceeded/i.test(value.message)) return "Error: operation timed out"
+  if (/abort|interrupt/i.test(value.message)) return "Error: operation aborted"
+  if (/refused|ECONNREFUSED/i.test(value.message)) return "Error: connection refused"
+  if (/closed|reset|socket hang up/i.test(value.message)) return "Error: connection closed"
+  return "Error: operation failed"
+}
+
+const exitWithPendingOperation = (reason, exitCode, error) => {
   if (exiting) return
   exiting = true
-  writeLine(process.stderr.fd, `[http-preview] ${reason}; pending operation: ${currentOperation}`)
+  const detail = error === undefined ? "" : `; error: ${genericErrorMessage(error)}`
+  writeLine(process.stderr.fd, `[http-preview] ${reason}; pending operation: ${currentOperation}${detail}`)
   process.exit(exitCode)
 }
 
 process.once("SIGTERM", () => exitWithPendingOperation("received SIGTERM", 143))
-process.once("uncaughtException", () => exitWithPendingOperation("uncaught exception", 1))
-process.once("unhandledRejection", () => exitWithPendingOperation("unhandled rejection", 1))
+process.once("uncaughtException", (error) => exitWithPendingOperation("uncaught exception", 1, error))
+process.once("unhandledRejection", (error) => exitWithPendingOperation("unhandled rejection", 1, error))
 
 const daemonUrl = process.env.MICROVM_URL
 const adminToken = process.env.MICROVM_TOKEN
@@ -71,6 +82,7 @@ const DEADLINES = {
   readyMs: 120_000,
   rpcMs: 60_000,
   rpcCreateMs: 300_000,
+  cleanupMs: 30_000,
   requestMs: 30_000,
   websocketMs: 30_000,
   streamMs: 60_000
@@ -99,6 +111,25 @@ const fetchBounded = (label, url, init = {}, milliseconds = DEADLINES.requestMs)
  */
 const boundedRpc = (label, effect, milliseconds = DEADLINES.rpcMs) =>
   Effect.raceFirst(effect, Effect.delay(Effect.die(expired(label, milliseconds)), milliseconds))
+
+const armVmCleanup = (label, destroy) => Effect.acquireRelease(
+  Effect.sync(() => ({ armed: true })),
+  (cleanup) => {
+    if (!cleanup.armed) return Effect.void
+    const interruptedOperation = currentOperation
+    currentOperation = `${label} cleanup`
+    return Effect.exit(Effect.suspend(() =>
+      boundedRpc(currentOperation, destroy(), DEADLINES.cleanupMs)
+    )).pipe(
+      Effect.andThen((outcome) => Effect.sync(() => {
+        currentOperation = interruptedOperation
+        if (Exit.isFailure(outcome) || outcome.value.destroyed !== true) {
+          step(`${label} cleanup failed`)
+        }
+      }))
+    )
+  }
+)
 
 const listenProxy = (proxy) => Effect.acquireRelease(
   Effect.promise(() => listenTrustedProxy(proxy)),
@@ -228,55 +259,6 @@ const closeWithin = async (promise, milliseconds, label) => {
   ])
 }
 
-const guestProtocolService = String.raw`
-const http = require("node:http")
-const { createHash } = require("node:crypto")
-const server = http.createServer((request, response) => {
-  if (request.url === "/headers") {
-    response.setHeader("content-type", "application/json")
-    response.end(JSON.stringify({ authorization: request.headers.authorization || null, proxyAuthorization: request.headers["proxy-authorization"] || null }))
-    return
-  }
-  if (request.url === "/sse") {
-    response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
-    response.write("data: ready\\n\\n")
-    const timer = setInterval(() => response.write("data: heartbeat\\n\\n"), 1000)
-    request.once("close", () => clearInterval(timer))
-    return
-  }
-  if (request.url === "/large") {
-    response.writeHead(200, { "content-type": "application/octet-stream" })
-    let remaining = 8 << 20
-    const write = () => {
-      while (remaining > 0) {
-        const size = Math.min(32768, remaining)
-        remaining -= size
-        if (!response.write(Buffer.alloc(size, 120))) return response.once("drain", write)
-      }
-      response.end()
-    }
-    write()
-    return
-  }
-  response.end("guest-http-ok")
-})
-server.on("upgrade", (request, socket) => {
-  const key = request.headers["sec-websocket-key"]
-  if (request.method !== "GET" || request.headers.upgrade !== "websocket" || typeof key !== "string") return socket.destroy()
-  const accept = createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64")
-  socket.write("HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Accept: " + accept + "\\r\\n\\r\\n")
-  socket.on("data", (frame) => {
-    if (frame.length < 6 || (frame[0] & 15) !== 1 || (frame[1] & 128) === 0) return socket.destroy()
-    const length = frame[1] & 127
-    if (length >= 126 || frame.length < 6 + length) return socket.destroy()
-    const payload = Buffer.alloc(length)
-    for (let index = 0; index < length; index++) payload[index] = frame[6 + index] ^ frame[2 + (index % 4)]
-    socket.write(Buffer.concat([Buffer.from([0x81, length]), payload]))
-  })
-})
-server.listen(Number(process.env.PORT), process.env.HOSTNAME)
-`
-
 const program = Effect.scoped(Effect.gen(function*() {
   step("program started")
   const cluster = yield* makeMicrovmCluster({ endpoints: [{ url: daemonUrl, token: adminToken }] })
@@ -288,6 +270,7 @@ const program = Effect.scoped(Effect.gen(function*() {
     cluster.create({ image, cpus: 1, memMib: 768, ttlSeconds: 900 }),
     DEADLINES.rpcCreateMs
   )
+  const nextCleanup = yield* armVmCleanup("Next VM", () => next.destroy())
   step("Next preview VM created")
   try {
     const initialized = yield* boundedRpc("exec microvm-next-init", next.execute({
@@ -352,7 +335,12 @@ const program = Effect.scoped(Effect.gen(function*() {
     )
     step("network isolation and Next service stop verified")
   } finally {
-    yield* boundedRpc("destroy next preview VM", next.destroy()).pipe(Effect.catch(() => Effect.void))
+    const nextDestroy = yield* Effect.exit(boundedRpc("destroy next preview VM", next.destroy()))
+    if (Exit.isSuccess(nextDestroy) && nextDestroy.value.destroyed === true) {
+      nextCleanup.armed = false
+    } else {
+      step("Next VM cleanup failed")
+    }
   }
 
   step("Next preview phase completed")
@@ -361,6 +349,7 @@ const program = Effect.scoped(Effect.gen(function*() {
     cluster.create({ image, cpus: 1, memMib: 512, ttlSeconds: 900 }),
     DEADLINES.rpcCreateMs
   )
+  const protocolCleanup = yield* armVmCleanup("protocol VM", () => protocol.destroy())
   const protocolService = yield* boundedRpc("startWebService guest protocol service", protocol.startWebService({
     argv: ["/usr/bin/node", "-e", guestProtocolService]
   }))
@@ -399,6 +388,9 @@ const program = Effect.scoped(Effect.gen(function*() {
     adminClient.create({ image, cpus: 1, memMib: 256, ttlSeconds: 300 }),
     DEADLINES.rpcCreateMs
   )
+  const donorCleanup = yield* armVmCleanup("token donor VM", () =>
+    adminClient.destroy({ vmId: tokenDonor.vm.vmId })
+  )
   operationSucceeded()
   try {
     operationStarted("cross-VM credential request")
@@ -414,12 +406,16 @@ const program = Effect.scoped(Effect.gen(function*() {
   } finally {
     const interruptedOperation = currentOperation
     operationStarted("token donor destruction")
-    const donorDestroy = yield* Effect.result(boundedRpc(
+    const donorDestroy = yield* Effect.exit(boundedRpc(
       currentOperation,
       adminClient.destroy({ vmId: tokenDonor.vm.vmId })
     ))
-    if (Result.isFailure(donorDestroy)) operationFailed()
-    else operationSucceeded()
+    if (Exit.isSuccess(donorDestroy) && donorDestroy.value.destroyed === true) {
+      donorCleanup.armed = false
+      operationSucceeded()
+    } else {
+      operationFailed()
+    }
     currentOperation = interruptedOperation
   }
 
@@ -466,8 +462,12 @@ const program = Effect.scoped(Effect.gen(function*() {
   assert(headers.proxyAuthorization === null, "Proxy-Authorization reached the guest")
 
   step("authorization separation verified")
+  operationStarted("WebSocket open")
   const websocket = yield* Effect.promise(() => openWebSocket(publicServer.port))
+  operationSucceeded()
+  operationStarted("WebSocket echo")
   assert((yield* Effect.promise(() => echoWebSocket(websocket, "preview-echo"))) === "preview-echo", "websocket echo failed")
+  operationSucceeded()
 
   step("websocket echo verified")
   const heldSse = []
@@ -512,6 +512,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   const websocketClosed = once(websocket, "close")
   const destroyed = yield* boundedRpc("destroy protocol VM", protocol.destroy())
   assert(destroyed.destroyed === true, "protocol VM destroy was not confirmed")
+  protocolCleanup.armed = false
   yield* Effect.promise(() => closeWithin(sseClosed, 2_000, "active SSE"))
   yield* Effect.promise(() => closeWithin(websocketClosed, 2_000, "active websocket"))
   assert(websocket.destroyed, "active websocket client socket remained open after VM destroy")
