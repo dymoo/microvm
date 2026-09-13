@@ -48,18 +48,28 @@ v4 idioms proven in this codebase (copy these, do not guess):
   v1 channel over the vsock UDS with strict frame validation. Any transport
   violation is a `GuestTransportFault` (VM gets poisoned; success is never
   reported for a VM in doubt).
+- `src/vsock.ts` — fragment-safe bounded Firecracker UDS acknowledgement
+  parsing behind the fixed-purpose exec, HTTP, and service socket openers.
+- `src/daemon-http-proxy.ts` — authenticated `/http/v1/vms/:id/*` HTTP and
+  WebSocket data plane: admission quotas, semantic parsing, sanitization,
+  streaming, frame validation, and destroy-time request-lease closure.
 - `src/daemon.ts` — daemon assembly: config, kernel-held single-daemon lock,
   VM registry (quotas, reservations, TTL reaper, recovery), RPC handlers, and
   bounded HTTP/TLS serving.
 - `src/client.ts` — scoped typed client for one authenticated daemon endpoint.
 - `src/cluster.ts` — bounded health polling, static multi-daemon placement,
-  capacity-only create failover, and VM owner binding.
+  capacity-only create failover, VM owner binding, and the source-revision
+  `http()`/`startWebService` handles.
+- `src/http-proxy.ts` — the trusted Node reverse-proxy hop: binds one VM's
+  ingress capability and exposes `request`, `upgrade`, `connect`, and
+  `checkContinue` handlers that can reach only the image's fixed HTTP target.
 - `src/ai.ts` — Vercel AI SDK tools bound to one already-created sandbox VM;
   never receives cluster credentials.
 - `src/bin/` — `microvm-daemon` and `microvm` CLI entrypoints.
 
-`guest/**` contains the Go guest runner; `scripts/**` the image builder and
-acceptance scripts. The host speaks guest exec v1 exactly as specified in
+`guest/**` contains the Go guest runner, HTTP bridge, and PID 1; `scripts/**`
+the image builder and acceptance scripts. The host speaks the guest exec,
+HTTP preview, and durable web-service contracts exactly as specified in
 `docs/protocol.md`.
 
 ## Security invariants (load-bearing — never weaken)
@@ -90,7 +100,8 @@ acceptance scripts. The host speaks guest exec v1 exactly as specified in
 
 - `README.md` — what this is, quickstart, honest limitation list.
 - `docs/architecture.md` — module/seam design, trust boundaries.
-- `docs/protocol.md` — guest exec v1 wire contract (shared with `guest/`).
+- `docs/protocol.md` — guest exec, HTTP preview, and durable web-service v1
+  wire contracts (shared with `guest/`).
 - `docs/operations.md` — daemon config, prerequisites, Linux deployment shape.
 - `docs/ai-tools.md` — Vercel AI SDK tool usage and prompt guidance.
 

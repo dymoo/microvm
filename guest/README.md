@@ -123,8 +123,9 @@ per-stream truncation, descendant cleanup, and host backpressure. On macOS:
 pnpm test tests/guest-image-template.test.ts
 cd guest
 go test ./internal/runner
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/microvm-guest ./cmd/microvm-init
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/microvm-guest ./cmd/microvm-init
+go test ./internal/httpproxy
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/microvm-guest ./cmd/microvm-init ./cmd/microvm-http-proxy
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/microvm-guest ./cmd/microvm-init ./cmd/microvm-http-proxy
 ```
 
 A real VM smoke test is unavailable on macOS because Firecracker requires Linux KVM. Nothing in the portable tests claims KVM success. On a Linux KVM host, boot a VM through the real daemon (the jailer is mandatory; no direct-Firecracker path exists anywhere in this repository), then exercise the protocol against that already-booted jailed VM's vsock:

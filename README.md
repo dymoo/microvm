@@ -211,6 +211,75 @@ const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
 })))
 ```
 
+## HTTP preview and durable web service (current `main` source)
+
+These APIs are **not in the immutable `v0.1.0` release**. The published
+`microvm-0.1.0-*.tgz` asset contains the typed RPC client, cluster placement,
+and AI tools, but no `SandboxHandle.http()`, `startWebService`, or guest HTTP
+bridge. The example below is a source-revision contract on `main`; treat it as
+unreleased until a later tag contains it.
+
+`sandbox.http()` binds the VM's ingress capability to the image's immutable
+`web` endpoint. No caller supplies a socket path, guest host, or guest TCP
+port, and an image without `httpEndpoints.web.port` fails with
+`HttpNotConfigured` before any guest I/O. `startWebService` runs one durable
+service per VM with direct argv execution; a second start is refused, and the
+service outlives the control connection that started it.
+
+```ts
+import { Effect } from "effect"
+import { createServer } from "node:http"
+import { makeMicrovmCluster } from "microvm"
+
+const program = Effect.scoped(Effect.gen(function* () {
+  const cluster = yield* makeMicrovmCluster({
+    endpoints: [
+      { url: "https://host-a.example:9443", token: process.env.HOST_A_TOKEN! }
+    ]
+  })
+  const sandbox = yield* cluster.create({
+    image: "node", cpus: 1, memMib: 512, ttlSeconds: 900
+  })
+
+  // One durable service per VM; argv runs directly, with no shell.
+  const service = yield* sandbox.startWebService({
+    argv: ["/usr/local/bin/pnpm", "dev"],
+    cwd: "/workspace"
+  })
+
+  // Node routes these four events independently, so wire all four: a missing
+  // `connect` or `checkContinue` listener changes the refusal into a silent
+  // hang-up or an interim `100 Continue` this adapter never forwards.
+  const proxy = yield* sandbox.http()
+  const server = createServer(proxy.handleRequest)
+  server.on("upgrade", proxy.handleUpgrade)
+  server.on("connect", proxy.handleConnect)
+  server.on("checkContinue", proxy.handleCheckContinue)
+  yield* Effect.promise(() => new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(8_080, "127.0.0.1", resolve)
+  }))
+
+  yield* Effect.promise(() => new Promise<void>((resolve) => {
+    server.close(() => resolve())
+    // Upgraded sockets leave the server's own accounting, so close them too.
+    server.closeAllConnections()
+  }))
+
+  // Teardown is explicit. Leaving the scope closes the scoped clients; it does
+  // not destroy the VM. Destroy blocks new admissions and aborts active
+  // HTTP/SSE/WebSocket leases before it stops the VM.
+  yield* service.stop()
+  return yield* sandbox.destroy()
+}))
+
+await Effect.runPromise(program)
+```
+
+The guest-side contract, including the fixed vsock purposes, the manifest
+endpoint, and the refusal semantics for CONNECT and `Expect`, lives in
+[docs/protocol.md](docs/protocol.md).
+
 For model-bound `run_command`, `read_file`, and `write_file` tools using
 `generateText` or `streamText`, see [Vercel AI SDK tools](docs/ai-tools.md).
 
@@ -220,6 +289,9 @@ For model-bound `run_command`, `read_file`, and `write_file` tools using
 - Every VM receives a private root disk copy and no network interface.
 - Guest I/O is vsock-only; exec has bounded time, frame size, chunk count, and
   per-stream output.
+- HTTP ingress is capability-scoped to one VM and can dial only that image's
+  fixed manifest target; callers never receive a guest socket or choose a
+  target.
 - Transport uncertainty poisons the VM. Destroy stops the VMM promptly and
   queued execs re-check liveness before reaching the guest.
 - Failed cleanup retains capacity, UID/GID, CID, and VM-ID reservations in
