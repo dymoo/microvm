@@ -1,15 +1,16 @@
 import { createHash } from "node:crypto"
 import { once } from "node:events"
-import { connect } from "node:net"
+import { createServer, request as httpRequest, type IncomingMessage, type RequestOptions } from "node:http"
+import { connect, Socket } from "node:net"
 import { describe, expect, it } from "vitest"
-import { listenTrustedProxy } from "../scripts/http-preview-proxy.mjs"
+import { listenTrustedProxy, rawStatus, requestStatus } from "../scripts/http-preview-proxy.mjs"
 
 const WEBSOCKET_KEY = "MDEyMzQ1Njc4OWFiY2RlZg=="
 const RELEASE_LIMIT_MS = 500
 
-// A real deadline is the behavior under test: fake time cannot expose a native
-// `server.close()` callback that never arrives after an HTTP Upgrade.
-const settleWithin = async (work: Promise<unknown>, label: string): Promise<void> => {
+// Real deadlines are the behavior under test: fake time cannot expose native
+// server-close and connection-lifecycle callbacks that never arrive.
+const settleWithin = async <Value>(work: Promise<Value>, label: string): Promise<Value> => {
   const timedOut = Promise.withResolvers<never>()
   const deadline: NodeJS.Timeout = setTimeout(
     () => timedOut.reject(new Error(`${label} did not settle within ${RELEASE_LIMIT_MS}ms`)),
@@ -17,7 +18,7 @@ const settleWithin = async (work: Promise<unknown>, label: string): Promise<void
   )
   deadline.unref()
   try {
-    await Promise.race([work, timedOut.promise])
+    return await Promise.race([work, timedOut.promise])
   } finally {
     clearTimeout(deadline)
   }
@@ -66,5 +67,69 @@ describe("trusted preview proxy server", () => {
       clientSocket.destroy()
       if (proxy.server.listening) await settleWithin(proxy.close(), "trusted proxy cleanup")
     }
+  })
+})
+
+describe("HTTP preview denial probes", () => {
+  it("times out and closes a request when a server accepts but never responds", async () => {
+    const server = createServer()
+    const listening = Promise.withResolvers<void>()
+    server.once("error", listening.reject)
+    server.listen(0, "127.0.0.1", listening.resolve)
+    await listening.promise
+    const address = server.address()
+    if (address === null || typeof address === "string") throw new Error("silent test server has no TCP port")
+
+    const accepted = Promise.withResolvers<Socket>()
+    server.once("connection", accepted.resolve)
+    const status = requestStatus(
+      "silent request probe",
+      `http://127.0.0.1:${address.port}`,
+      "GET",
+      "/",
+      {},
+      {
+        timeoutMs: 50,
+        request: (options: RequestOptions, onResponse: (response: IncomingMessage) => void) => {
+          const request = httpRequest(options, onResponse)
+          request.setTimeout = () => request
+          return request
+        }
+      }
+    )
+    try {
+      const serverSocket = await settleWithin(accepted.promise, "silent server accept")
+      const serverSocketClosed = once(serverSocket, "close")
+      await expect(settleWithin(status, "silent request result"))
+        .rejects.toThrow("silent request probe exceeded 50ms")
+      await settleWithin(serverSocketClosed, "silent request socket close")
+      expect(serverSocket.destroyed).toBe(true)
+    } finally {
+      server.closeAllConnections()
+      if (server.listening) {
+        const closed = Promise.withResolvers<void>()
+        server.close((error) => {
+          if (error === undefined) closed.resolve()
+          else closed.reject(error)
+        })
+        await settleWithin(closed.promise, "silent server close")
+      }
+    }
+  })
+
+  it("times out and closes a socket when connection establishment never completes", async () => {
+    const stalledSocket = new Socket()
+    stalledSocket.setTimeout = () => stalledSocket
+    const socketClosed = once(stalledSocket, "close")
+
+    await expect(settleWithin(
+      rawStatus("stalled connection probe", 1, "GET", "/", {
+        timeoutMs: 50,
+        connect: () => stalledSocket
+      }),
+      "stalled connection result"
+    )).rejects.toThrow("stalled connection probe exceeded 50ms")
+    await settleWithin(socketClosed, "stalled socket close")
+    expect(stalledSocket.destroyed).toBe(true)
   })
 })

@@ -1,6 +1,118 @@
-import { createServer } from "node:http"
+import { createServer, request as httpRequest } from "node:http"
+import { connect as openConnection } from "node:net"
 
 const CLOSE_DEADLINE_MS = 2_000
+const PROBE_DEADLINE_MS = 5_000
+
+const timedOut = (label, milliseconds) => new Error(`${label} exceeded ${milliseconds}ms`)
+
+/**
+ * Reads one HTTP status under an absolute wall-clock deadline. The timer is
+ * armed before Node creates the request, so stalled connection setup is bounded.
+ */
+export const requestStatus = (
+  label,
+  origin,
+  method,
+  target,
+  headers = {},
+  { timeoutMs = PROBE_DEADLINE_MS, request = httpRequest } = {}
+) => {
+  const result = Promise.withResolvers()
+  const url = new URL(origin)
+  let activeRequest
+  let settled = false
+  let deadline
+
+  const settle = (error, status, destroy = false) => {
+    if (settled) return
+    settled = true
+    clearTimeout(deadline)
+    if (destroy) activeRequest?.destroy()
+    if (error === undefined) result.resolve(status)
+    else result.reject(error)
+  }
+
+  deadline = setTimeout(
+    () => settle(timedOut(label, timeoutMs), undefined, true),
+    timeoutMs
+  )
+  try {
+    activeRequest = request({
+      host: url.hostname,
+      port: Number(url.port),
+      method,
+      path: target,
+      headers,
+      agent: false
+    }, (response) => {
+      response.resume()
+      response.once("error", (error) => settle(error, undefined, true))
+      response.once("aborted", () => settle(new Error(`${label} response aborted`), undefined, true))
+      response.once("end", () => settle(undefined, response.statusCode ?? 0))
+    })
+    activeRequest.once("error", (error) => settle(error))
+    activeRequest.end()
+  } catch (error) {
+    settle(error, undefined, true)
+  }
+  return result.promise
+}
+
+/**
+ * Sends one raw HTTP request under an absolute wall-clock deadline, including
+ * connection establishment. Every terminal path shares one idempotent cleanup.
+ */
+export const rawStatus = (
+  label,
+  port,
+  method,
+  target,
+  { timeoutMs = PROBE_DEADLINE_MS, connect = openConnection } = {}
+) => {
+  const result = Promise.withResolvers()
+  let socket
+  let bytes = Buffer.alloc(0)
+  let settled = false
+  let deadline
+
+  const settle = (error, status, destroy = false) => {
+    if (settled) return
+    settled = true
+    clearTimeout(deadline)
+    if (destroy) socket?.destroy()
+    if (error === undefined) result.resolve(status)
+    else result.reject(error)
+  }
+
+  deadline = setTimeout(
+    () => settle(timedOut(label, timeoutMs), undefined, true),
+    timeoutMs
+  )
+  try {
+    socket = connect({ host: "127.0.0.1", port })
+    socket.once("error", (error) => settle(error))
+    socket.once("close", () => settle(new Error(`${label} connection closed before response`)))
+    socket.once("connect", () => {
+      try {
+        socket.write(`${method} ${target} HTTP/1.1\r\nHost: trusted.invalid\r\nConnection: close\r\n\r\n`)
+      } catch (error) {
+        settle(error, undefined, true)
+      }
+    })
+    socket.on("data", (chunk) => {
+      bytes = Buffer.concat([bytes, chunk])
+      const end = bytes.indexOf("\r\n")
+      if (end === -1) return
+      const match = /^HTTP\/1\.1 ([0-9]{3}) /.exec(bytes.subarray(0, end).toString("ascii"))
+      if (match === null) settle(new Error(`${label} received a malformed response`), undefined, true)
+      else settle(undefined, Number(match[1]), true)
+    })
+  } catch (error) {
+    settle(error, undefined, true)
+  }
+  return result.promise
+}
 
 /**
  * Starts the trusted loopback proxy server for the preview acceptance run.

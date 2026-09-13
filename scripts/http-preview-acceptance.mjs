@@ -2,11 +2,53 @@
 
 import { randomBytes, createHash } from "node:crypto"
 import { once } from "node:events"
+import { writeSync } from "node:fs"
 import { request as httpRequest } from "node:http"
 import { connect } from "node:net"
 import { Effect, Result } from "effect"
 import { makeMicrovmClient, makeMicrovmCluster } from "../dist/index.js"
-import { listenTrustedProxy } from "./http-preview-proxy.mjs"
+import { listenTrustedProxy, rawStatus, requestStatus } from "./http-preview-proxy.mjs"
+
+let currentOperation = "initialization"
+let exiting = false
+
+const writeLine = (fileDescriptor, line) => {
+  try {
+    writeSync(fileDescriptor, `${line}\n`)
+  } catch {}
+}
+
+const step = (label) => {
+  writeLine(process.stdout.fd, `[http-preview] ${label}`)
+}
+
+const operationStarted = (label) => {
+  currentOperation = label
+  step(`${label} started`)
+}
+
+const operationSucceeded = () => {
+  const completed = currentOperation
+  currentOperation = "between acceptance operations"
+  step(`${completed} succeeded`)
+}
+
+const operationFailed = () => {
+  const failed = currentOperation
+  currentOperation = "between acceptance operations"
+  step(`${failed} failed`)
+}
+
+const exitWithPendingOperation = (reason, exitCode) => {
+  if (exiting) return
+  exiting = true
+  writeLine(process.stderr.fd, `[http-preview] ${reason}; pending operation: ${currentOperation}`)
+  process.exit(exitCode)
+}
+
+process.once("SIGTERM", () => exitWithPendingOperation("received SIGTERM", 143))
+process.once("uncaughtException", () => exitWithPendingOperation("uncaught exception", 1))
+process.once("unhandledRejection", () => exitWithPendingOperation("unhandled rejection", 1))
 
 const daemonUrl = process.env.MICROVM_URL
 const adminToken = process.env.MICROVM_TOKEN
@@ -30,17 +72,11 @@ const DEADLINES = {
   rpcMs: 60_000,
   rpcCreateMs: 300_000,
   requestMs: 30_000,
-  rawStatusMs: 30_000,
   websocketMs: 30_000,
   streamMs: 60_000
 }
 
 const expired = (label, milliseconds) => new Error(`${label} exceeded ${milliseconds}ms`)
-
-/** Prints one line per completed step so a stall names what last finished. */
-const step = (label) => {
-  process.stdout.write(`[http-preview] ${label}\n`)
-}
 
 /** Resolves `work` or rejects with a labelled error once `milliseconds` elapse. */
 const bounded = (label, milliseconds, work) => new Promise((resolve, reject) => {
@@ -86,24 +122,6 @@ const waitForResponse = async (url, predicate, timeoutMs = DEADLINES.readyMs) =>
   throw new Error(`timed out waiting for ${url}: ${last}`)
 }
 
-const requestStatus = (origin, method, target, headers = {}) => new Promise((resolve, reject) => {
-  const label = `raw ${method} ${target}`
-  const url = new URL(origin)
-  const request = httpRequest({
-    host: url.hostname,
-    port: Number(url.port),
-    method,
-    path: target,
-    headers,
-    agent: false
-  }, (response) => {
-    response.resume()
-    response.once("end", () => resolve(response.statusCode ?? 0))
-  })
-  request.setTimeout(DEADLINES.requestMs, () => request.destroy(expired(label, DEADLINES.requestMs)))
-  request.once("error", reject)
-  request.end()
-})
 
 const requestJson = (origin, target, headers) => new Promise((resolve, reject) => {
   const label = `header reflection ${target}`
@@ -135,26 +153,6 @@ const requestJson = (origin, target, headers) => new Promise((resolve, reject) =
   request.end()
 })
 
-const rawStatus = (port, method, target) => new Promise((resolve, reject) => {
-  const label = `raw ${method} ${target}`
-  const socket = connect({ host: "127.0.0.1", port })
-  let bytes = Buffer.alloc(0)
-  socket.setTimeout(DEADLINES.rawStatusMs, () => {
-    socket.destroy()
-    reject(expired(label, DEADLINES.rawStatusMs))
-  })
-  socket.once("error", reject)
-  socket.once("connect", () => socket.write(`${method} ${target} HTTP/1.1\r\nHost: trusted.invalid\r\nConnection: close\r\n\r\n`))
-  socket.on("data", (chunk) => {
-    bytes = Buffer.concat([bytes, chunk])
-    const end = bytes.indexOf("\r\n")
-    if (end === -1) return
-    const match = /^HTTP\/1\.1 ([0-9]{3}) /.exec(bytes.subarray(0, end).toString("ascii"))
-    socket.destroy()
-    if (match === null) reject(new Error("malformed trusted proxy response"))
-    else resolve(Number(match[1]))
-  })
-})
 
 const websocketFrame = (text) => {
   const payload = Buffer.from(text)
@@ -374,39 +372,77 @@ const program = Effect.scoped(Effect.gen(function*() {
   ))
 
   step("protocol service and trusted proxy ready")
+  operationStarted("missing capability request")
   const missing = yield* Effect.promise(() => requestStatus(
+    currentOperation,
     daemonUrl,
     "GET",
     `/http/v1/vms/${protocol.vm.vmId}/`
   ))
   assert(missing === 401, `missing ingress capability returned HTTP ${missing}`)
+  operationSucceeded()
+
+  operationStarted("administrative credential request")
   const controlCredential = yield* Effect.promise(() => requestStatus(
+    currentOperation,
     daemonUrl,
     "GET",
     `/http/v1/vms/${protocol.vm.vmId}/`,
     { "proxy-authorization": `Bearer ${adminToken}` }
   ))
   assert(controlCredential === 401, `admin credential authenticated data ingress: HTTP ${controlCredential}`)
+  operationSucceeded()
+
+  operationStarted("token donor creation")
   const tokenDonor = yield* boundedRpc(
-    "cluster create (cross-VM token donor)",
+    currentOperation,
     adminClient.create({ image, cpus: 1, memMib: 256, ttlSeconds: 300 }),
     DEADLINES.rpcCreateMs
   )
+  operationSucceeded()
   try {
+    operationStarted("cross-VM credential request")
     const crossVmCredential = yield* Effect.promise(() => requestStatus(
+      currentOperation,
       daemonUrl,
       "GET",
       `/http/v1/vms/${protocol.vm.vmId}/`,
       { "proxy-authorization": `Bearer ${tokenDonor.httpIngressToken}` }
     ))
     assert(crossVmCredential === 404, `cross-VM ingress credential returned HTTP ${crossVmCredential}`)
+    operationSucceeded()
   } finally {
-    yield* boundedRpc("destroy token donor VM", adminClient.destroy({ vmId: tokenDonor.vm.vmId }))
-      .pipe(Effect.catch(() => Effect.void))
+    const interruptedOperation = currentOperation
+    operationStarted("token donor destruction")
+    const donorDestroy = yield* Effect.result(boundedRpc(
+      currentOperation,
+      adminClient.destroy({ vmId: tokenDonor.vm.vmId })
+    ))
+    if (Result.isFailure(donorDestroy)) operationFailed()
+    else operationSucceeded()
+    currentOperation = interruptedOperation
   }
-  assert((yield* Effect.promise(() => rawStatus(publicServer.port, "CONNECT", "example.invalid:443"))) === 405, "CONNECT was not rejected")
-  assert((yield* Effect.promise(() => rawStatus(publicServer.port, "TRACE", "/"))) === 405, "TRACE was not rejected")
-  assert((yield* Effect.promise(() => rawStatus(publicServer.port, "GET", "http://example.invalid/"))) === 400, "absolute-form target was not rejected")
+
+  operationStarted("CONNECT method probe")
+  assert(
+    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "CONNECT", "example.invalid:443"))) === 405,
+    "CONNECT was not rejected"
+  )
+  operationSucceeded()
+
+  operationStarted("TRACE method probe")
+  assert(
+    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "TRACE", "/"))) === 405,
+    "TRACE was not rejected"
+  )
+  operationSucceeded()
+
+  operationStarted("absolute-form target probe")
+  assert(
+    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "GET", "http://example.invalid/"))) === 400,
+    "absolute-form target was not rejected"
+  )
+  operationSucceeded()
 
   step("capability separation and method/target rejection verified")
   const headers = yield* Effect.promise(() => requestJson(
