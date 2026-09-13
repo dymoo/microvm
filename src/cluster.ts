@@ -2,13 +2,16 @@ import { Effect, Result, Schema, Scope } from "effect"
 import { RpcClientError } from "effect/unstable/rpc"
 import { makeMicrovmClient, type MicrovmClient } from "./client.js"
 import { secureOrigin } from "./endpoint.js"
+import { makeSandboxHttpProxy, type SandboxHttpProxy } from "./http-proxy.js"
 import {
   BootFailed,
   CapacityExceeded,
+  ClusterServiceError,
   DestroyUncertain,
   Forbidden,
   GuestExecError,
   HostPrereqFailed,
+  HttpNotConfigured,
   ImageNotAllowed,
   Unauthenticated,
   VmNotFound,
@@ -19,6 +22,9 @@ import {
   type VmInfo,
   type CreateRequest,
   type ExecuteRequest,
+  type StartWebServiceRequest,
+  type StopWebServiceResult,
+  type WebServiceStatus
 } from "./protocol.js"
 
 export interface ClusterEndpoint {
@@ -45,6 +51,7 @@ export class ClusterEndpointUnavailable extends Schema.TaggedError<ClusterEndpoi
 
 interface EndpointRuntime {
   readonly origin: string
+  readonly ca: string | undefined
   readonly client: MicrovmClient
 }
 
@@ -63,10 +70,21 @@ export type ClusterDestroyError =
 export type ClusterListError =
   Forbidden | Unauthenticated | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
 
+export interface WebServiceHandle {
+  readonly status: () => Effect.Effect<WebServiceStatus, ClusterServiceError>
+  readonly stop: () => Effect.Effect<StopWebServiceResult, ClusterServiceError>
+}
+
 export interface SandboxHandle {
   readonly vm: VmInfo
   /** Sandbox-scoped client closed over the selected configured daemon. */
   readonly client: MicrovmClient
+  /** Binds the image's immutable `web` endpoint; callers cannot select a target. */
+  readonly http: () => Effect.Effect<SandboxHttpProxy, HttpNotConfigured>
+  /** Starts the single durable `web` service while ordinary execute remains available. */
+  readonly startWebService: (
+    request: StartWebServiceRequest
+  ) => Effect.Effect<WebServiceHandle, ClusterServiceError>
   readonly execute: (request: Omit<ExecuteRequest, "vmId">) => Effect.Effect<ExecResult, ClusterExecuteError>
   readonly inspect: () => Effect.Effect<VmInfo, ClusterInspectError>
   readonly destroy: () => Effect.Effect<DestroyResult, ClusterDestroyError>
@@ -82,6 +100,15 @@ export interface MicrovmCluster {
 
 const isCapacityExceeded = (error: unknown): error is CapacityExceeded =>
   error instanceof CapacityExceeded
+
+const serviceError = (vmId: VmId, error: unknown): ClusterServiceError =>
+  error instanceof ClusterServiceError
+    ? error
+    : new ClusterServiceError({
+      vmId,
+      code: "INTERNAL",
+      message: "web service control request failed"
+    })
 
 /**
  * Acquires a client for a static daemon set. Placement health checks are safe
@@ -119,7 +146,7 @@ export const makeMicrovmCluster = (
       const client = yield* makeMicrovmClient({ url: origin, token: endpoint.token, ca: endpoint.ca }).pipe(
         Effect.mapError((error) => new ClusterRoutingError({ reason: error.reason }))
       )
-      runtimes.push({ origin, client })
+      runtimes.push({ origin, client, ca: endpoint.ca })
     }
 
     const owners = new Map<string, EndpointRuntime>()
@@ -201,7 +228,7 @@ export const makeMicrovmCluster = (
           const sandboxClientResult = yield* Effect.result(makeMicrovmClient({
             url: candidate.endpoint.origin,
             token: result.success.sandboxToken,
-            ca: options.endpoints[candidate.index]?.ca
+            ca: candidate.endpoint.ca
           }).pipe(Effect.provideService(Scope.Scope, clusterScope)))
           if (Result.isFailure(sandboxClientResult)) {
             const rollback = yield* Effect.result(candidate.endpoint.client.destroy({ vmId }))
@@ -214,10 +241,33 @@ export const makeMicrovmCluster = (
             }))
           }
           const sandboxClient = sandboxClientResult.success
+          const httpProxy = result.success.httpIngressToken === undefined
+            ? undefined
+            : makeSandboxHttpProxy({
+              daemonOrigin: new URL(candidate.endpoint.origin),
+              vmId,
+              httpIngressToken: result.success.httpIngressToken,
+              ca: candidate.endpoint.ca
+            })
+          const webService: WebServiceHandle = {
+            status: () => sandboxClient.webServiceStatus({ vmId }).pipe(
+              Effect.mapError((error) => serviceError(vmId, error))
+            ),
+            stop: () => sandboxClient.stopWebService({ vmId }).pipe(
+              Effect.mapError((error) => serviceError(vmId, error))
+            )
+          }
           return {
             vm: result.success.vm,
             client: sandboxClient,
             execute: (input) => sandboxClient.execute({ ...input, vmId }),
+            http: () => httpProxy === undefined
+              ? Effect.fail(new HttpNotConfigured({ vmId }))
+              : Effect.succeed(httpProxy),
+            startWebService: (input) => sandboxClient.startWebService({ ...input, vmId }).pipe(
+              Effect.mapError((error) => serviceError(vmId, error)),
+              Effect.map(() => webService)
+            ),
             inspect: () => sandboxClient.inspect({ vmId }),
             destroy: () => sandboxClient.destroy({ vmId })
           }

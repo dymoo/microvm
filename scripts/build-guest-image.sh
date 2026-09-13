@@ -6,6 +6,9 @@ DEBIAN_SNAPSHOT=20260911T202741Z
 DEBIAN_SECURITY_SNAPSHOT=20260911T204307Z
 SOURCE_DATE_EPOCH=1789158461
 NODE_VERSION=24.21.0
+PNPM_VERSION=11.13.1
+# npm registry dist.integrity sha512-svx2g7imUlQU59E+G6KMqt3elr9m7FQL+ut+cCuB8+C+TR8pXt9/n+A5Z0Co3ORQnFgt33mJH0VD/qMtN2RfJQ==
+PNPM_SHA512=b2fc7683b8a6525414e7d13e1ba28caaddde96bf66ec540bfaeb7e702b81f3e0be4d1f295edf7f9fe0396740a8dce4509c582ddf79891f4543fea32d37645f25
 IMAGE_SIZE_MIB=2048
 IMAGE_NAME=microvm-agent
 TARGET_ARCH=
@@ -23,9 +26,10 @@ Usage: sudo scripts/build-guest-image.sh \
   [--name microvm-agent] [--size-mib 2048]
 
 Builds a pinned Debian 13 (Trixie) snapshot root image containing the maintained
-Node.js 24 LTS and Python 3.13 runtimes, the minimal PID 1, and the AF_VSOCK
-guest runner. The kernel is deliberately not downloaded: an operator must
-supply a Firecracker-compatible kernel and its trusted SHA-256 digest.
+Node.js 24 LTS, Python 3.13, and Git runtimes, pnpm 11, an offline-ready
+Next.js template, the minimal PID 1, and the AF_VSOCK guest runner. The kernel
+is deliberately not downloaded: an operator must supply a Firecracker-compatible
+kernel and its trusted SHA-256 digest.
 USAGE
 }
 
@@ -51,7 +55,7 @@ done
 [[ $IMAGE_NAME =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || { echo "--name must match [a-z0-9][a-z0-9._-]{0,63}" >&2; exit 2; }
 [[ $IMAGE_SIZE_MIB =~ ^[0-9]+$ && $IMAGE_SIZE_MIB -ge 512 && $IMAGE_SIZE_MIB -le 16384 ]] || { echo "--size-mib must be between 512 and 16384" >&2; exit 2; }
 
-for tool in chroot curl file find go install mke2fs mmdebstrap sha256sum tar truncate xz; do
+for tool in chroot cp curl file find go install mke2fs mmdebstrap sha256sum sha512sum tar truncate xz; do
   command -v "$tool" >/dev/null || { echo "required tool not found: $tool" >&2; exit 1; }
 done
 
@@ -96,6 +100,12 @@ esac
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
 mkdir -p "$OUTPUT_DIR"
+NEXT_TEMPLATE_SOURCE=$REPO_DIR/guest/image/next-template
+NEXT_INIT_SOURCE=$REPO_DIR/guest/image/microvm-next-init
+[[ -f $NEXT_TEMPLATE_SOURCE/pnpm-lock.yaml && -x $NEXT_INIT_SOURCE ]] || {
+  echo "Next.js image sources are incomplete" >&2
+  exit 1
+}
 OUTPUT_DIR=$(cd -- "$OUTPUT_DIR" && pwd)
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/microvm-image.XXXXXXXX")
 trap 'rm -rf -- "$WORK_DIR"' EXIT
@@ -103,6 +113,7 @@ ROOTFS=$WORK_DIR/rootfs
 BUILD_DIR=$WORK_DIR/bin
 IMAGE_TMP=$WORK_DIR/rootfs.raw
 NODE_ARCHIVE=$WORK_DIR/node-v$NODE_VERSION-linux-$NODE_ARCH.tar.xz
+PNPM_ARCHIVE=$WORK_DIR/pnpm-$PNPM_VERSION.tgz
 mkdir -p "$ROOTFS" "$BUILD_DIR"
 
 export SOURCE_DATE_EPOCH
@@ -117,7 +128,7 @@ mmdebstrap \
   --variant=minbase \
   --architectures="$DEB_ARCH" \
   --components=main \
-  --include=ca-certificates,python3 \
+  --include=ca-certificates,git,python3 \
   --aptopt='Acquire::Check-Valid-Until "false"' \
   --aptopt='Acquire::Languages "none"' \
   --dpkgopt='path-exclude=/usr/share/doc/*' \
@@ -137,6 +148,17 @@ printf '%s  %s\n' "$NODE_SHA256" "$NODE_ARCHIVE" | sha256sum --check --status ||
 tar -xJf "$NODE_ARCHIVE" -C "$ROOTFS/usr/local" --strip-components=1 --no-same-owner
 ln -s /usr/local/bin/node "$ROOTFS/usr/bin/node"
 
+curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  --output "$PNPM_ARCHIVE" "https://registry.npmjs.org/pnpm/-/pnpm-$PNPM_VERSION.tgz"
+printf '%s  %s\n' "$PNPM_SHA512" "$PNPM_ARCHIVE" | sha512sum --check --status || {
+  echo "pnpm archive integrity mismatch" >&2
+  exit 1
+}
+install -d -o 0 -g 0 -m 0755 "$ROOTFS/usr/local/lib/pnpm"
+tar -xzf "$PNPM_ARCHIVE" -C "$ROOTFS/usr/local/lib/pnpm" \
+  --strip-components=1 --no-same-owner
+ln -s ../lib/pnpm/bin/pnpm.mjs "$ROOTFS/usr/local/bin/pnpm"
+
 (
   cd "$REPO_DIR/guest"
   CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build \
@@ -144,13 +166,18 @@ ln -s /usr/local/bin/node "$ROOTFS/usr/bin/node"
     -o "$BUILD_DIR/microvm-guest" ./cmd/microvm-guest
   CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build \
     -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
+    -o "$BUILD_DIR/microvm-http-proxy" ./cmd/microvm-http-proxy
+  CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build \
+    -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
     -o "$BUILD_DIR/microvm-init" ./cmd/microvm-init
 )
 
 install -D -o 0 -g 0 -m 0755 "$BUILD_DIR/microvm-guest" "$ROOTFS/usr/local/sbin/microvm-guest"
+install -D -o 0 -g 0 -m 0755 "$BUILD_DIR/microvm-http-proxy" "$ROOTFS/usr/local/sbin/microvm-http-proxy"
 install -D -o 0 -g 0 -m 0755 "$BUILD_DIR/microvm-init" "$ROOTFS/usr/local/sbin/microvm-init"
 rm -f "$ROOTFS/sbin/init"
 ln -s /usr/local/sbin/microvm-init "$ROOTFS/sbin/init"
+install -D -o 0 -g 0 -m 0755 "$NEXT_INIT_SOURCE" "$ROOTFS/usr/local/bin/microvm-next-init"
 
 if chroot "$ROOTFS" /usr/bin/getent passwd 1000 >/dev/null; then
   echo "snapshot already assigns uid 1000; refusing ambiguous execution identity" >&2
@@ -160,13 +187,48 @@ chroot "$ROOTFS" /usr/sbin/useradd \
   --uid 1000 --user-group --home-dir /workspace --no-create-home \
   --shell /usr/sbin/nologin agent
 install -d -o 1000 -g 1000 -m 0700 "$ROOTFS/workspace"
+install -d -o 1000 -g 1000 -m 0755 \
+  "$ROOTFS/opt/microvm/next-template" "$ROOTFS/var/lib/microvm/pnpm-store"
+cp -a "$NEXT_TEMPLATE_SOURCE/." "$ROOTFS/opt/microvm/next-template/"
+chown -R 1000:1000 "$ROOTFS/opt/microvm/next-template"
+
+# The chroot may need the builder's resolver only while fetching the lockfile's
+# pinned public packages. Runtime DNS is removed again before image creation.
+BUILD_RESOLV_CONF=/etc/resolv.conf
+[[ -r /run/systemd/resolve/resolv.conf ]] && BUILD_RESOLV_CONF=/run/systemd/resolve/resolv.conf
+cp -L "$BUILD_RESOLV_CONF" "$ROOTFS/etc/resolv.conf"
+chroot --userspec=1000:1000 "$ROOTFS" /usr/bin/env -i \
+  HOME=/workspace USER=agent LOGNAME=agent \
+  PATH=/usr/local/bin:/usr/bin:/bin CI=true \
+  /usr/local/bin/pnpm --dir /opt/microvm/next-template fetch \
+    --frozen-lockfile --config.offline=false
+rm -f "$ROOTFS/etc/resolv.conf"
+: >"$ROOTFS/etc/resolv.conf"
+# pnpm fetch may create a virtual store without project links. Recreate
+# node_modules strictly from the now-prewarmed content-addressed store.
+rm -rf "$ROOTFS/opt/microvm/next-template/node_modules"
+chroot --userspec=1000:1000 "$ROOTFS" /usr/bin/env -i \
+  HOME=/workspace USER=agent LOGNAME=agent \
+  PATH=/usr/local/bin:/usr/bin:/bin CI=true \
+  /usr/local/bin/pnpm --dir /opt/microvm/next-template install \
+    --offline --frozen-lockfile --config.package-import-method=copy
+chroot --userspec=1000:1000 "$ROOTFS" /usr/bin/env -i \
+  HOME=/workspace USER=agent LOGNAME=agent \
+  PATH=/usr/local/bin:/usr/bin:/bin CI=true \
+  /usr/local/bin/pnpm --dir /opt/microvm/next-template run typecheck
+
+chown -R 0:0 "$ROOTFS/opt/microvm/next-template"
+chmod -R u=rwX,go=rX "$ROOTFS/opt/microvm/next-template"
+chown -R 1000:1000 "$ROOTFS/var/lib/microvm/pnpm-store"
 install -d -o 0 -g 0 -m 0755 \
   "$ROOTFS/dev/pts" "$ROOTFS/proc" "$ROOTFS/run" \
   "$ROOTFS/sys/fs/cgroup/microvm-exec" "$ROOTFS/tmp"
 chmod 1777 "$ROOTFS/tmp"
 
 chroot "$ROOTFS" /usr/bin/node --version
+chroot "$ROOTFS" /usr/local/bin/pnpm --version
 chroot "$ROOTFS" /usr/bin/python3 --version
+chroot "$ROOTFS" /usr/bin/git --version
 rm -rf "$ROOTFS/var/lib/apt/lists"/* "$ROOTFS/var/cache/apt/archives"/*
 find "$ROOTFS" -xdev -exec touch --no-dereference --date="@$SOURCE_DATE_EPOCH" {} +
 
@@ -184,7 +246,7 @@ CHECKSUM_OUTPUT=$OUTPUT_DIR/$IMAGE_NAME.sha256
 install -o 0 -g 0 -m 0644 "$IMAGE_TMP" "$IMAGE_OUTPUT"
 install -o 0 -g 0 -m 0644 "$KERNEL" "$KERNEL_OUTPUT"
 cat >"$MANIFEST_OUTPUT" <<EOF
-{"name":"$IMAGE_NAME","file":"$IMAGE_NAME.raw","arch":"$TARGET_ARCH","rootDevice":"/dev/vda"}
+{"name":"$IMAGE_NAME","file":"$IMAGE_NAME.raw","arch":"$TARGET_ARCH","rootDevice":"/dev/vda","httpEndpoints":{"web":{"port":3000}}}
 EOF
 (
   cd "$OUTPUT_DIR"

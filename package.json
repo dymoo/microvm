@@ -47,6 +47,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "check-all": "pnpm typecheck && pnpm build && pnpm test",
     "test": "vitest run",
     "test:watch": "vitest"
   },

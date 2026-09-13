@@ -11,7 +11,17 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createServer, type Server, type Socket } from "node:net"
 import { afterEach, describe, expect, it } from "vitest"
-import { GuestExecChannel, GuestExecChannelLive, GuestTransportFault, type GuestExecSuccess } from "../src/firecracker.js"
+import {
+  awaitGuestReadiness,
+  GuestExecChannel,
+  GuestExecChannelLive,
+  GuestHttpChannel,
+  GuestHttpChannelLive,
+  GuestServiceChannel,
+  GuestServiceChannelLive,
+  GuestTransportFault,
+  type GuestExecSuccess
+} from "../src/firecracker.js"
 
 interface FakeGuest {
   readonly path: string
@@ -31,7 +41,10 @@ const closed = (server: Server): Promise<void> => {
 }
 
 const startFakeGuest = (
-  behavior: (socket: Socket, request: unknown) => void
+  behavior: (socket: Socket, request: unknown) => void,
+  acknowledge: (socket: Socket) => void = (socket) => {
+    socket.write("OK 1073741824\n")
+  }
 ): Promise<FakeGuest> => {
   const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
   const path = join(dir, "v.sock")
@@ -49,7 +62,7 @@ const startFakeGuest = (
           socket.destroy()
           return
         }
-        socket.write("OK 1073741824\n")
+        acknowledge(socket)
         acked = true
       }
       const index = buffer.indexOf("\n")
@@ -118,6 +131,134 @@ describe("guest exec v1 channel", () => {
     expect(result.frame.stderr.toString("utf8")).toBe("warn")
     expect(result.frame.timedOut).toBe(false)
     expect(result.frame.outputTruncated).toBe(false)
+  })
+
+  it("accepts a fragmented CONNECT acknowledgement", async () => {
+    const guest = track(await startFakeGuest((socket) => {
+      socket.end(frame({ type: "exit", code: 0, signal: null, timedOut: false, outputTruncated: false }))
+    }, (socket) => {
+      socket.write("OK 107")
+      setImmediate(() => socket.write("3741824\n"))
+    }))
+    const result = await runExec(guest.path) as Extract<GuestExecSuccess, { _tag: "Exit" }>
+    expect(result.frame.code).toBe(0)
+  })
+
+  it("preserves a terminal frame coalesced after the CONNECT acknowledgement", async () => {
+    const terminal = frame({
+      type: "exit",
+      code: 23,
+      signal: null,
+      timedOut: false,
+      outputTruncated: false
+    })
+    const guest = track(await startFakeGuest(() => undefined, (socket) => {
+      socket.write(`OK 1073741824\n${terminal}`)
+    }))
+    const result = await runExec(guest.path) as Extract<GuestExecSuccess, { _tag: "Exit" }>
+    expect(result.frame.code).toBe(23)
+  })
+
+  it("maps HTTP and service APIs to their fixed vsock purposes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    const connects: Array<string> = []
+    let serviceRequest: Record<string, unknown> | undefined
+    const server = createServer((socket) => {
+      let buffer = ""
+      let connected = false
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8")
+        const newline = buffer.indexOf("\n")
+        if (newline === -1) return
+        if (!connected) {
+          const line = buffer.slice(0, newline)
+          buffer = buffer.slice(newline + 1)
+          connects.push(line)
+          connected = true
+          socket.write("OK 1073741824\n")
+          if (line === "CONNECT 1025") return
+        }
+        const requestEnd = buffer.indexOf("\n")
+        if (requestEnd === -1) return
+        serviceRequest = JSON.parse(buffer.slice(0, requestEnd)) as Record<string, unknown>
+        socket.end(`${JSON.stringify({
+          version: 1,
+          id: serviceRequest["id"],
+          type: "status",
+          state: "exited",
+          startedAtEpochMs: 42,
+          exitCode: 0
+        })}\n`)
+      })
+    })
+    server.listen(path)
+    await started(server)
+    track({
+      path,
+      cleanup: async () => {
+        server.close()
+        await closed(server)
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+
+    await Effect.runPromise(
+      Effect.scoped(Effect.gen(function*() {
+        const http = yield* GuestHttpChannel
+        yield* http.open({ vmId: "mvm-test0001", vsockSocket: path })
+      })).pipe(Effect.provide(GuestHttpChannelLive))
+    )
+    const state = await Effect.runPromise(
+      Effect.gen(function*() {
+        const service = yield* GuestServiceChannel
+        return yield* service.status({
+          vmId: "mvm-test0001",
+          vsockSocket: path,
+          requestId: "service-1"
+        })
+      }).pipe(Effect.provide(GuestServiceChannelLive))
+    )
+
+    expect(connects).toEqual(["CONNECT 1025", "CONNECT 1026"])
+    expect(serviceRequest).toMatchObject({ version: 1, id: "service-1", op: "status" })
+    expect(state).toEqual({ state: "exited", startedAtEpochMs: 42, exitCode: 0, signal: null })
+  })
+
+  it("requires all three fixed listeners for web-enabled boot readiness", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    const connects: Array<string> = []
+    const server = createServer((socket) => {
+      let buffer = ""
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8")
+        const newline = buffer.indexOf("\n")
+        if (newline === -1) return
+        connects.push(buffer.slice(0, newline))
+        socket.end("OK 1073741824\n")
+      })
+    })
+    server.listen(path)
+    await started(server)
+    track({
+      path,
+      cleanup: async () => {
+        server.close()
+        await closed(server)
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+
+    await Effect.runPromise(awaitGuestReadiness("mvm-test0001", path, 1_000, true))
+    expect(connects).toEqual(["CONNECT 1024", "CONNECT 1025", "CONNECT 1026"])
+  })
+
+  it("rejects a CONNECT acknowledgement outside the vsock port range", async () => {
+    const guest = track(await startFakeGuest(() => undefined, (socket) => {
+      socket.end("OK 4294967296\n")
+    }))
+    await expect(runExec(guest.path)).rejects.toBeInstanceOf(GuestTransportFault)
   })
 
   it("reports guest error frames for pre-exec rejections", async () => {

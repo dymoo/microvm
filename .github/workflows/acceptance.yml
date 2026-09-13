@@ -121,7 +121,7 @@ jobs:
           MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
           bash scripts/ci-acceptance.sh image
 
-      - name: Daemon, jailed acceptance, and hostile guest abuse
+      - name: Daemon, HTTP preview, jailed acceptance, and hostile guest abuse
         run: >-
           sudo env PATH="$PATH"
           FIRECRACKER_URL="$FIRECRACKER_URL"

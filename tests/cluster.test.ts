@@ -7,14 +7,19 @@ import { afterEach, describe, expect, it } from "vitest"
 import { makeMicrovmClient } from "../src/client.js"
 import { makeMicrovmCluster } from "../src/cluster.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
-import { Firecracker, GuestExecChannel } from "../src/firecracker.js"
+import {
+  Firecracker,
+  GuestExecChannel,
+  GuestServiceChannel,
+  type WebServiceState
+} from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
 
 const adminToken = "admin-token-for-cluster-integration"
 const roots: Array<string> = []
 const createPayload = { image: "node", cpus: undefined, memMib: undefined, ttlSeconds: undefined } as const
 
-const fixture = async (): Promise<string> => {
+const fixture = async (webPort?: number): Promise<string> => {
   const root = await mkdtemp(join(tmpdir(), "microvm-cluster-"))
   roots.push(root)
   await mkdir(join(root, "images"), { recursive: true })
@@ -26,7 +31,8 @@ const fixture = async (): Promise<string> => {
     file: "node.raw",
     arch: process.arch === "arm64" ? "aarch64" : "x86_64",
     sizeBytes: 4,
-    rootDevice: "/dev/vda"
+    rootDevice: "/dev/vda",
+    ...(webPort === undefined ? {} : { httpEndpoints: { web: { port: webPort } } })
   }))
   return root
 }
@@ -106,9 +112,21 @@ const guestLayer = (marker: string, onBlock?: () => Effect.Effect<never>) =>
       })
   }))
 
-const start = (root: string, maxVms: number, server: Server, firecracker: Layer.Layer<Firecracker>, guest: Layer.Layer<GuestExecChannel>) =>
+const start = (
+  root: string,
+  maxVms: number,
+  server: Server,
+  firecracker: Layer.Layer<Firecracker>,
+  guest: Layer.Layer<GuestExecChannel>,
+  guestService?: Layer.Layer<GuestServiceChannel>
+) =>
   daemonLayer(configFor(root, maxVms), {
-    server, firecracker, guestExec: guest, prereqs, unsafeSkipKernelLockForTests: true
+    server,
+    firecracker,
+    guestExec: guest,
+    prereqs,
+    unsafeSkipKernelLockForTests: true,
+    ...(guestService === undefined ? {} : { guestService })
   }).pipe(
     Layer.launch,
     Effect.forkScoped
@@ -149,6 +167,107 @@ describe("static microVM cluster", () => {
       expect((yield* secondAdmin.inspect({ vmId: sandbox.vm.vmId })).vmId).toBe(sandbox.vm.vmId)
       expect((yield* cluster.inspect(sandbox.vm.vmId)).vmId).toBe(sandbox.vm.vmId)
       expect((yield* cluster.destroy(sandbox.vm.vmId)).destroyed).toBe(true)
+    })))
+  })
+
+  it("exposes only a semantic HTTP adapter when the image declares web", async () => {
+    const plainRoot = await fixture()
+    const webRoot = await fixture(3_000)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const plainServer = createServer()
+      const webServer = createServer()
+      yield* start(plainRoot, 1, plainServer, firecrackerLayer()(plainServer), guestLayer("plain"))
+      yield* start(webRoot, 1, webServer, firecrackerLayer()(webServer), guestLayer("web"))
+      const plainUrl = `http://127.0.0.1:${yield* listeningPort(plainServer)}`
+      const webUrl = `http://127.0.0.1:${yield* listeningPort(webServer)}`
+
+      const plainCluster = yield* makeMicrovmCluster({ endpoints: [{ url: plainUrl, token: adminToken }] })
+      const plain = yield* plainCluster.create(createPayload)
+      const absent = yield* Effect.result(plain.http())
+      expect(Result.isFailure(absent) && absent.failure._tag).toBe("HttpNotConfigured")
+      expect(Result.isFailure(absent) && absent.failure.vmId).toBe(plain.vm.vmId)
+
+      const webCluster = yield* makeMicrovmCluster({ endpoints: [{ url: webUrl, token: adminToken }] })
+      const web = yield* webCluster.create(createPayload)
+      const proxy = yield* web.http()
+      expect(Object.keys(proxy).sort()).toEqual(["handleRequest", "handleUpgrade"])
+      expect(typeof proxy.handleRequest).toBe("function")
+      expect(typeof proxy.handleUpgrade).toBe("function")
+      expect("httpIngressToken" in web).toBe(false)
+      expect(yield* web.http()).toBe(proxy)
+    })))
+  })
+
+  it("owns the durable web service lifecycle without blocking execute", async () => {
+    const root = await fixture(3_000)
+    let state: WebServiceState = { state: "not_started" }
+    let startOptions: Parameters<GuestServiceChannel["Service"]["start"]>[0] | undefined
+    const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
+      start: (options) => Effect.sync(() => {
+        startOptions = options
+        state = { state: "running", startedAtEpochMs: 1_700_000_000_000 }
+        return state
+      }),
+      status: () => Effect.sync(() => state),
+      stop: () => Effect.sync(() => {
+        state = {
+          state: "exited",
+          startedAtEpochMs: 1_700_000_000_000,
+          exitCode: 143,
+          signal: "SIGTERM"
+        }
+        return { stopped: true }
+      })
+    }))
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const server = createServer()
+      yield* start(
+        root,
+        1,
+        server,
+        firecrackerLayer()(server),
+        guestLayer("execute-remains-available"),
+        serviceLayer
+      )
+      const url = `http://127.0.0.1:${yield* listeningPort(server)}`
+      const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
+      const sandbox = yield* cluster.create(createPayload)
+
+      const service = yield* sandbox.startWebService({
+        argv: ["/usr/bin/node", "server.js"],
+        cwd: "/workspace",
+        env: { NODE_ENV: "development" }
+      })
+      expect(Object.keys(service).sort()).toEqual(["status", "stop"])
+      expect(yield* service.status()).toMatchObject({
+        state: "running",
+        startedAtEpochMs: 1_700_000_000_000
+      })
+      expect(Buffer.from((yield* sandbox.execute(execPayload)).stdoutB64, "base64").toString()).toBe(
+        "execute-remains-available"
+      )
+      expect(startOptions).toMatchObject({
+        vmId: sandbox.vm.vmId,
+        argv: ["/usr/bin/node", "server.js"],
+        cwd: "/workspace",
+        env: { NODE_ENV: "development" },
+        webPort: 3_000
+      })
+      expect(yield* service.stop()).toEqual({ stopped: true })
+      expect(yield* service.status()).toMatchObject({
+        state: "exited",
+        startedAtEpochMs: 1_700_000_000_000,
+        exitCode: 143,
+        signal: "SIGTERM"
+      })
+
+      const reserved = yield* Effect.result(sandbox.startWebService({
+        argv: ["/usr/bin/node", "server.js"],
+        env: { PORT: "9999" }
+      }))
+      expect(Result.isFailure(reserved) && reserved.failure._tag).toBe("ClusterServiceError")
+      expect(Result.isFailure(reserved) && reserved.failure.code).toBe("INVALID_REQUEST")
     })))
   })
 

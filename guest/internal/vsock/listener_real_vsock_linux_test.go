@@ -24,9 +24,9 @@ type readResult struct {
 }
 
 func TestListenerRejectsLocalVSOCKPeer(t *testing.T) {
-	listener, err := Listen()
+	listener, err := ListenExec()
 	if err != nil {
-		t.Fatalf("listen on AF_VSOCK port %d: %v", Port, err)
+		t.Fatalf("listen on AF_VSOCK port %d: %v", ExecPort, err)
 	}
 	defer listener.Close()
 
@@ -59,7 +59,7 @@ func TestListenerRejectsLocalVSOCKPeer(t *testing.T) {
 
 	connectErr := unix.Connect(clientFD, &unix.SockaddrVM{
 		CID:  unix.VMADDR_CID_LOCAL,
-		Port: Port,
+		Port: ExecPort,
 	})
 	if errors.Is(connectErr, unix.EINPROGRESS) {
 		pollFDs := []unix.PollFd{{Fd: int32(clientFD), Events: unix.POLLOUT}}
@@ -75,10 +75,10 @@ func TestListenerRejectsLocalVSOCKPeer(t *testing.T) {
 			t.Fatalf("read AF_VSOCK connection result: %v", err)
 		}
 		if socketErr != 0 {
-			t.Fatalf("connect to AF_VSOCK CID_LOCAL:%d: %v", Port, unix.Errno(socketErr))
+			t.Fatalf("connect to AF_VSOCK CID_LOCAL:%d: %v", ExecPort, unix.Errno(socketErr))
 		}
 	} else if connectErr != nil {
-		t.Fatalf("connect to AF_VSOCK CID_LOCAL:%d: %v", Port, connectErr)
+		t.Fatalf("connect to AF_VSOCK CID_LOCAL:%d: %v", ExecPort, connectErr)
 	}
 
 	localAddress, err := unix.Getsockname(clientFD)

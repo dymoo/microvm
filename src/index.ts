@@ -30,28 +30,36 @@ export type {
   ClusterListError,
   MicrovmCluster,
   MicrovmClusterOptions,
-  SandboxHandle
+  SandboxHandle,
+  WebServiceHandle
 } from "./cluster.js"
+
+export type { SandboxHttpProxy } from "./http-proxy.js"
 
 export {
   BootFailed,
   CapacityExceeded,
   CleanupResult,
+  ClusterServiceError,
   CreateResult,
   DestroyResult,
   DestroyUncertain,
   ExecResult,
   Forbidden,
+  HttpNotConfigured,
   ImageNotAllowed,
   HostPrereqFailed,
   ImageName,
   ListResult,
   MicrovmRpc,
+  StartWebServiceRequest,
+  StopWebServiceResult,
   Unauthenticated,
   VmId,
   VmInfo,
   VmNotFound,
-  VmPoisoned
+  VmPoisoned,
+  WebServiceStatus
 } from "./protocol.js"
 export type {
   CleanupRequest,
@@ -59,5 +67,8 @@ export type {
   DestroyRequest,
   ExecuteRequest,
   InspectRequest,
-  ListRequest
+  ListRequest,
+  StartWebServiceRpcRequest,
+  StopWebServiceRequest,
+  WebServiceStatusRequest
 } from "./protocol.js"

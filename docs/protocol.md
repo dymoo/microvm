@@ -1,10 +1,10 @@
-# Guest exec protocol v1 (host <-> guest runner)
+# Guest protocols v1 (host <-> guest)
 
-This is the exact wire contract between the host daemon (`src/firecracker.ts`)
-and the Go guest runner (`guest/`). Both sides MUST implement it byte-for-byte.
-Error enums and limits here are final.
+This is the exact wire contract between the host daemon and the Go guest
+services. Both sides MUST implement it byte-for-byte. Error enums and limits
+here are final.
 
-## Transport
+## Exec transport
 
 1. At VM configure time the daemon supplies Firecracker `uds_path: "v.sock"`,
    relative to the jailed root. The host-side socket is
@@ -98,3 +98,93 @@ Pre-exec / protocol failures (no process ran, or the request was invalid):
   A later per-command isolation setup failure returns a bounded `INTERNAL`
   error before starting the workload; there is no degraded execution mode.
 - No guest network interfaces exist; vsock is the only guest I/O channel.
+
+## Shared fixed-purpose transport
+
+Every channel begins by connecting to the VM's Firecracker vsock UDS and
+writing one ASCII selector:
+
+| Purpose | Selector | Guest listener |
+| --- | --- | --- |
+| exec | `CONNECT 1024\n` | AF_VSOCK 1024 |
+| HTTP preview | `CONNECT 1025\n` | AF_VSOCK 1025 |
+| web-service control | `CONNECT 1026\n` | AF_VSOCK 1026 |
+
+The host accepts one bounded `OK <uint32>\n` Firecracker acknowledgement and
+continues on that same socket. Fragmented acknowledgements are accumulated;
+bytes coalesced after the newline remain application data. No public API
+accepts a UDS path, vsock port, guest host, or guest TCP port.
+
+## HTTP preview v1
+
+The image manifest may declare exactly one immutable endpoint:
+
+```json
+{"httpEndpoints":{"web":{"port":3000}}}
+```
+
+The port is an integer from 1024 through 65535. PID 1 raises loopback before
+starting the HTTP bridge as UID/GID 1001. The bridge dials only
+`tcp4 127.0.0.1:<manifest-port>` and handles one HTTP/1.1 exchange per vsock
+connection. A connection refusal is `503 Service Unavailable`; an origin head
+timeout is `504 Gateway Timeout`; an invalid origin response is `502 Bad
+Gateway`. None poisons the VM.
+
+The host daemon route is `/http/v1/vms/<vm-id><raw-suffix>`. It authenticates
+one VM-bound HTTP-ingress capability in `Proxy-Authorization: Bearer ...`
+before acquiring a VM or opening vsock. Admin and sandbox-control tokens are
+not ingress tokens. The external Node adapter owns capability injection, and
+neither the token nor the daemon route is exposed through `SandboxHttpProxy`.
+
+Request and response handling is semantic, not a raw byte tunnel:
+
+- origin-form targets only; raw path/query bytes are preserved after removing
+  the daemon prefix;
+- `CONNECT`, `TRACE`, malformed upgrades, trailers, `Expect`, ambiguous
+  framing, and reserved `Microvm-*` fields are rejected;
+- `Proxy-*`, hop-by-hop and connection-nominated fields, caller forwarding
+  metadata, `Host`, and transport framing are stripped and reconstructed;
+- application `Authorization` is preserved, while `Proxy-Authorization` never
+  reaches the guest;
+- request target, headers, field count, request body, upload idle time, and
+  response-head time are bounded; bodies remain streaming and backpressured;
+- SSE flushes immediately and occupies one of eight per-VM long-lived slots.
+
+A WebSocket request is admitted only after a valid RFC 6455 version/key and a
+valid guest `101` accept/subprotocol response. Extensions are disabled.
+Client-to-server frames must be masked, server-to-client frames unmasked, RSV
+bits and reserved opcodes are rejected, control/fragmentation rules are
+checked, and an aggregate message is capped at 1 MiB. Neither public nor guest
+sockets become available to callers.
+
+Destroy blocks new admissions, aborts active HTTP/SSE/WebSocket scopes, waits
+a bounded interval, stops the VM, and proves the captured scopes closed before
+returning success. Teardown revokes ingress and sandbox-control credentials.
+
+## Durable web-service control v1
+
+Port 1026 accepts one UTF-8 JSON line and returns one UTF-8 JSON line, then
+closes. The service process is owned by the guest controller, not by that
+connection, so it continues running after a successful `start` response.
+
+Start request:
+
+```json
+{"version":1,"id":"<safe-id>","op":"start","argv":["/usr/local/bin/pnpm","dev"],"cwd":"/workspace","env":{"NODE_ENV":"development"},"port":3000}
+```
+
+`argv` is direct execution with no shell; `cwd` is `/workspace` or a
+descendant. The daemon supplies the immutable manifest `port`; caller
+`HOSTNAME` and `PORT` environment entries are rejected and the guest injects
+`HOSTNAME=127.0.0.1` plus the manifest port. Exactly one web service may run.
+It runs as UID/GID 1000 in `/sys/fs/cgroup/microvm-service/web` with the same
+CPU, memory, PID, and group-kill posture as exec. stdout and stderr are drained
+into bounded 64 KiB tails so an unattended service cannot deadlock.
+
+Status and stop requests contain only `version`, `id`, and `op` (`status` or
+`stop`). Status returns `not_started`, `running`, or `exited` with start time
+and, after exit, code/signal. Stop freezes and kills the service cgroup, waits
+for confirmed exit, and is idempotent. Malformed control frames and unknown
+operations return bounded `INVALID_REQUEST`; start conflicts return
+`START_FAILED`. A well-formed guest service error is not VM poison, while a
+service-channel framing/transport fault is.

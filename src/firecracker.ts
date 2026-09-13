@@ -17,25 +17,29 @@
  *   frame types, deadline expiry — is a `GuestTransportFault`; the daemon
  *   poisons such VMs and exec success is never reported for a VM in doubt.
  */
-import { Cause, Context, Effect, Exit, Layer, Schema } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Schema, Scope } from "effect"
 import { spawn, type ChildProcess } from "node:child_process"
 import { Buffer } from "node:buffer"
 import { existsSync } from "node:fs"
 import { rmdir } from "node:fs/promises"
 import { request as httpRequest, type ClientRequest } from "node:http"
-import { connect, type Socket } from "node:net"
+import type { Socket } from "node:net"
 import type { HostConfig } from "./host.js"
 import { provisionChroot, type ResolvedImage, type VmLayout } from "./host.js"
 import {
   BootFailed,
   DEFAULT_MAX_OUTPUT_BYTES,
   DEFAULT_TIMEOUT_MS,
-  GUEST_VSOCK_PORT,
   GuestExecError,
   MAX_JSONL_LINE_BYTES,
   MAX_OUTPUT_BYTES_PER_STREAM,
   MAX_TIMEOUT_MS
 } from "./protocol.js"
+import {
+  openGuestExecSocket,
+  openGuestHttpSocket,
+  openGuestServiceSocket
+} from "./vsock.js"
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -205,6 +209,12 @@ export interface BootSpec {
   readonly memMib: number
   /** Operator-controlled kernel boot arguments; never caller-supplied. */
   readonly kernelArgs: string
+  /**
+   * Immutable image-manifest web port. When present it is passed to the guest
+   * through the operator-controlled kernel command line and all preview
+   * listeners must be ready before boot succeeds.
+   */
+  readonly webPort?: number | undefined
   readonly layout: VmLayout
   readonly uid: number
   readonly gid: number
@@ -258,6 +268,15 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
       Effect.gen(function*() {
         const layout = spec.layout
         const vmId = spec.vmId
+        if (
+          spec.webPort !== undefined &&
+          (!Number.isInteger(spec.webPort) || spec.webPort < 1024 || spec.webPort > 65_535)
+        ) {
+          return yield* Effect.fail(new FirecrackerError({
+            vmId,
+            reason: "web port must be an integer between 1024 and 65535"
+          }))
+        }
 
         // 1. Private root disk + kernel copy inside the chroot.
         yield* provisionChroot(vmId, layout, image, config.kernelImage, spec.uid, spec.gid).pipe(
@@ -369,7 +388,9 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
 
             yield* apiRequest(vmId, layout.apiSocket, "PUT", "/boot-source", {
               kernel_image_path: basenameIn(layout.kernelPath),
-              boot_args: spec.kernelArgs
+              boot_args: spec.webPort === undefined
+                ? spec.kernelArgs
+                : `${spec.kernelArgs} microvm.web_port=${spec.webPort}`
             })
             yield* apiRequest(vmId, layout.apiSocket, "PUT", "/drives/rootfs", {
               drive_id: "rootfs",
@@ -398,10 +419,14 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
                 : Effect.fail(cause as FirecrackerError | BootProcessDied)
             )
           )
-
         const startTransaction = configureAndStart.pipe(
           Effect.andThen(
-            awaitGuestReadiness(vmId, layout.vsockSocket, config.guestReadinessTimeoutMs).pipe(
+            awaitGuestReadiness(
+              vmId,
+              layout.vsockSocket,
+              config.guestReadinessTimeoutMs,
+              spec.webPort !== undefined
+            ).pipe(
               Effect.mapError((reason) => new BootFailed({ vmId, reason }))
             )
           )
@@ -487,68 +512,60 @@ const waitForSocket = (
 // Guest readiness probing
 // ---------------------------------------------------------------------------
 
-/**
- * Single readiness attempt: connect to the vsock UDS, send
- * `CONNECT 1024\n`, and require `OK <port>\n`. The probe destroys the
- * connection immediately after — the guest runner treats a connection with
- * no request as a no-op (docs/protocol.md).
- */
+/** A single fixed-purpose readiness probe; the scoped socket is immediately closed. */
+const probeListener = (
+  name: string,
+  open: Effect.Effect<Socket, string, Scope.Scope>
+): Effect.Effect<void, string> =>
+  Effect.scoped(
+    open.pipe(
+      Effect.map(() => undefined),
+      Effect.mapError((reason) => `${name} listener: ${reason}`)
+    )
+  )
+
+/** Probes the exec listener retained by every supported guest image. */
 export const probeGuestReadiness = (vsockSocket: string): Effect.Effect<void, string> =>
-  Effect.callback<void, string>((resume, signal) => {
-    const socket = connect(vsockSocket)
-    let settled = false
-    const done = (outcome: Effect.Effect<void, string>): void => {
-      if (settled) return
-      settled = true
-      socket.destroy()
-      resume(outcome)
-    }
-    const buffer: Array<Buffer> = []
-    let buffered = 0
-    socket.on("data", (chunk: Buffer) => {
-      buffer.push(chunk)
-      buffered += chunk.length
-      const reply = Buffer.concat(buffer).subarray(0, 64).toString("utf8")
-      const index = reply.indexOf("\n")
-      if (index !== -1) {
-        const line = reply.slice(0, index)
-        if (/^OK \d+$/.test(line)) done(Effect.void)
-        else done(Effect.fail(`unexpected readiness reply: ${line.slice(0, 32)}`))
-      } else if (buffered > 64) {
-        done(Effect.fail("readiness reply too long"))
-      }
-    })
-    socket.once("connect", () => {
-      socket.write(`CONNECT ${GUEST_VSOCK_PORT}\n`, "utf8")
-    })
-    socket.once("error", (cause: Error) => done(Effect.fail(String(cause))))
-    socket.once("close", () => done(Effect.fail("connection closed before readiness ack")))
-    signal.addEventListener("abort", () => socket.destroy(), { once: true })
+  probeListener("exec", openGuestExecSocket(vsockSocket))
+
+const probeRequiredListeners = (
+  vsockSocket: string,
+  requireWebListeners: boolean
+): Effect.Effect<void, string> =>
+  Effect.gen(function*() {
+    yield* probeGuestReadiness(vsockSocket)
+    if (!requireWebListeners) return
+    yield* probeListener("http", openGuestHttpSocket(vsockSocket))
+    yield* probeListener("service", openGuestServiceSocket(vsockSocket))
   })
 
-/** Polls readiness until the deadline; used before `create` returns. */
+/** Polls all required listeners until the deadline; used before `create` returns. */
 export const awaitGuestReadiness = (
   vmId: string,
   vsockSocket: string,
-  timeoutMs: number
+  timeoutMs: number,
+  requireWebListeners = false
 ): Effect.Effect<void, string> =>
  Effect.gen(function*() {
-    const deadline = Date.now() + timeoutMs
-    let lastReason = "guest did not become ready"
-    while (Date.now() < deadline) {
-      const attempt = yield* Effect.result(
-        timeoutCause(probeGuestReadiness(vsockSocket), READINESS_POLL_MS * 2)
-      )
-      if (attempt._tag === "Success") return
-      if (attempt._tag === "Failure" && !Cause.isTimeoutError(attempt.failure)) {
-        lastReason = String(attempt.failure)
-      }
-      yield* Effect.sleep({ milliseconds: READINESS_POLL_MS })
-    }
-    return yield* Effect.fail(
-      `readiness timeout after ${timeoutMs}ms for ${vmId}: ${lastReason}`
-    )
-  })
+   const deadline = Date.now() + timeoutMs
+   let lastReason = "guest did not become ready"
+   while (Date.now() < deadline) {
+     const attempt = yield* Effect.result(
+       timeoutCause(
+         probeRequiredListeners(vsockSocket, requireWebListeners),
+         READINESS_POLL_MS * 2
+       )
+     )
+     if (attempt._tag === "Success") return
+     if (attempt._tag === "Failure" && !Cause.isTimeoutError(attempt.failure)) {
+       lastReason = String(attempt.failure)
+     }
+     yield* Effect.sleep({ milliseconds: READINESS_POLL_MS })
+   }
+   return yield* Effect.fail(
+     `readiness timeout after ${timeoutMs}ms for ${vmId}: ${lastReason}`
+   )
+ })
 
 // ---------------------------------------------------------------------------
 // Guest exec v1 frames (parsed from the guest side, so validated with Schema)
@@ -648,19 +665,12 @@ export const GuestExecChannelLive: Layer.Layer<GuestExecChannel> = Layer.effect(
         new GuestTransportFault({ vmId: options.vmId, reason })
 
       return Effect.scoped(
-        Effect.acquireRelease(
-          connectVsock(options.vsockSocket).pipe(
-            Effect.mapError((reason) => fault(`vsock connect failed: ${reason}`))
-          ),
-          // Release runs on success, failure, timeout-interrupt, and
-          // cancellation: the socket never outlives the effect.
-          (socket) => Effect.sync(() => socket.destroy())
-        ).pipe(
+        openGuestExecSocket(options.vsockSocket).pipe(
+          Effect.mapError((reason) => fault(`vsock connect failed: ${reason}`)),
           Effect.flatMap((socket) =>
-            handshake(socket, `${JSON.stringify(request)}\n`).pipe(
-              Effect.mapError((reason) => fault(reason)),
-              Effect.flatMap(() => readGuestFrames(socket, options))
-            )
+            Effect.sync(() => {
+              socket.write(`${JSON.stringify(request)}\n`, "utf8")
+            }).pipe(Effect.andThen(readGuestFrames(socket, options)))
           ),
           // Whole-channel deadline covers connect + handshake + frames.
           Effect.timeout({ milliseconds: options.limits.timeoutMs + EXEC_DEADLINE_GRACE_MS }),
@@ -676,55 +686,325 @@ export const GuestExecChannelLive: Layer.Layer<GuestExecChannel> = Layer.effect(
     return GuestExecChannel.of({ exec })
   }))
 
-const connectVsock = (socketPath: string) =>
-  Effect.callback<Socket, string>((resume, signal) => {
-    const socket = connect(socketPath)
-    const fail = (cause: Error): void => {
-      socket.destroy()
-      resume(Effect.fail(String(cause)))
-    }
-    socket.once("connect", () => {
-      socket.off("error", fail)
-      resume(Effect.succeed(socket))
-    })
-    socket.once("error", fail)
-    signal.addEventListener("abort", () => socket.destroy(), { once: true })
-  })
+// ---------------------------------------------------------------------------
+// Guest HTTP and persistent service channels
+// ---------------------------------------------------------------------------
 
-/** Sends `CONNECT <port>\n`, waits for `OK <num>\n`, then writes the request. */
-const handshake = (socket: Socket, requestLine: string) =>
-  Effect.callback<void, string>((resume, signal) => {
-    let buffer: Buffer = Buffer.alloc(0)
-    const done = (outcome: Effect.Effect<void, string>): void => {
+export class GuestServiceError extends Schema.TaggedError<GuestServiceError>()("GuestServiceError", {
+  vmId: Schema.String,
+  code: Schema.Literals(["INVALID_REQUEST", "START_FAILED"]),
+  message: Schema.String
+}) {}
+
+export type WebServiceState =
+  | {
+      readonly state: "not_started"
+      readonly startedAtEpochMs?: undefined
+      readonly exitCode?: undefined
+      readonly signal?: undefined
+    }
+  | {
+      readonly state: "running"
+      readonly startedAtEpochMs: number
+      readonly exitCode?: undefined
+      readonly signal?: undefined
+    }
+  | {
+      readonly state: "exited"
+      readonly startedAtEpochMs: number
+      readonly exitCode: number
+      readonly signal: string | null
+    }
+
+export class GuestHttpChannel extends Context.Service<GuestHttpChannel, {
+  /**
+   * Opens one raw HTTP exchange to the fixed guest HTTP proxy. The returned
+   * socket is paused and scoped; cancellation or scope close destroys it.
+   */
+  readonly open: (options: {
+    readonly vmId: string
+    readonly vsockSocket: string
+  }) => Effect.Effect<Socket, GuestTransportFault, Scope.Scope>
+}>()("microvm/firecracker/GuestHttpChannel") {}
+
+export const GuestHttpChannelLive: Layer.Layer<GuestHttpChannel> = Layer.effect(
+  GuestHttpChannel,
+  Effect.sync(() => GuestHttpChannel.of({
+    open: (options) =>
+      openGuestHttpSocket(options.vsockSocket).pipe(
+        Effect.mapError((reason) => new GuestTransportFault({
+          vmId: options.vmId,
+          reason: `http vsock connect failed: ${reason}`
+        }))
+      )
+  }))
+)
+
+interface GuestServiceCommonOptions {
+  readonly vmId: string
+  readonly vsockSocket: string
+  readonly requestId: string
+}
+
+export class GuestServiceChannel extends Context.Service<GuestServiceChannel, {
+  readonly start: (options: GuestServiceCommonOptions & {
+    readonly argv: ReadonlyArray<string>
+    readonly cwd?: string | undefined
+    readonly env?: Readonly<Record<string, string>> | undefined
+    /** Immutable image-manifest port; encoded as trusted guest control data. */
+    readonly webPort: number
+  }) => Effect.Effect<WebServiceState, GuestServiceError | GuestTransportFault>
+  readonly status: (
+    options: GuestServiceCommonOptions
+  ) => Effect.Effect<WebServiceState, GuestServiceError | GuestTransportFault>
+  readonly stop: (
+    options: GuestServiceCommonOptions
+  ) => Effect.Effect<{ readonly stopped: boolean }, GuestServiceError | GuestTransportFault>
+}>()("microvm/firecracker/GuestServiceChannel") {}
+
+const SERVICE_LINE_LIMIT_BYTES = 64 * 1024
+
+const serviceStartedSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  id: Schema.String,
+  type: Schema.Literal("started"),
+  startedAtEpochMs: Schema.Number
+})
+const serviceStatusSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  id: Schema.String,
+  type: Schema.Literal("status"),
+  state: Schema.Literals(["not_started", "running", "exited"]),
+  startedAtEpochMs: Schema.optional(Schema.Number),
+  exitCode: Schema.optional(Schema.Number),
+  signal: Schema.optional(Schema.NullOr(Schema.String))
+})
+const serviceStoppedSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  id: Schema.String,
+  type: Schema.Literal("stopped"),
+  stopped: Schema.Boolean
+})
+const serviceErrorSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  id: Schema.String,
+  type: Schema.Literal("error"),
+  code: Schema.Literals(["INVALID_REQUEST", "START_FAILED", "INTERNAL"]),
+  message: Schema.String
+})
+
+const decodeServiceStarted = Schema.decodeUnknownResult(serviceStartedSchema)
+const decodeServiceStatus = Schema.decodeUnknownResult(serviceStatusSchema)
+const decodeServiceStopped = Schema.decodeUnknownResult(serviceStoppedSchema)
+const decodeServiceError = Schema.decodeUnknownResult(serviceErrorSchema)
+
+const serviceExchange = (
+  socket: Socket,
+  request: Readonly<Record<string, unknown>>,
+  vmId: string
+): Effect.Effect<unknown, GuestTransportFault> =>
+  Effect.callback<unknown, GuestTransportFault>((resume, signal) => {
+    const requestLine = Buffer.from(`${JSON.stringify(request)}\n`, "utf8")
+    let chunks: Array<Buffer> = []
+    let bytes = 0
+    let finished = false
+
+    const detach = (): void => {
       socket.off("data", onData)
       socket.off("error", onError)
       socket.off("close", onClose)
-      resume(outcome)
+    }
+    const fault = (reason: string): void => {
+      if (finished) return
+      finished = true
+      detach()
+      resume(Effect.fail(new GuestTransportFault({ vmId, reason })))
     }
     const onData = (chunk: Buffer): void => {
-      buffer = Buffer.concat([buffer, chunk])
-      const index = buffer.indexOf(0x0a)
-      if (index === -1) {
-        if (buffer.length > 64) done(Effect.fail("vsock handshake reply too long"))
+      const newline = chunk.indexOf(0x0a)
+      if (newline === -1) {
+        if (bytes + chunk.length > SERVICE_LINE_LIMIT_BYTES) {
+          fault("guest service response exceeded maximum line size")
+          return
+        }
+        chunks.push(chunk)
+        bytes += chunk.length
         return
       }
-      const reply = buffer.subarray(0, index).toString("utf8")
-      if (!/^OK \d+$/.test(reply)) {
-        done(Effect.fail(`unexpected vsock handshake reply: ${reply.slice(0, 64)}`))
+      if (bytes + newline > SERVICE_LINE_LIMIT_BYTES || newline + 1 !== chunk.length) {
+        fault(
+          bytes + newline > SERVICE_LINE_LIMIT_BYTES
+            ? "guest service response exceeded maximum line size"
+            : "guest service sent bytes after its terminal response"
+        )
         return
       }
-      socket.write(requestLine, "utf8")
-      done(Effect.void)
+      chunks.push(chunk.subarray(0, newline))
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(Buffer.concat(chunks, bytes + newline).toString("utf8"))
+      } catch {
+        fault("guest service sent a non-JSON response")
+        return
+      }
+      finished = true
+      detach()
+      resume(Effect.succeed(parsed))
     }
-    const onError = (cause: Error): void => done(Effect.fail(`vsock handshake error: ${String(cause)}`))
-    const onClose = (): void => done(Effect.fail("vsock closed during handshake"))
+    const onError = (cause: Error): void => fault(`guest service socket error: ${String(cause)}`)
+    const onClose = (): void => fault("guest service closed before its terminal response")
 
+    if (requestLine.length > SERVICE_LINE_LIMIT_BYTES + 1) {
+      fault("guest service request exceeded maximum line size")
+      return
+    }
     socket.on("data", onData)
-    socket.on("error", onError)
-    socket.on("close", onClose)
-    socket.write(`CONNECT ${GUEST_VSOCK_PORT}\n`, "utf8")
-    signal.addEventListener("abort", () => socket.destroy(), { once: true })
+    socket.once("error", onError)
+    socket.once("close", onClose)
+    signal.addEventListener("abort", () => {
+      if (finished) return
+      finished = true
+      detach()
+      socket.destroy()
+    }, { once: true })
+    socket.write(requestLine)
+    socket.resume()
   })
+
+const serviceFailure = (
+  parsed: unknown,
+  vmId: string,
+  requestId: string
+): Effect.Effect<never, GuestServiceError | GuestTransportFault> => {
+  const error = decodeServiceError(parsed)
+  if (error._tag === "Failure" || error.success.id !== requestId) {
+    return Effect.fail(new GuestTransportFault({
+      vmId,
+      reason: error._tag === "Success"
+        ? "guest service response id mismatch"
+        : "guest service sent an unknown or invalid response"
+    }))
+  }
+  if (error.success.code === "INTERNAL") {
+    return Effect.fail(new GuestTransportFault({
+      vmId,
+      reason: `guest service INTERNAL: ${error.success.message.slice(0, 300)}`
+    }))
+  }
+  return Effect.fail(new GuestServiceError({
+    vmId,
+    code: error.success.code,
+    message: error.success.message.slice(0, 500)
+  }))
+}
+
+export const GuestServiceChannelLive: Layer.Layer<GuestServiceChannel> = Layer.effect(
+  GuestServiceChannel,
+  Effect.sync(() => {
+    const exchange = (
+      options: GuestServiceCommonOptions,
+      request: Readonly<Record<string, unknown>>
+    ): Effect.Effect<unknown, GuestTransportFault> =>
+      Effect.scoped(
+        openGuestServiceSocket(options.vsockSocket).pipe(
+          Effect.mapError((reason) => new GuestTransportFault({
+            vmId: options.vmId,
+            reason: `service vsock connect failed: ${reason}`
+          })),
+          Effect.flatMap((socket) => serviceExchange(socket, request, options.vmId))
+        )
+      )
+
+    const start: GuestServiceChannel["Service"]["start"] = (options) => {
+      const request: Record<string, unknown> = {
+        version: 1,
+        id: options.requestId,
+        op: "start",
+        argv: [...options.argv],
+        port: options.webPort
+      }
+      if (options.cwd !== undefined) request["cwd"] = options.cwd
+      if (options.env !== undefined) request["env"] = { ...options.env }
+      return exchange(options, request).pipe(
+        Effect.flatMap((parsed) => {
+          const started = decodeServiceStarted(parsed)
+          if (started._tag === "Success") {
+            if (started.success.id !== options.requestId) {
+              return Effect.fail(new GuestTransportFault({
+                vmId: options.vmId,
+                reason: "guest service response id mismatch"
+              }))
+            }
+            return Effect.succeed<WebServiceState>({
+              state: "running",
+              startedAtEpochMs: started.success.startedAtEpochMs
+            })
+          }
+          return serviceFailure(parsed, options.vmId, options.requestId)
+        })
+      )
+    }
+
+    const status: GuestServiceChannel["Service"]["status"] = (options) =>
+      exchange(options, { version: 1, id: options.requestId, op: "status" }).pipe(
+        Effect.flatMap((parsed) => {
+          const status = decodeServiceStatus(parsed)
+          if (status._tag === "Failure") return serviceFailure(parsed, options.vmId, options.requestId)
+          const response = status.success
+          if (response.id !== options.requestId) {
+            return Effect.fail(new GuestTransportFault({
+              vmId: options.vmId,
+              reason: "guest service response id mismatch"
+            }))
+          }
+          if (response.state === "not_started") {
+            return Effect.succeed<WebServiceState>({ state: "not_started" })
+          }
+          if (response.startedAtEpochMs === undefined) {
+            return Effect.fail(new GuestTransportFault({
+              vmId: options.vmId,
+              reason: `guest service ${response.state} status omitted startedAtEpochMs`
+            }))
+          }
+          if (response.state === "running") {
+            return Effect.succeed<WebServiceState>({
+              state: "running",
+              startedAtEpochMs: response.startedAtEpochMs
+            })
+          }
+          if (response.exitCode === undefined) {
+            return Effect.fail(new GuestTransportFault({
+              vmId: options.vmId,
+              reason: "guest service exited status omitted exit code"
+            }))
+          }
+          return Effect.succeed<WebServiceState>({
+            state: "exited",
+            startedAtEpochMs: response.startedAtEpochMs,
+            exitCode: response.exitCode,
+            signal: response.signal ?? null
+          })
+        })
+      )
+
+    const stop: GuestServiceChannel["Service"]["stop"] = (options) =>
+      exchange(options, { version: 1, id: options.requestId, op: "stop" }).pipe(
+        Effect.flatMap((parsed) => {
+          const stopped = decodeServiceStopped(parsed)
+          if (stopped._tag === "Failure") return serviceFailure(parsed, options.vmId, options.requestId)
+          if (stopped.success.id !== options.requestId) {
+            return Effect.fail(new GuestTransportFault({
+              vmId: options.vmId,
+              reason: "guest service response id mismatch"
+            }))
+          }
+          return Effect.succeed({ stopped: stopped.success.stopped })
+        })
+      )
+
+    return GuestServiceChannel.of({ start, status, stop })
+  })
+)
 
 interface StreamState {
   readonly chunks: Array<Buffer>
@@ -906,4 +1186,5 @@ const readGuestFrames = (
     socket.on("data", onData)
     socket.on("error", onError)
     socket.on("close", onClose)
+    socket.resume()
   })

@@ -20,6 +20,8 @@ import (
 
 const (
 	executionCgroupRoot = "/sys/fs/cgroup/microvm-exec"
+	serviceCgroupRoot   = "/sys/fs/cgroup/microvm-service"
+	webServiceCgroup    = "/sys/fs/cgroup/microvm-service/web"
 	executionUID        = 1000
 	executionGID        = 1000
 )
@@ -33,15 +35,19 @@ func NewLinuxPlatform() (*LinuxPlatform, error) {
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		return nil, fmt.Errorf("cgroup v2 unavailable: %w", err)
 	}
-	if err := os.MkdirAll(executionCgroupRoot, 0o755); err != nil {
-		return nil, fmt.Errorf("create execution cgroup root: %w", err)
+	for _, root := range []string{executionCgroupRoot, serviceCgroupRoot} {
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			return nil, fmt.Errorf("create guest workload cgroup root: %w", err)
+		}
 	}
 	for _, controller := range []string{"cpu", "memory", "pids"} {
 		if err := enableController("/sys/fs/cgroup", controller); err != nil {
 			return nil, err
 		}
-		if err := enableController(executionCgroupRoot, controller); err != nil {
-			return nil, err
+		for _, root := range []string{executionCgroupRoot, serviceCgroupRoot} {
+			if err := enableController(root, controller); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return &LinuxPlatform{}, nil
@@ -76,11 +82,18 @@ func (p *LinuxPlatform) Prepare(command *exec.Cmd, requestID string) (ProcessSco
 		return nil, fmt.Errorf("generate cgroup name: %w", err)
 	}
 	path := filepath.Join(executionCgroupRoot, hex.EncodeToString(random))
-	if err := os.Mkdir(path, 0o755); err != nil {
-		return nil, fmt.Errorf("create command cgroup: %w", err)
-	}
+	return prepareLinuxScope(command, path)
+}
 
-	scope := &linuxProcessScope{path: path}
+func (p *LinuxPlatform) PrepareService(command *exec.Cmd) (ProcessScope, error) {
+	return prepareLinuxScope(command, webServiceCgroup)
+}
+
+func prepareLinuxScope(command *exec.Cmd, path string) (ProcessScope, error) {
+	if err := os.Mkdir(path, 0o755); err != nil {
+		return nil, fmt.Errorf("create workload cgroup: %w", err)
+	}
+	scope := &linuxProcessScope{path: path, fd: -1}
 	cleanupOnError := func(err error) (ProcessScope, error) {
 		_ = os.Remove(path)
 		return nil, err
@@ -91,13 +104,12 @@ func (p *LinuxPlatform) Prepare(command *exec.Cmd, requestID string) (ProcessSco
 		"pids.max":   "128",
 	} {
 		if err := os.WriteFile(filepath.Join(path, file), []byte(value), 0o644); err != nil {
-			return cleanupOnError(fmt.Errorf("configure command cgroup %s: %w", file, err))
+			return cleanupOnError(fmt.Errorf("configure workload cgroup %s: %w", file, err))
 		}
 	}
-
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return cleanupOnError(fmt.Errorf("open command cgroup: %w", err))
+		return cleanupOnError(fmt.Errorf("open workload cgroup: %w", err))
 	}
 	scope.fd = fd
 	command.SysProcAttr = &syscall.SysProcAttr{

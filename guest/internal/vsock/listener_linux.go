@@ -14,33 +14,42 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const Port uint32 = 1024
+const (
+	ExecPort    uint32 = 1024
+	HTTPPort    uint32 = 1025
+	ServicePort uint32 = 1026
+)
 
-func Listen() (net.Listener, error) {
+func ListenExec() (net.Listener, error)    { return listen(ExecPort) }
+func ListenHTTP() (net.Listener, error)    { return listen(HTTPPort) }
+func ListenService() (net.Listener, error) { return listen(ServicePort) }
+
+func listen(port uint32) (net.Listener, error) {
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("create AF_VSOCK socket: %w", err)
 	}
-	if err := unix.Bind(fd, &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: Port}); err != nil {
+	if err := unix.Bind(fd, &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: port}); err != nil {
 		unix.Close(fd)
-		return nil, fmt.Errorf("bind AF_VSOCK port %d: %w", Port, err)
+		return nil, fmt.Errorf("bind AF_VSOCK port %d: %w", port, err)
 	}
 	if err := unix.Listen(fd, 128); err != nil {
 		unix.Close(fd)
-		return nil, fmt.Errorf("listen on AF_VSOCK port %d: %w", Port, err)
+		return nil, fmt.Errorf("listen on AF_VSOCK port %d: %w", port, err)
 	}
 	file := os.NewFile(uintptr(fd), "vsock-listener")
 	if file == nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("wrap AF_VSOCK listener")
 	}
-	return &listener{file: file}, nil
+	return &listener{file: file, port: port}, nil
 }
 
 type listener struct {
 	file      *os.File
 	closeOnce sync.Once
 	closed    atomic.Bool
+	port      uint32
 }
 
 func (l *listener) Accept() (net.Conn, error) {
@@ -122,7 +131,7 @@ func (l *listener) Close() error {
 }
 
 func (l *listener) Addr() net.Addr {
-	return address{cid: unix.VMADDR_CID_ANY, port: Port}
+	return address{cid: unix.VMADDR_CID_ANY, port: l.port}
 }
 
 type connection struct {

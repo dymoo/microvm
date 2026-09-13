@@ -103,14 +103,25 @@ Notes:
   same kernel arguments as the image's `/sbin/init` and as the jailed boot the
   hosted acceptance workflow dispatches; a boot on your own host remains
   unverified until you run the acceptance there.
+- The image includes pnpm 11.13.1 and an operator-owned, offline-ready
+  `/opt/microvm/next-template`. Run `microvm-next-init` once against an empty
+  `/workspace`; it never merges into existing source. `pnpm dev` then binds
+  guest loopback `127.0.0.1:3000`.
+- Git comes from the same pinned Debian snapshot. A pre-destroy guest-local
+  checkpoint must set a non-secret repository-local author, commit, prove a
+  clean index/worktree, and record `git rev-parse HEAD`. It is still ephemeral
+  until a trusted external export verifies and persists it; that export is not
+  implemented. Guests have no Git credentials, remote, NIC, DNS, or push path.
 - `memory.max` per VM = guest `memMib` + the configured `vmmOverheadMib`; do
   not drop the overhead or the OOM killer can take valid VMs.
 - `jailerFsizeBytes` must be at least the largest allowed root image.
 - `runStateDir` stores one private logical full-size root disk per live VM.
   Provisioning requests a copy-on-write reflink and automatically falls back
-  to an ordinary private copy when unsupported. Put it on disk-backed storage
-  and size for the worst case: `maxVms × image size` plus headroom, because
-  fallback copies and guest writes can consume the full space.
+  to an ordinary private copy when unsupported. That private disk also isolates
+  the UID-1000-writable `/var/lib/microvm/pnpm-store`; never replace it with a
+  store shared across VMs. Put `runStateDir` on disk-backed storage and size for
+  the worst case: `maxVms × image size` plus headroom, because fallback copies,
+  dependency-store writes, and project writes can consume the full space.
 - `create` returns only after the guest runner answers a readiness probe
   bounded by `guestReadinessTimeoutMs`.
 - `maxTtlSeconds` is both the default lifetime when `create` omits a TTL and
@@ -162,6 +173,11 @@ export MICROVM_CGROUP_ROOT='/sys/fs/cgroup/microvm.slice'
 scripts/accept-linux.sh
 ```
 
+The base image prewarms only the pinned public Free Vibecode dependency graph.
+`@free-vibecode/site-sdk@0.2.0` is not on the public npm registry; a trusted
+project materializer must supply that package or its source when required.
+Image construction intentionally never fetches it.
+
 ### Hosted acceptance (CI)
 
 `.github/workflows/acceptance.yml` is dispatch-only and runs the real path on
@@ -176,9 +192,15 @@ first-party CI fixture, not an upstream signature), `pnpm test` with the
 kernel-flock test asserted unskipped, guest `go test -race`, a hosted-only
 tagged real-AF_VSOCK peer-authorization test compiled and run as the runner
 user under a hard timeout after a root-only `vsock_loopback` module load, the
-pinned image build, the guest exec v1 protocol (including the idle request-header
-deadline) against a jailed VM the daemon booted, and the two-VM daemon
-acceptance. The daemon's admin token is generated
+pinned image build, then the guest exec v1 protocol against a jailed VM the
+daemon booted. That guest check covers the idle request-header deadline,
+Git and pnpm/template pins, UID-1000 store ownership, empty runtime resolver,
+offline initialization without overwrites, and a Next.js dev server listening
+only on `127.0.0.1:3000`. It creates and commits a guest-local repository with
+a non-secret local author, proves the index/worktree clean, records
+`git rev-parse HEAD`, and proves no remote or push destination exists. The
+runtime isolation checks and two-VM daemon acceptance follow. The daemon's
+admin token is generated
 ephemerally, masked before any output, and passed only through the config's
 `${ENV}` reference; teardown rides the daemon's native shutdown lifecycle plus
 an always-step cleanup, and the uploaded evidence contains versions,

@@ -274,6 +274,8 @@ const checkKvmDeviceAccess = (): Effect.Effect<void, string> =>
 // Image allowlist
 // ---------------------------------------------------------------------------
 
+const httpEndpointPort = Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 65_535 }))
+
 export class ImageManifest extends Schema.Class<ImageManifest>("ImageManifest")({
   name: ImageName,
   /** Raw disk image file, relative to the allowlist directory. */
@@ -282,7 +284,14 @@ export class ImageManifest extends Schema.Class<ImageManifest>("ImageManifest")(
   /** Informational builder metadata; builders may omit either field. */
   sizeBytes: Schema.optional(Schema.Number),
   /** Guest device the root filesystem appears on (informational). */
-  rootDevice: Schema.optional(Schema.String)
+  rootDevice: Schema.optional(Schema.String),
+  /**
+   * Immutable operator-declared endpoint metadata. No RPC caller can choose
+   * the guest target or port.
+   */
+  httpEndpoints: Schema.optional(Schema.Struct({
+    web: Schema.Struct({ port: httpEndpointPort })
+  }))
 }) {}
 
 export interface ResolvedImage {

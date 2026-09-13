@@ -37,7 +37,7 @@ func TestListenerCloseUnblocksAccept(t *testing.T) {
 		t.Fatal("wrap Unix listener")
 	}
 	owned = true
-	listener := &listener{file: file}
+	listener := &listener{file: file, port: ExecPort}
 	defer listener.Close()
 
 	started := make(chan struct{})

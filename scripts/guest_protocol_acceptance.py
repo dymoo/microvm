@@ -156,9 +156,241 @@ def run(vsock_uds: str) -> None:
     require_exit(python)
     if not re.fullmatch(rb"Python 3\.\d+\.\d+\s*", python.stdout):
         raise AssertionError(f"unexpected Python version: {python.stdout!r}")
+    git = execute(vsock_uds, request("git", ["/usr/bin/git", "--version"]))
+    require_exit(git)
+    if not re.fullmatch(rb"git version \d+\.\d+\.\d+(?:\.\d+)?\s*", git.stdout):
+        raise AssertionError(f"unexpected Git version: {git.stdout!r}")
 
+    pnpm = execute(vsock_uds, request("pnpm", ["/usr/local/bin/pnpm", "--version"]))
+    require_exit(pnpm)
+    if pnpm.stdout.strip() != b"11.13.1":
+        raise AssertionError(f"unexpected pnpm version: {pnpm.stdout!r}")
 
+    image_policy = execute(
+        vsock_uds,
+        request(
+            "next-image-policy",
+            [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "import os;"
+                    "store_path='/var/lib/microvm/pnpm-store';"
+                    "template_path='/opt/microvm/next-template';"
+                    "store_paths=[store_path]+[os.path.join(root,name) "
+                    "for root,dirs,files in os.walk(store_path) for name in dirs+files];"
+                    "template_paths=[template_path]+[os.path.join(root,name) "
+                    "for root,dirs,files in os.walk(template_path) for name in dirs+files];"
+                    "assert all((os.lstat(path).st_uid,os.lstat(path).st_gid)==(1000,1000) "
+                    "for path in store_paths);"
+                    "assert os.access(store_path,os.W_OK);"
+                    "assert all((os.lstat(path).st_uid,os.lstat(path).st_gid)==(0,0) "
+                    "for path in template_paths);"
+                    "assert all(os.path.islink(path) or os.lstat(path).st_mode&0o22==0 "
+                    "for path in template_paths);"
+                    "assert not os.access(template_path,os.W_OK);"
+                    "assert open('/etc/resolv.conf','rb').read()==b''"
+                ),
+            ],
+        ),
+    )
+    require_exit(image_policy)
 
+    initialize = execute(
+        vsock_uds,
+        request("next-init", ["/usr/local/bin/microvm-next-init"]),
+    )
+    require_exit(initialize)
+
+    offline_install = execute(
+        vsock_uds,
+        request(
+            "next-offline-install",
+            [
+                "/usr/local/bin/pnpm",
+                "install",
+                "--offline",
+                "--frozen-lockfile",
+            ],
+            timeoutMs=60_000,
+        ),
+    )
+    require_exit(offline_install)
+
+    template_typecheck = execute(
+        vsock_uds,
+        request(
+            "next-typecheck",
+            ["/usr/local/bin/pnpm", "run", "typecheck"],
+            timeoutMs=60_000,
+        ),
+    )
+    require_exit(template_typecheck)
+
+    no_overwrite = execute(
+        vsock_uds,
+        request("next-no-overwrite", ["/usr/local/bin/microvm-next-init"]),
+    )
+    if no_overwrite.terminal.get("type") != "exit" or no_overwrite.terminal.get("code") != 1:
+        raise AssertionError(f"initializer overwrote a non-empty workspace: {no_overwrite!r}")
+
+    next_smoke_source = (
+        "const {spawn}=require('node:child_process');"
+        "const {readFileSync}=require('node:fs');"
+        "const http=require('node:http');"
+        "const child=spawn('/usr/local/bin/pnpm',['dev'],"
+        "{cwd:'/workspace',stdio:'ignore'});"
+        "const deadline=Date.now()+12000;"
+        "let finished=false;"
+        "function fail(message){if(finished)return;finished=true;"
+        "console.error(message);process.exit(1)}"
+        "child.on('exit',code=>fail(`next dev exited early: ${code}`));"
+        "function probe(){const req=http.get("
+        "{host:'127.0.0.1',port:3000,path:'/',timeout:500},res=>{"
+        "res.resume();if(res.statusCode!==200)return fail(`HTTP ${res.statusCode}`);"
+        "function listeners(path){return readFileSync(path,'utf8').trim().split('\\n')"
+        ".slice(1).map(line=>line.trim().split(/\\s+/))"
+        ".filter(fields=>fields[3]==='0A'&&fields[1].endsWith(':0BB8'))"
+        ".map(fields=>fields[1])}"
+        "const bound=[...listeners('/proc/net/tcp'),...listeners('/proc/net/tcp6')];"
+        "if(bound.length!==1||bound[0]!=='0100007F:0BB8')"
+        "return fail(`unexpected Next.js listeners: ${bound.join(',')}`);"
+        "finished=true;console.log('next-ready');process.exit(0)});"
+        "req.on('timeout',()=>req.destroy());"
+        "req.on('error',()=>{if(Date.now()>=deadline)"
+        "return fail('Next.js did not become ready');setTimeout(probe,100)})}"
+        "probe();"
+    )
+    next_smoke = execute(
+        vsock_uds,
+        request(
+            "next-dev",
+            ["/usr/bin/node", "-e", next_smoke_source],
+            timeoutMs=15_000,
+        ),
+    )
+    require_exit(next_smoke)
+    if next_smoke.stdout.strip() != b"next-ready":
+        raise AssertionError(f"unexpected Next.js smoke output: {next_smoke!r}")
+
+    git_init = execute(
+        vsock_uds,
+        request(
+            "git-init",
+            ["/usr/bin/git", "init", "--initial-branch=main"],
+        ),
+    )
+    require_exit(git_init)
+    for identifier, key, value in (
+        ("git-author-name", "user.name", "MicroVM Checkpoint"),
+        ("git-author-email", "user.email", "checkpoint@microvm.invalid"),
+    ):
+        configured = execute(
+            vsock_uds,
+            request(
+                identifier,
+                ["/usr/bin/git", "config", "--local", key, value],
+            ),
+        )
+        require_exit(configured)
+
+    git_add = execute(
+        vsock_uds,
+        request("git-add", ["/usr/bin/git", "add", "--all"]),
+    )
+    require_exit(git_add)
+    git_commit = execute(
+        vsock_uds,
+        request(
+            "git-commit",
+            [
+                "/usr/bin/git",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                "Checkpoint Next.js workspace",
+            ],
+            env={
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+            },
+        ),
+    )
+    require_exit(git_commit)
+
+    worktree_clean = execute(
+        vsock_uds,
+        request(
+            "git-worktree-clean",
+            ["/usr/bin/git", "diff", "--quiet"],
+        ),
+    )
+    require_exit(worktree_clean)
+    index_clean = execute(
+        vsock_uds,
+        request(
+            "git-index-clean",
+            ["/usr/bin/git", "diff", "--cached", "--quiet"],
+        ),
+    )
+    require_exit(index_clean)
+    status = execute(
+        vsock_uds,
+        request(
+            "git-status",
+            ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"],
+        ),
+    )
+    require_exit(status)
+    if status.stdout:
+        raise AssertionError(f"checkpoint did not leave a clean repository: {status.stdout!r}")
+
+    head = execute(
+        vsock_uds,
+        request(
+            "git-head",
+            ["/usr/bin/git", "rev-parse", "--verify", "HEAD^{commit}"],
+        ),
+    )
+    require_exit(head)
+    if not re.fullmatch(rb"[0-9a-f]{40}\s*", head.stdout):
+        raise AssertionError(f"unexpected checkpoint HEAD: {head.stdout!r}")
+
+    remotes = execute(
+        vsock_uds,
+        request("git-remotes", ["/usr/bin/git", "remote"]),
+    )
+    require_exit(remotes)
+    if remotes.stdout:
+        raise AssertionError(f"guest checkpoint unexpectedly has a remote: {remotes.stdout!r}")
+    credential_config = execute(
+        vsock_uds,
+        request(
+            "git-no-credentials",
+            [
+                "/usr/bin/git",
+                "config",
+                "--get-regexp",
+                r"^(credential\.|http\..*\.extraheader$)",
+            ],
+        ),
+    )
+    if (
+        credential_config.terminal.get("type") != "exit"
+        or credential_config.terminal.get("code") != 1
+        or credential_config.stdout
+    ):
+        raise AssertionError(f"guest contains Git credential configuration: {credential_config!r}")
+    push = execute(
+        vsock_uds,
+        request("git-push-denied", ["/usr/bin/git", "push"]),
+    )
+    if push.terminal.get("type") != "exit" or push.terminal.get("code") == 0:
+        raise AssertionError(f"guest checkpoint unexpectedly pushed: {push!r}")
+
+    print(f"guest checkpoint HEAD: {head.stdout.decode('ascii').strip()}")
     invalid_cwd = execute(
         vsock_uds,
         request("cwd", ["/usr/bin/true"], cwd="/etc"),

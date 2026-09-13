@@ -5,11 +5,17 @@
 import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
+  CreateResult,
   ExecId,
+  GUEST_EXEC_VSOCK_PORT,
+  GUEST_HTTP_VSOCK_PORT,
+  GUEST_SERVICE_VSOCK_PORT,
   ImageName,
   MAX_ARGV_ENTRIES,
+  StartWebServiceRequest,
   VmId,
-  execRejection
+  execRejection,
+  webServiceStartRejection
 } from "../src/protocol.js"
 
 const isValid = Schema.is
@@ -41,6 +47,75 @@ describe("wire patterns", () => {
     expect(isImage("../etc/passwd")).toBe(false)
     expect(isImage("")).toBe(false)
     expect(isImage("-leading-dash")).toBe(false)
+  })
+})
+describe("fixed guest channels", () => {
+  it("reserves one non-selectable port per protocol purpose", () => {
+    expect(GUEST_EXEC_VSOCK_PORT).toBe(1024)
+    expect(GUEST_HTTP_VSOCK_PORT).toBe(1025)
+    expect(GUEST_SERVICE_VSOCK_PORT).toBe(1026)
+  })
+})
+
+describe("durable web-service wire schemas", () => {
+  const decodeStartRequest = Schema.decodeUnknownResult(StartWebServiceRequest)
+
+  it("accepts bounded start requests without exposing host or port selection", () => {
+    expect(decodeStartRequest({
+      argv: ["/usr/bin/npm", "run", "dev"],
+      cwd: "/workspace",
+      env: { NODE_ENV: "development" }
+    })._tag).toBe("Success")
+    expect(decodeStartRequest({ argv: ["/bin/true"] })._tag).toBe("Success")
+  })
+
+  it("rejects empty, excessive, or oversized request fields at schema admission", () => {
+    expect(decodeStartRequest({ argv: [], cwd: undefined, env: undefined })._tag).toBe("Failure")
+    expect(decodeStartRequest({
+      argv: Array.from({ length: MAX_ARGV_ENTRIES + 1 }, () => "/bin/true"),
+      cwd: undefined,
+      env: undefined
+    })._tag).toBe("Failure")
+    expect(decodeStartRequest({
+      argv: ["/bin/echo", "x".repeat(4097)],
+      cwd: undefined,
+      env: undefined
+    })._tag).toBe("Failure")
+  })
+
+  it("enforces byte-total bounds and protects manifest-owned service environment", () => {
+    expect(webServiceStartRejection(["/bin/true"], undefined, { PORT: "4000" })).toBeDefined()
+    expect(webServiceStartRejection(["/bin/true"], undefined, { HOSTNAME: "0.0.0.0" })).toBeDefined()
+    expect(webServiceStartRejection(["/bin/echo", "€".repeat(1400)], undefined, undefined)).toBeDefined()
+    expect(webServiceStartRejection(
+      ["/usr/bin/npm", "run", "dev"],
+      "/workspace",
+      { NODE_ENV: "development" }
+    )).toBeUndefined()
+  })
+
+  it("represents the create ingress capability only when configured", () => {
+    const baseVm = {
+      vmId: "mvm-abc12345",
+      owningHost: "local",
+      state: "running" as const,
+      image: "node",
+      cpus: 1,
+      memMib: 512,
+      createdAtEpochMs: 1,
+      expiresAtEpochMs: undefined
+    }
+    const decodeCreateResult = Schema.decodeUnknownResult(CreateResult)
+    expect(decodeCreateResult({
+      vm: baseVm,
+      sandboxToken: "mvs_control",
+      httpIngressToken: "mvi_ingress"
+    })._tag).toBe("Success")
+    expect(decodeCreateResult({
+      vm: baseVm,
+      sandboxToken: "mvs_control",
+      httpIngressToken: undefined
+    })._tag).toBe("Success")
   })
 })
 

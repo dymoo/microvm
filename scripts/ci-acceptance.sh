@@ -10,8 +10,8 @@
 #   vsock     hosted-only real AF_VSOCK peer-authorization test (runner builds
 #              and runs it; root only loads the loopback transport)
 #   image      build the pinned guest image via scripts/build-guest-image.sh
-#   daemon     boot the real daemon, run guest-protocol and two-VM acceptance,
-#              then hostile jailed-VM abuse and proven native shutdown
+#   daemon     boot the real daemon, run guest-protocol, HTTP preview, and
+#              two-VM acceptance, then hostile abuse and proven native shutdown
 #   clean      identity-verified fallback teardown; reports uncertainty and
 #              never deletes diagnostic state to fake a green result
 #
@@ -403,7 +403,7 @@ daemon() {
   # Ephemeral admin credential: generated, masked, and never printed. It only
   # reaches the daemon through the config's ${MICROVM_ADMIN_TOKEN} reference.
   local admin_token started finished create_json vm_id vsock destroy_json
-  local daemon_listen_ms protocol_vm_create_ms protocol_accept_ms two_vm_accept_ms hostile_abuse_ms
+  local daemon_listen_ms protocol_vm_create_ms protocol_accept_ms http_preview_ms two_vm_accept_ms hostile_abuse_ms
   local daemon_pid
   admin_token=$(openssl rand -hex 32)
   printf '::add-mask::%s\n' "$admin_token"
@@ -599,6 +599,17 @@ print(
   python3 -c 'import json,sys; assert json.load(sys.stdin)["destroyed"] is True' <<<"$destroy_json"
   vm_id=
 
+  # End-to-end HTTP-only preview acceptance. This uses the public Node handler
+  # from a trusted loopback webserver, starts the prepared Next service through
+  # durable service control, and covers HTTP assets, SSE, WebSocket, capability
+  # separation/revocation, concurrent exec, pressure cancellation, and no NIC.
+  started=$(now_ms)
+  MICROVM_URL=$URL MICROVM_TOKEN=$admin_token MICROVM_IMAGE=node \
+    node "$ROOT/scripts/http-preview-acceptance.mjs" \
+    | tee "$EVIDENCE_DIR/http-preview.log"
+  finished=$(now_ms)
+  http_preview_ms=$((finished - started))
+
   # Full two-sandbox daemon/client acceptance (auth, isolation, capability
   # denial, timeouts, output bounds, process/cgroup/disk release).
   started=$(now_ms)
@@ -638,6 +649,7 @@ print(
     echo "daemon cold start to listening ms: $daemon_listen_ms"
     echo "protocol VM create (jailer boot + readiness) ms: $protocol_vm_create_ms"
     echo "guest protocol acceptance ms: $protocol_accept_ms"
+    echo "HTTP-only preview acceptance ms: $http_preview_ms"
     echo "two-VM daemon acceptance ms: $two_vm_accept_ms"
     echo "hostile jailed-VM abuse ms: $hostile_abuse_ms (outer bound: 8m + 30s cleanup grace)"
   } >"$EVIDENCE_DIR/timings.txt"

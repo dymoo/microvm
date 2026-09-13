@@ -12,12 +12,16 @@ import { Context, Schema } from "effect"
 import { Rpc, RpcGroup, RpcMiddleware } from "effect/unstable/rpc"
 
 // ---------------------------------------------------------------------------
-// Guest exec v1 constants (mirrored by guest/ runner; docs/protocol.md is the
-// source of truth).
+// Guest fixed-purpose vsock ports. These are mirrored by the Go guest and are
+// never selected by callers.
 // ---------------------------------------------------------------------------
 
-/** AF_VSOCK guest port the runner listens on. */
-export const GUEST_VSOCK_PORT = 1024
+/** Finite command execution channel. */
+export const GUEST_EXEC_VSOCK_PORT = 1024
+/** HTTP preview channel. */
+export const GUEST_HTTP_VSOCK_PORT = 1025
+/** Durable web-service control channel. */
+export const GUEST_SERVICE_VSOCK_PORT = 1026
 
 /** Default per-exec wall-clock limit. */
 export const DEFAULT_TIMEOUT_MS = 30_000
@@ -55,6 +59,14 @@ export const ExecId = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{1,1
 export const ImageName = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9._-]{0,63}$/))
 
 const positiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
+const boundedArg = Schema.String.check(Schema.isMaxLength(MAX_ARG_BYTES))
+const boundedArgv = Schema.Array(boundedArg).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(MAX_ARGV_ENTRIES)
+)
+const boundedCwd = Schema.String.check(Schema.isMaxLength(MAX_CWD_BYTES))
+const boundedEnvKey = Schema.String.check(Schema.isMaxLength(MAX_ENV_KEY_BYTES))
+const boundedEnvValue = Schema.String.check(Schema.isMaxLength(MAX_ENV_VALUE_BYTES))
 
 
 // ---------------------------------------------------------------------------
@@ -146,6 +158,26 @@ export class DestroyUncertain extends Schema.TaggedError<DestroyUncertain>()("De
   phase: Schema.Literals(["signal", "cgroup"]),
   reason: Schema.String
 }) {}
+/** The image has no immutable `web` HTTP endpoint. */
+export class HttpNotConfigured extends Schema.TaggedError<HttpNotConfigured>()("HttpNotConfigured", {
+  vmId: VmId
+}) {}
+
+/**
+ * Semantic failure of the single durable web-service lifecycle. Transport,
+ * authentication, VM lookup and poison errors remain distinct.
+ */
+export class ClusterServiceError extends Schema.TaggedError<ClusterServiceError>()("ClusterServiceError", {
+  vmId: VmId,
+  code: Schema.Literals([
+    "INVALID_REQUEST",
+    "ALREADY_RUNNING",
+    "NOT_RUNNING",
+    "START_FAILED",
+    "INTERNAL"
+  ]),
+  message: Schema.String
+}) {}
 
 // ---------------------------------------------------------------------------
 // Auth contract (implementation lives in auth.ts)
@@ -224,6 +256,45 @@ export const execRejection = (
   return undefined
 }
 
+/**
+ * Validates the exact byte ceilings and reserved environment owned by the
+ * durable web-service supervisor. The RPC schema supplies structural/count
+ * bounds; this check runs before service-control guest I/O.
+ */
+export const webServiceStartRejection = (
+  argv: ReadonlyArray<string>,
+  cwd: string | undefined,
+  env: Readonly<Record<string, string>> | undefined
+): string | undefined => {
+  const rejected = execRejection(argv, cwd, env)
+  if (rejected !== undefined) return rejected
+  if (env !== undefined && ("HOSTNAME" in env || "PORT" in env)) {
+    return "HOSTNAME and PORT are controlled by the image manifest"
+  }
+  return undefined
+}
+
+/**
+ * Public request accepted by a VM-bound SandboxHandle. The low-level RPC adds
+ * the already-bound VM id; callers cannot select an HTTP target or port.
+ */
+export class StartWebServiceRequest extends Schema.Class<StartWebServiceRequest>("StartWebServiceRequest")({
+  argv: boundedArgv,
+  cwd: Schema.optional(boundedCwd),
+  env: Schema.optional(Schema.Record(boundedEnvKey, boundedEnvValue))
+}) {}
+
+export class WebServiceStatus extends Schema.Class<WebServiceStatus>("WebServiceStatus")({
+  state: Schema.Literals(["running", "exited"]),
+  startedAtEpochMs: Schema.Number,
+  exitCode: Schema.optional(Schema.Number),
+  signal: Schema.optional(Schema.String)
+}) {}
+
+export class StopWebServiceResult extends Schema.Class<StopWebServiceResult>("StopWebServiceResult")({
+  stopped: Schema.Boolean
+}) {}
+
 // ---------------------------------------------------------------------------
 // RPC contracts
 // ---------------------------------------------------------------------------
@@ -234,7 +305,12 @@ export class CreateResult extends Schema.Class<CreateResult>("CreateResult")({
    * Sandbox-scoped credential authorizing exec/inspect/destroy/list for this
    * VM only. This is the only credential sandboxed consumers (AI tools) need.
    */
-  sandboxToken: Schema.String
+  sandboxToken: Schema.String,
+  /**
+   * Dedicated HTTP data-plane capability for the immutable `web` endpoint.
+   * Returned once and absent when the image has no endpoint.
+   */
+  httpIngressToken: Schema.UndefinedOr(Schema.String)
 }) {}
 
 export class DestroyResult extends Schema.Class<DestroyResult>("DestroyResult")({
@@ -314,6 +390,42 @@ export class MicrovmRpc extends RpcGroup.make(
     success: ListResult,
     error: Schema.Union([Unauthenticated, Forbidden])
   }).middleware(Auth),
+  Rpc.make("startWebService", {
+    payload: Schema.Struct({
+      vmId: VmId,
+      ...StartWebServiceRequest.fields
+    }),
+    success: WebServiceStatus,
+    error: Schema.Union([
+      VmNotFound,
+      VmPoisoned,
+      ClusterServiceError,
+      Unauthenticated,
+      Forbidden
+    ])
+  }).middleware(Auth),
+  Rpc.make("webServiceStatus", {
+    payload: Schema.Struct({ vmId: VmId }),
+    success: WebServiceStatus,
+    error: Schema.Union([
+      VmNotFound,
+      VmPoisoned,
+      ClusterServiceError,
+      Unauthenticated,
+      Forbidden
+    ])
+  }).middleware(Auth),
+  Rpc.make("stopWebService", {
+    payload: Schema.Struct({ vmId: VmId }),
+    success: StopWebServiceResult,
+    error: Schema.Union([
+      VmNotFound,
+      VmPoisoned,
+      ClusterServiceError,
+      Unauthenticated,
+      Forbidden
+    ])
+  }).middleware(Auth),
   // Admin-only: reap expired/poisoned VMs and orphans.
   Rpc.make("cleanup", {
     payload: Schema.Struct({}),
@@ -331,3 +443,12 @@ export type InspectRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag
 export type DestroyRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "destroy" }>>
 export type ListRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "list" }>>
 export type CleanupRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "cleanup" }>>
+export type StartWebServiceRpcRequest = Rpc.Payload<
+  Extract<MicrovmRequest, { readonly _tag: "startWebService" }>
+>
+export type WebServiceStatusRequest = Rpc.Payload<
+  Extract<MicrovmRequest, { readonly _tag: "webServiceStatus" }>
+>
+export type StopWebServiceRequest = Rpc.Payload<
+  Extract<MicrovmRequest, { readonly _tag: "stopWebService" }>
+>

@@ -57,9 +57,9 @@ type SandboxTools = {
   }>
 }
 
-export const SANDBOX_SYSTEM_PROMPT = `You have tools for exactly one isolated microVM sandbox at /workspace. Commands are argv arrays whose first entry is an absolute guest executable path, normally /usr/bin/node or /usr/bin/python3; never compose a shell command string. The sandbox has no network or package-download capability. read_file and write_file accept relative paths beneath /workspace only and enforce byte bounds. A timeout, cancellation, or failed tool call is not evidence that a command did not start: report the uncertainty and do not blindly retry. Tool cancellation stops the RPC and the daemon destroys a sandbox whose execution state is uncertain.`
+export const SANDBOX_SYSTEM_PROMPT = `You have tools for exactly one isolated microVM sandbox rooted at /workspace. Commands are argv arrays whose first entry is an absolute guest executable path; never compose a shell command string. The private guest root is ephemeral and has no NIC, outbound network, package downloads, or Git credentials. read_file and write_file accept relative paths beneath /workspace only and enforce byte bounds. For an empty workspace, use /usr/local/bin/microvm-next-init when it exists; its pinned Next.js dependencies are prewarmed and stay offline. A web service binds guest 127.0.0.1:3000 and is exposed only by a trusted HTTP-only preview bridge with a fixed loopback target, never by arbitrary TCP/UDP forwarding, caller-selected destinations, or direct daemon access. Before requesting export, use /usr/bin/git when the supported image provides it to make one coherent local commit, require clean status, and record its SHA. That guest-local commit is not durable and the guest cannot push: the trusted webserver must export or materialize and verify the exact commit before teardown, then owns any external push. Keep the sandbox alive while an unexported checkpoint is pending. Preview and export are orchestrator prerequisites, not capabilities implemented by these tools. A timeout, cancellation, or failed tool call is not evidence that a command did not start: report the uncertainty and do not blindly retry. Cancellation stops the RPC and may cause the daemon to destroy a sandbox whose execution state is uncertain.`
 
-export const TOOL_GUIDANCE = `Inspect files before editing them. Prefer one bounded command at a time. Use /usr/bin/node for JavaScript and /usr/bin/python3 for Python. Check exitCode, timedOut, outputTruncated, stdout, and stderr from run_command. File writes are bounded and file tools never accept a VM id or credential: their server-side closure is already bound to one sandbox. If a result is truncated, request a narrower read or command rather than assuming the missing output. Never claim network access, host access, or successful package installation.`
+export const TOOL_GUIDANCE = `Inspect files before editing them and prefer one bounded command at a time. Use absolute guest executables such as /usr/bin/node, /usr/bin/python3, /usr/local/bin/microvm-next-init, and /usr/local/bin/pnpm. Check exitCode, timedOut, outputTruncated, stdout, and stderr from run_command; narrow a truncated read or command instead of assuming missing output. File tools are already bound to one sandbox and accept no VM id or credential. Use the prewarmed initializer only for an empty workspace, and keep any preview service on guest 127.0.0.1:3000. After final changes, use /usr/bin/git when the supported image provides it to produce one clean commit and record its SHA, then request trusted export and verification; never attempt guest push or destroy while export is pending. If Git, trusted HTTP preview, or verified export is unavailable, report the missing orchestrator prerequisite rather than claiming success.`
 
 const boundedLimit = (requested: number | undefined, fallback: number, hardMaximum: number): number => {
   const value = requested ?? fallback
@@ -127,7 +127,7 @@ export const createSandboxTools = (options: SandboxToolsOptions): SandboxTools =
 
   return {
     run_command: tool({
-      description: "Run one absolute guest executable path (for example /usr/bin/node or /usr/bin/python3) with argv directly; no shell or network is available.",
+      description: "Run one absolute guest executable with argv directly in the offline, ephemeral sandbox; no shell, NIC, package download, preview/export bridge, or guest push is available. Use /usr/local/bin/microvm-next-init for an empty prewarmed workspace when present; services bind guest 127.0.0.1:3000 for a trusted HTTP-only orchestrator.",
       inputSchema: z.object({
         argv: z.array(z.string().min(1).max(4096)).min(1).max(64)
           .refine((argv) => argv[0]?.startsWith("/") === true, "argv[0] must be an absolute guest path"),
@@ -147,7 +147,7 @@ export const createSandboxTools = (options: SandboxToolsOptions): SandboxTools =
       }
     }),
     read_file: tool({
-      description: "Read a UTF-8 file beneath the configured sandbox workspace.",
+      description: "Read a bounded UTF-8 file beneath /workspace in the one configured ephemeral sandbox.",
       inputSchema: z.object({
         path: z.string().min(1).max(512),
         maxBytes: z.number().int().min(1).max(maxReadBytes).optional()
@@ -173,7 +173,7 @@ export const createSandboxTools = (options: SandboxToolsOptions): SandboxTools =
       }
     }),
     write_file: tool({
-      description: "Write one UTF-8 file beneath the configured sandbox workspace, creating parent directories.",
+      description: "Write one bounded UTF-8 file beneath /workspace, creating parent directories. The private root is ephemeral: a local commit is not durable until the trusted orchestrator exports and verifies its SHA.",
       inputSchema: z.object({
         path: z.string().min(1).max(512),
         content: z.string().max(maxWriteBytes)

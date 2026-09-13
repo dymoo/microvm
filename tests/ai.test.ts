@@ -7,7 +7,7 @@ import { Effect, Layer } from "effect"
 import { generateText, simulateReadableStream, stepCountIs, streamText } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { describe, expect, it } from "vitest"
-import { createSandboxTools } from "../src/ai.js"
+import { createSandboxTools, SANDBOX_SYSTEM_PROMPT, TOOL_GUIDANCE } from "../src/ai.js"
 import { makeMicrovmClient } from "../src/client.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import {
@@ -23,6 +23,31 @@ const usage = {
   inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
   outputTokens: { total: 1, text: 1, reasoning: undefined }
 } as const
+
+const requiredGuidance = [
+  "/workspace",
+  "absolute guest executable",
+  "no NIC",
+  "package downloads",
+  "/usr/local/bin/microvm-next-init",
+  "/usr/bin/git",
+  "127.0.0.1:3000",
+  "trusted HTTP-only",
+  "arbitrary TCP/UDP",
+  "caller-selected destinations",
+  "direct daemon access",
+  "private guest root is ephemeral",
+  "one coherent local commit",
+  "require clean status",
+  "record its SHA",
+  "not durable",
+  "cannot push",
+  "export or materialize and verify",
+  "owns any external push",
+  "unexported checkpoint",
+  "orchestrator prerequisites",
+  "not evidence that a command did not start"
+] as const
 
 const configFor = (root: string) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
@@ -102,6 +127,40 @@ const runLocalGuest = (
   })
 
 describe("Vercel AI SDK sandbox tools", () => {
+  it("presents the operating contract and bounded tools to the model", async () => {
+    const model = new MockLanguageModelV4({
+      doGenerate: [{
+        content: [{ type: "text", text: "ready" }],
+        finishReason: { unified: "stop", raw: undefined },
+        usage,
+        warnings: []
+      }]
+    })
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const client = yield* makeMicrovmClient({
+        url: "http://127.0.0.1:1",
+        token: "unused-guidance-smoke-token"
+      })
+      const tools = createSandboxTools({ client, vmId: "mvm-guidance" })
+      yield* Effect.promise(() => generateText({
+        model,
+        system: `${SANDBOX_SYSTEM_PROMPT}\n\n${TOOL_GUIDANCE}`,
+        prompt: "Prepare the sandbox safely.",
+        tools
+      }))
+    })))
+
+    const visible = JSON.stringify(model.doGenerateCalls)
+    for (const toolName of ["run_command", "read_file", "write_file"]) {
+      expect(visible, toolName).toContain(toolName)
+    }
+    for (const guidance of requiredGuidance) {
+      expect(visible, guidance).toContain(guidance)
+    }
+    expect(visible).not.toContain("unused-guidance-smoke-token")
+    expect(visible).not.toContain("mvm-guidance")
+  })
+
   it("executes generateText and streamText tool calls through authenticated RPC without exposing credentials", async () => {
     const root = await mkdtemp(join(tmpdir(), "microvm-ai-"))
     const workspace = join(root, "workspace")
@@ -172,6 +231,7 @@ describe("Vercel AI SDK sandbox tools", () => {
         })
         const generated = yield* Effect.promise(() => generateText({
           model: generatedModel,
+          system: `${SANDBOX_SYSTEM_PROMPT}\n\n${TOOL_GUIDANCE}`,
           prompt: "Write the note.",
           tools,
           stopWhen: stepCountIs(2)
@@ -182,6 +242,9 @@ describe("Vercel AI SDK sandbox tools", () => {
         expect(visibleGenerate).not.toContain(adminToken)
         expect(visibleGenerate).not.toContain(created.sandboxToken)
         expect(visibleGenerate).not.toContain(created.vm.vmId)
+        for (const guidance of requiredGuidance) {
+          expect(visibleGenerate, guidance).toContain(guidance)
+        }
 
         const streamedModel = new MockLanguageModelV4({
           doStream: [

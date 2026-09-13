@@ -28,23 +28,36 @@ const bearerOf = (headers: Headers.Headers): string | undefined => {
   return token.length === 0 ? undefined : token
 }
 
+export interface HttpIngressCredential {
+  readonly vmId: string
+  readonly endpoint: "web"
+  /** Undefined follows a VM with no TTL; destroy still revokes the token. */
+  readonly expiresAtEpochMs: number | undefined
+}
+
 // ---------------------------------------------------------------------------
 // Credential store
 // ---------------------------------------------------------------------------
 
 export class CredentialStore extends Context.Service<CredentialStore, {
-  /** Verifies a bearer token; `undefined` when unknown. */
-  readonly verify: (token: string) => Credential | undefined
-  /** Mints a fresh sandbox token and registers its digest for the VM. */
+  /** Verifies only admin and sandbox control-plane credentials. */
+  readonly verifyControl: (token: string) => Credential | undefined
+  /** Mints a fresh sandbox control token and registers only its digest. */
   readonly mintSandbox: (vmId: string) => string
-  /** Drops all credentials bound to a VM (on destroy). */
+  /** Mints a data-plane token bound to the VM's immutable web endpoint. */
+  readonly mintHttpIngress: (vmId: string, expiresAtEpochMs: number | undefined) => string
+  /** Verifies only HTTP ingress credentials and prunes expired bindings. */
+  readonly verifyHttpIngress: (token: string) => HttpIngressCredential | undefined
+  /** Drops every control- and data-plane credential bound to a VM. */
   readonly forgetVm: (vmId: string) => void
 }>()("microvm/auth/CredentialStore") {
   static readonly layer = (adminTokens: ReadonlyArray<string>): Layer.Layer<CredentialStore> =>
     Layer.effect(CredentialStore)(Effect.sync(() => {
       const admin = new Set(Array.from(new Set(adminTokens), (token) => Buffer.from(sha256Hex(token), "utf8")))
       const sandbox = new Map<string, string>()
-      const verify = (token: string): Credential | undefined => {
+      const httpIngress = new Map<string, HttpIngressCredential>()
+
+      const verifyControl = (token: string): Credential | undefined => {
         const digest = sha256Hex(token)
         const provided = Buffer.from(digest, "utf8")
         for (const known of admin) {
@@ -55,17 +68,44 @@ export class CredentialStore extends Context.Service<CredentialStore, {
         const vmId = sandbox.get(digest)
         return vmId === undefined ? undefined : { kind: "sandbox", vmId }
       }
+
       const mintSandbox = (vmId: string): string => {
         const token = `mvs_${randomBytes(24).toString("hex")}`
         sandbox.set(sha256Hex(token), vmId)
         return token
       }
+
+      const mintHttpIngress = (vmId: string, expiresAtEpochMs: number | undefined): string => {
+        const token = `mvi_${randomBytes(24).toString("hex")}`
+        httpIngress.set(sha256Hex(token), { vmId, endpoint: "web", expiresAtEpochMs })
+        return token
+      }
+
+      const verifyHttpIngress = (token: string): HttpIngressCredential | undefined => {
+        const digest = sha256Hex(token)
+        const binding = httpIngress.get(digest)
+        if (
+          binding !== undefined &&
+          binding.expiresAtEpochMs !== undefined &&
+          binding.expiresAtEpochMs <= Date.now()
+        ) {
+          httpIngress.delete(digest)
+          return undefined
+        }
+        return binding
+      }
+
       return CredentialStore.of({
-        verify,
+        verifyControl,
         mintSandbox,
+        mintHttpIngress,
+        verifyHttpIngress,
         forgetVm: (vmId) => {
-          for (const [digest, bound] of sandbox) {
-            if (bound === vmId) sandbox.delete(digest)
+          for (const [digest, boundVmId] of sandbox) {
+            if (boundVmId === vmId) sandbox.delete(digest)
+          }
+          for (const [digest, binding] of httpIngress) {
+            if (binding.vmId === vmId) httpIngress.delete(digest)
           }
         }
       })
@@ -81,7 +121,7 @@ export const authLayer: Layer.Layer<Auth, never, CredentialStore> = Layer.effect
     const store = yield* CredentialStore
     return (effect, options) => {
       const token = bearerOf(options.headers)
-      const credential = token === undefined ? undefined : store.verify(token)
+      const credential = token === undefined ? undefined : store.verifyControl(token)
       if (credential === undefined) {
         return Effect.fail(new Unauthenticated({ message: "missing or invalid bearer token" }))
       }

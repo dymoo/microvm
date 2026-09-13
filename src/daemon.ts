@@ -1,15 +1,23 @@
 import { NodeHttpServer } from "@effect/platform-node"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, FileSystem, Layer, Result, Schema, Scope, Semaphore } from "effect"
-import { HttpRouter, HttpServerRequest } from "effect/unstable/http"
+import { HttpRouter, HttpServer as EffectHttpServer, HttpServerRequest } from "effect/unstable/http"
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc"
 import { randomBytes } from "node:crypto"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { existsSync } from "node:fs"
 import { mkdir, readFile, readdir, rmdir, writeFile } from "node:fs/promises"
-import { createServer as createHttpServer, type Server as HttpServer } from "node:http"
+import { createServer as createHttpServer, type Server as NodeServer } from "node:http"
 import { createServer as createHttpsServer } from "node:https"
+import type { Socket } from "node:net"
 import { join } from "node:path"
 import { authLayer, authorizeVm, CredentialStore, requireAdmin } from "./auth.js"
+import {
+  DaemonHttpAdmissionError,
+  makeDaemonHttpProxy,
+  type DaemonHttpAdmissionKind,
+  type DaemonHttpIngressBinding,
+  type DaemonHttpLease
+} from "./daemon-http-proxy.js"
 import { isLoopbackHost, secureOrigin } from "./endpoint.js"
 import {
   clampLimits,
@@ -18,9 +26,15 @@ import {
   FirecrackerLive,
   GuestExecChannel,
   GuestExecChannelLive,
+  GuestHttpChannel,
+  GuestHttpChannelLive,
+  GuestServiceChannel,
+  GuestServiceChannelLive,
+  GuestServiceError,
   GuestTransportFault,
   VmTeardownFault,
-  type VmHandle
+  type VmHandle,
+  type WebServiceState
 } from "./firecracker.js"
 import {
   CidAllocator,
@@ -36,6 +50,7 @@ import {
   BootFailed,
   CapacityExceeded,
   CleanupResult,
+  ClusterServiceError,
   CreateResult,
   DestroyUncertain,
   DestroyResult,
@@ -47,14 +62,18 @@ import {
   ListResult,
   MicrovmRpc,
   SandboxContext,
+  StopWebServiceResult,
   VmInfo,
   VmNotFound,
   VmPoisoned,
+  WebServiceStatus,
   execRejection,
+  webServiceStartRejection,
   type Credential,
   type VmId,
   type CreateRequest,
   type ExecuteRequest,
+  type StartWebServiceRpcRequest
 } from "./protocol.js"
 
 const positiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
@@ -170,13 +189,22 @@ interface Allocation {
   readonly cid: number
 }
 
+interface HttpLeaseState {
+  kind: DaemonHttpAdmissionKind
+  readonly controller: AbortController
+  readonly done: Deferred.Deferred<void>
+}
+
 interface VmRecord extends Allocation {
   info: VmInfo
   readonly handle: VmHandle
   readonly layout: VmLayout
+  readonly webPort: number | undefined
   poisoned: boolean
   destroyGate: Deferred.Deferred<DestroyResult, DaemonRuntimeError | VmTeardownFault> | undefined
   readonly execSemaphore: Semaphore.Semaphore
+  readonly serviceSemaphore: Semaphore.Semaphore
+  readonly httpScopes: Set<HttpLeaseState>
 }
 
 interface Quarantine {
@@ -206,6 +234,23 @@ export class VmRegistry extends Context.Service<VmRegistry, {
     credential: Credential
   ) => Effect.Effect<DestroyResult, Forbidden | VmNotFound | DestroyUncertain>
   readonly list: (credential: Credential) => Effect.Effect<ListResult>
+  readonly startWebService: (
+    request: StartWebServiceRpcRequest,
+    credential: Credential
+  ) => Effect.Effect<WebServiceStatus, Forbidden | VmNotFound | VmPoisoned | ClusterServiceError>
+  readonly webServiceStatus: (
+    vmId: VmId,
+    credential: Credential
+  ) => Effect.Effect<WebServiceStatus, Forbidden | VmNotFound | VmPoisoned | ClusterServiceError>
+  readonly stopWebService: (
+    vmId: VmId,
+    credential: Credential
+  ) => Effect.Effect<StopWebServiceResult, Forbidden | VmNotFound | VmPoisoned | ClusterServiceError>
+  readonly acquireHttp: (
+    vmId: string,
+    binding: DaemonHttpIngressBinding,
+    kind: DaemonHttpAdmissionKind
+  ) => Effect.Effect<DaemonHttpLease, DaemonHttpAdmissionError>
   readonly cleanup: (credential: Credential) => Effect.Effect<CleanupResult, Forbidden | DestroyUncertain>
   readonly lockLost: Effect.Effect<never, DaemonRuntimeError>
 }>()("microvm/daemon/VmRegistry") {
@@ -215,7 +260,8 @@ export class VmRegistry extends Context.Service<VmRegistry, {
   ): Layer.Layer<
     VmRegistry,
     DaemonRuntimeError | HostPrereqFailed,
-    HostPrereqs | ImageAllowlist | CidAllocator | JailerUidAllocator | Firecracker | GuestExecChannel | CredentialStore
+    HostPrereqs | ImageAllowlist | CidAllocator | JailerUidAllocator | Firecracker |
+      GuestExecChannel | GuestHttpChannel | GuestServiceChannel | CredentialStore
   > => Layer.effect(VmRegistry)(makeVmRegistry(config, unsafeSkipKernelLockForTests))
 }
 
@@ -474,6 +520,8 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
     const jailerUids = yield* JailerUidAllocator
     const firecracker = yield* Firecracker
     const guest = yield* GuestExecChannel
+    const guestHttp = yield* GuestHttpChannel
+    const guestService = yield* GuestServiceChannel
     const credentials = yield* CredentialStore
     const daemonScope = yield* Scope.Scope
     const capabilities = yield* prereqs.verifyAll()
@@ -540,7 +588,83 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         if (records.get(record.info.vmId) !== record) return
         record.poisoned = true
         record.info = new VmInfo({ ...record.info, state: "poisoned" })
+        for (const scope of record.httpScopes) scope.controller.abort()
       }))
+
+    const acquireHttp = (
+      vmId: string,
+      binding: DaemonHttpIngressBinding,
+      kind: DaemonHttpAdmissionKind
+    ): Effect.Effect<DaemonHttpLease, DaemonHttpAdmissionError> =>
+      mutex.withPermit(Effect.try({
+        try: () => {
+          if (binding.vmId !== vmId || binding.endpoint !== "web") {
+            throw new DaemonHttpAdmissionError("not-found")
+          }
+          const record = records.get(vmId)
+          if (record === undefined || record.webPort === undefined) {
+            throw new DaemonHttpAdmissionError("not-found")
+          }
+          if (
+            record.destroyGate !== undefined ||
+            record.poisoned ||
+            (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= Date.now())
+          ) {
+            throw new DaemonHttpAdmissionError("unavailable")
+          }
+          if (record.httpScopes.size >= 32) throw new DaemonHttpAdmissionError("quota")
+          let sameKind = 0
+          for (const active of record.httpScopes) {
+            if (active.kind === kind) sameKind++
+          }
+          if ((kind === "sse" || kind === "websocket") && sameKind >= 8) {
+            throw new DaemonHttpAdmissionError("quota")
+          }
+
+          const state: HttpLeaseState = {
+            kind,
+            controller: new AbortController(),
+            done: Deferred.makeUnsafe<void>()
+          }
+          record.httpScopes.add(state)
+          let released = false
+          return {
+            vmId,
+            vsockSocket: record.layout.vsockSocket,
+            signal: state.controller.signal,
+            promoteToSse: () => Effect.runPromise(mutex.withPermit(Effect.sync(() => {
+              if (released || state.kind === "sse") return true
+              let activeSse = 0
+              for (const active of record.httpScopes) {
+                if (active.kind === "sse") activeSse++
+              }
+              if (activeSse >= 8) return false
+              state.kind = "sse"
+              return true
+            }))),
+            poison: () => Effect.runPromise(markPoisoned(record)),
+            release: () => Effect.runPromise(mutex.withPermit(Effect.sync(() => {
+              if (released) return
+              released = true
+              record.httpScopes.delete(state)
+              Deferred.doneUnsafe(state.done, Effect.void)
+            })))
+          }
+        },
+        catch: (cause) => cause instanceof DaemonHttpAdmissionError
+          ? cause
+          : new DaemonHttpAdmissionError("unavailable")
+      }))
+
+    const waitForHttpScopes = (scopes: ReadonlyArray<HttpLeaseState>): Effect.Effect<boolean> =>
+      Effect.gen(function*() {
+        const deadline = Date.now() + 5_000
+        while (scopes.some((scope) => !Deferred.isDoneUnsafe(scope.done))) {
+          if (Date.now() >= deadline) return false
+          yield* Effect.sleep(10)
+        }
+        return true
+      })
 
     const destroyRecord = (
       record: VmRecord
@@ -551,17 +675,27 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
           Effect.gen(function*() {
             const claim = yield* mutex.withPermit(Effect.sync(() => {
               if (records.get(record.info.vmId) !== record) return undefined
-              if (record.destroyGate !== undefined) return { gate: record.destroyGate, owner: false } as const
+              if (record.destroyGate !== undefined) {
+                return { gate: record.destroyGate, owner: false, scopes: [] as ReadonlyArray<HttpLeaseState> } as const
+              }
               record.destroyGate = candidate
               record.poisoned = true
               record.info = new VmInfo({ ...record.info, state: "poisoned" })
-              return { gate: candidate, owner: true } as const
+              const scopes = Array.from(record.httpScopes)
+              for (const scope of scopes) scope.controller.abort()
+              return { gate: candidate, owner: true, scopes } as const
             }))
             if (claim === undefined) return new DestroyResult({ vmId: record.info.vmId, destroyed: false })
             if (!claim.owner) return yield* restore(Deferred.await(claim.gate))
+            yield* waitForHttpScopes(claim.scopes)
 
             const ownerOutcome = yield* Effect.exit(Effect.gen(function*() {
               yield* teardown(record)
+              if (!(yield* waitForHttpScopes(claim.scopes))) {
+                return yield* Effect.fail(new DaemonRuntimeError({
+                  reason: "HTTP connection scopes remained active after VM teardown"
+                }))
+              }
               const removed = yield* forgetRecord(record)
               return new DestroyResult({ vmId: record.info.vmId, destroyed: removed })
             }))
@@ -674,6 +808,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             cpus,
             memMib,
             kernelArgs: config.firecracker.kernelArgs,
+            webPort: image.manifest.httpEndpoints?.web?.port,
             layout,
             uid: allocation.uid,
             gid: allocation.gid
@@ -693,6 +828,9 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             Effect.ensuring(Effect.sync(() => bootCancels.delete(cancelBoot)))
           )
           const sandboxToken = credentials.mintSandbox(vmId)
+          const httpIngressToken = image.manifest.httpEndpoints?.web === undefined
+            ? undefined
+            : credentials.mintHttpIngress(vmId, expiresAtEpochMs)
           tokenMinted = true
           yield* saveVmState(layout.statePath, {
             vmId,
@@ -721,9 +859,12 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             gid: allocation.gid,
             cid: allocation.cid,
             layout,
+            webPort: image.manifest.httpEndpoints?.web?.port,
             poisoned: false,
             destroyGate: undefined,
-            execSemaphore: Semaphore.makeUnsafe(1)
+            execSemaphore: Semaphore.makeUnsafe(1),
+            serviceSemaphore: Semaphore.makeUnsafe(1),
+            httpScopes: new Set()
           }
           yield* mutex.withPermit(Effect.sync(() => {
             reservations.delete(vmId!)
@@ -734,7 +875,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             Effect.andThen(markPoisoned(record)),
             Effect.forkIn(daemonScope)
           )
-          return new CreateResult({ vm: info, sandboxToken })
+          return new CreateResult({ vm: info, sandboxToken, httpIngressToken })
         }).pipe(Effect.onExit((exit) => Exit.isSuccess(exit) && committed ? Effect.void : cleanupFailedCreate))
       })
 
@@ -807,6 +948,138 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
     const execute = (request: ExecuteRequest, credential: Credential) =>
       withCredential(credential, authorizeVm(request.vmId)).pipe(Effect.andThen(executeAuthorized(request)))
 
+    const runServiceChannel = <A>(
+      record: VmRecord,
+      vmId: VmId,
+      operation: Effect.Effect<A, GuestServiceError | GuestTransportFault>
+    ): Effect.Effect<A, ClusterServiceError | VmPoisoned> =>
+      operation.pipe(
+        Effect.catchTag("GuestServiceError", (fault: GuestServiceError) =>
+          Effect.fail(new ClusterServiceError({
+            vmId,
+            code: fault.code,
+            message: fault.message
+          }))),
+        Effect.catchTag("GuestTransportFault", (fault: GuestTransportFault) =>
+          markPoisoned(record).pipe(
+            Effect.andThen(Effect.fail(new VmPoisoned({ vmId, message: fault.reason })))
+          ))
+      )
+
+    const serviceStatusResult = (
+      vmId: VmId,
+      status: WebServiceState
+    ): Effect.Effect<WebServiceStatus, ClusterServiceError> => {
+      if (status.state === "not_started") {
+        return Effect.fail(new ClusterServiceError({
+          vmId,
+          code: "NOT_RUNNING",
+          message: "web service has not been started"
+        }))
+      }
+      if (status.state === "running") {
+        return Effect.succeed(new WebServiceStatus({
+          state: "running",
+          startedAtEpochMs: status.startedAtEpochMs
+        }))
+      }
+      return Effect.succeed(new WebServiceStatus({
+        state: "exited",
+        startedAtEpochMs: status.startedAtEpochMs,
+        exitCode: status.exitCode,
+        ...(status.signal === null ? {} : { signal: status.signal })
+      }))
+    }
+
+    const withServiceRecord = <A, E>(
+      vmId: VmId,
+      use: (record: VmRecord, webPort: number) => Effect.Effect<A, E>
+    ): Effect.Effect<A, E | VmNotFound | VmPoisoned | ClusterServiceError> =>
+      Effect.gen(function*() {
+        const record = yield* getRecord(vmId)
+        return yield* record.serviceSemaphore.withPermit(Effect.gen(function*() {
+          const live = yield* mutex.withPermit(Effect.sync(() => records.get(vmId) === record))
+          if (!live) return yield* Effect.fail(new VmNotFound({ vmId }))
+          if (record.poisoned || record.destroyGate !== undefined) {
+            return yield* Effect.fail(new VmPoisoned({ vmId, message: "VM is being destroyed" }))
+          }
+          if (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= Date.now()) {
+            yield* Effect.result(destroyRecord(record))
+            return yield* Effect.fail(new VmPoisoned({ vmId, message: "VM lifetime expired" }))
+          }
+          if (record.webPort === undefined) {
+            return yield* Effect.fail(new ClusterServiceError({
+              vmId,
+              code: "INVALID_REQUEST",
+              message: "image has no web service endpoint"
+            }))
+          }
+          return yield* use(record, record.webPort)
+        }))
+      })
+
+    const startWebService = (request: StartWebServiceRpcRequest, credential: Credential) =>
+      withCredential(credential, authorizeVm(request.vmId)).pipe(
+        Effect.andThen(Effect.suspend(() => {
+          const rejection = webServiceStartRejection(request.argv, request.cwd, request.env)
+          if (rejection !== undefined) {
+            return Effect.fail(new ClusterServiceError({
+              vmId: request.vmId,
+              code: "INVALID_REQUEST",
+              message: rejection
+            }))
+          }
+          return withServiceRecord(request.vmId, (record, webPort) =>
+            Effect.gen(function*() {
+              const status = yield* runServiceChannel(record, request.vmId, guestService.status({
+                vmId: request.vmId,
+                vsockSocket: record.layout.vsockSocket,
+                requestId: randomBytes(16).toString("hex")
+              }))
+              if (status.state === "running") {
+                return yield* Effect.fail(new ClusterServiceError({
+                  vmId: request.vmId,
+                  code: "ALREADY_RUNNING",
+                  message: "web service is already running"
+                }))
+              }
+              const started = yield* runServiceChannel(record, request.vmId, guestService.start({
+                vmId: request.vmId,
+                vsockSocket: record.layout.vsockSocket,
+                requestId: randomBytes(16).toString("hex"),
+                argv: request.argv,
+                cwd: request.cwd,
+                env: request.env,
+                webPort
+              }))
+              return yield* serviceStatusResult(request.vmId, started)
+            })
+          )
+        }))
+      )
+
+    const webServiceStatus = (vmId: VmId, credential: Credential) =>
+      withCredential(credential, authorizeVm(vmId)).pipe(
+        Effect.andThen(withServiceRecord(vmId, (record) =>
+          runServiceChannel(record, vmId, guestService.status({
+            vmId,
+            vsockSocket: record.layout.vsockSocket,
+            requestId: randomBytes(16).toString("hex")
+          })).pipe(Effect.flatMap((status) => serviceStatusResult(vmId, status)))
+        ))
+      )
+
+    const stopWebService = (vmId: VmId, credential: Credential) =>
+      withCredential(credential, authorizeVm(vmId)).pipe(
+        Effect.andThen(withServiceRecord(vmId, (record) =>
+          runServiceChannel(record, vmId, guestService.stop({
+            vmId,
+            vsockSocket: record.layout.vsockSocket,
+            requestId: randomBytes(16).toString("hex")
+          })).pipe(Effect.map((result) => new StopWebServiceResult(result)))
+        ))
+      )
+
     const inspect = (vmId: VmId, credential: Credential) =>
       withCredential(credential, authorizeVm(vmId)).pipe(
         Effect.andThen(getRecord(vmId)),
@@ -869,9 +1142,10 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
       for (const cancel of Array.from(bootCancels)) yield* cancel()
       const live = yield* mutex.withPermit(Effect.sync(() => Array.from(records.values())))
       for (const record of live) {
-        const outcome = yield* Effect.result(teardown(record))
-        if (Result.isSuccess(outcome)) yield* forgetRecord(record)
-        else yield* Effect.logError(`failed to stop ${record.info.vmId} during daemon shutdown`, outcome.failure)
+        const outcome = yield* Effect.result(destroyRecord(record))
+        if (Result.isFailure(outcome)) {
+          yield* Effect.logError(`failed to stop ${record.info.vmId} during daemon shutdown`, outcome.failure)
+        }
       }
       const held = yield* mutex.withPermit(Effect.sync(() => Array.from(quarantines.values())))
       for (const quarantine of held) {
@@ -888,15 +1162,29 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
       )
     ).pipe(Effect.forkIn(daemonScope))
 
-    return VmRegistry.of({ create, execute, inspect, destroy, list, cleanup, lockLost: kernelLock.lost })
+    return VmRegistry.of({
+      create,
+      execute,
+      inspect,
+      destroy,
+      list,
+      startWebService,
+      webServiceStatus,
+      stopWebService,
+      acquireHttp,
+      cleanup,
+      lockLost: kernelLock.lost
+    })
   })
 
 export interface DaemonLayerOptions {
   readonly firecracker?: Layer.Layer<Firecracker>
   readonly guestExec?: Layer.Layer<GuestExecChannel>
+  readonly guestHttp?: Layer.Layer<GuestHttpChannel>
+  readonly guestService?: Layer.Layer<GuestServiceChannel>
   readonly prereqs?: Layer.Layer<HostPrereqs>
-  readonly server?: HttpServer
-  /** Test-only seam; rejected unless NODE_ENV is exactly \"test\". */
+  readonly server?: NodeServer
+  /** Test-only seam; rejected unless NODE_ENV is exactly "test". */
   readonly unsafeSkipKernelLockForTests?: boolean | undefined
 }
 
@@ -908,7 +1196,9 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
     CidAllocator.layer(config.firecracker),
     JailerUidAllocator.layer(config.firecracker),
     options?.firecracker ?? FirecrackerLive(config.firecracker),
-    options?.guestExec ?? GuestExecChannelLive
+    options?.guestExec ?? GuestExecChannelLive,
+    options?.guestHttp ?? GuestHttpChannelLive,
+    options?.guestService ?? GuestServiceChannelLive
   )
   const registry = VmRegistry.layer(config, options?.unsafeSkipKernelLockForTests).pipe(Layer.provide(infrastructure))
   const handlers = MicrovmRpc.toLayer(Effect.gen(function*() {
@@ -921,6 +1211,9 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
       inspect: ({ vmId }) => authenticated((credential) => service.inspect(vmId, credential)),
       destroy: ({ vmId }) => authenticated((credential) => service.destroy(vmId, credential)),
       list: () => authenticated(service.list),
+      startWebService: (request) => authenticated((credential) => service.startWebService(request, credential)),
+      webServiceStatus: ({ vmId }) => authenticated((credential) => service.webServiceStatus(vmId, credential)),
+      stopWebService: ({ vmId }) => authenticated((credential) => service.stopWebService(vmId, credential)),
       cleanup: () => authenticated(service.cleanup)
     }
   })).pipe(Layer.provide(registry))
@@ -939,9 +1232,87 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
   nodeServer.maxHeadersCount = 64
   nodeServer.headersTimeout = HTTP_HEADERS_TIMEOUT_MS
   nodeServer.requestTimeout = HTTP_REQUEST_TIMEOUT_MS
-  const server = Layer.unwrap(
-    Effect.map(VmRegistry, () => NodeHttpServer.layer(() => nodeServer, config.listen))
-  ).pipe(Layer.provide(registry))
+
+  const baseServer = NodeHttpServer.layer(() => nodeServer, config.listen)
+  const server = Layer.effectContext(Effect.gen(function*() {
+    const baseServices = yield* Layer.build(baseServer)
+    const base = Context.get(baseServices, EffectHttpServer.HttpServer)
+    const service = yield* VmRegistry
+    const credentials = yield* CredentialStore
+    const guestHttp = yield* GuestHttpChannel
+    const proxy = makeDaemonHttpProxy({
+      verifyHttpIngress: credentials.verifyHttpIngress,
+      admit: ({ vmId, binding, kind }) => Effect.runPromise(service.acquireHttp(vmId, binding, kind)),
+      openGuest: async (lease) => {
+        const connectionScope = Scope.makeUnsafe()
+        try {
+          const socket = await Effect.runPromise(
+            guestHttp.open({ vmId: lease.vmId, vsockSocket: lease.vsockSocket }).pipe(
+              Scope.provide(connectionScope)
+            )
+          )
+          return {
+            socket,
+            close: () => Effect.runPromise(Scope.close(connectionScope, Exit.void))
+          }
+        } catch (cause) {
+          await Effect.runPromise(Scope.close(connectionScope, Exit.void))
+          throw cause
+        }
+      }
+    })
+    const serve: EffectHttpServer.HttpServer["Service"]["serve"] = (
+      httpApp: Parameters<EffectHttpServer.HttpServer["Service"]["serve"]>[0],
+      middleware?: Parameters<EffectHttpServer.HttpServer["Service"]["serve"]>[1]
+    ) =>
+      Effect.gen(function*() {
+        const parentScope = yield* Effect.scope
+        const requestScope = Scope.forkUnsafe(parentScope, "parallel")
+        const rpcHandler = yield* NodeHttpServer.makeHandler(httpApp, {
+          scope: requestScope,
+          middleware
+        })
+        const requestHandler = (
+          request: Parameters<typeof rpcHandler>[0],
+          response: Parameters<typeof rpcHandler>[1]
+        ): void => {
+          if (proxy.isIngressTarget(request.url)) proxy.handleRequest(request, response)
+          else rpcHandler(request, response)
+        }
+        const upgradeHandler: typeof proxy.handleUpgrade = (request, socket, head) =>
+          proxy.handleUpgrade(request, socket, head)
+        const connectHandler: typeof proxy.handleConnect = (request, socket, head) =>
+          proxy.handleConnect(request, socket, head)
+        const checkContinueHandler: typeof proxy.handleCheckContinue = (request, response) =>
+          proxy.handleCheckContinue(request, response)
+        const clientErrorHandler = (_cause: Error, socket: Socket): void => {
+          if (socket.destroyed) return
+          const body = Buffer.from("Bad Request\n", "utf8")
+          socket.end(
+            `HTTP/1.1 400 Bad Request\r\nCache-Control: no-store\r\nConnection: close\r\n` +
+              `Content-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.byteLength}\r\n\r\n` +
+              body.toString("utf8")
+          )
+        }
+        nodeServer.on("request", requestHandler)
+        nodeServer.on("upgrade", upgradeHandler)
+        nodeServer.on("connect", connectHandler)
+        nodeServer.on("checkContinue", checkContinueHandler)
+        nodeServer.on("clientError", clientErrorHandler)
+        yield* Scope.addFinalizer(parentScope, Effect.sync(() => {
+          nodeServer.off("request", requestHandler)
+          nodeServer.off("upgrade", upgradeHandler)
+          nodeServer.off("connect", connectHandler)
+          nodeServer.off("checkContinue", checkContinueHandler)
+          nodeServer.off("clientError", clientErrorHandler)
+        }))
+      })
+    return Context.add(
+      baseServices,
+      EffectHttpServer.HttpServer,
+      EffectHttpServer.HttpServer.of({ address: base.address, serve })
+    )
+  })).pipe(Layer.provide(Layer.merge(infrastructure, registry)))
   const served = HttpRouter.serve(rpc, {
     disableLogger: true,
     middleware: (effect) => Effect.provideService(

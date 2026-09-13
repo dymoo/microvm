@@ -44,8 +44,19 @@ sudo scripts/build-guest-image.sh \
 
 The builder emits `node.raw`, `node.kernel`, `node.json`, and `node.sha256`; do
 not create a second manifest manually. It verifies Debian snapshot metadata,
-the pinned official Node.js tarball checksum, and the supplied kernel digest.
-It never fetches an unpinned `latest` artifact.
+the pinned official Node.js checksum, pnpm **11.13.1**'s official npm
+`dist.integrity`, the template lockfile, and the supplied kernel digest. The
+image contains Git from the pinned Debian snapshot, an operator-owned Next.js
+template, its ready `node_modules`, and a private writable pnpm store. In a new
+VM, run `microvm-next-init` once in the empty `/workspace`, then `pnpm dev`; the
+app binds only `127.0.0.1:3000`. Neither command downloads packages.
+
+Before destroying a VM, Git can create a coherent guest-local checkpoint:
+configure a non-secret local author, `git add --all`, commit, require a clean
+status, and record `git rev-parse HEAD`. That commit remains ephemeral with the
+private VM disk until a trusted external export verifies and persists it; that
+export is not implemented here. The guest has no remote, Git credentials, NIC,
+DNS, or push path.
 
 ## Hosted acceptance
 

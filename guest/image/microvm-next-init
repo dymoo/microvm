@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
+
+const usage = "usage: microvm-next-init [empty-target]";
+if (process.argv.length > 3) {
+  console.error(usage);
+  process.exit(2);
+}
+
+const sourceDirectory = resolve(
+  process.env.MICROVM_NEXT_TEMPLATE_DIR ?? "/opt/microvm/next-template",
+);
+const target = resolve(process.argv[2] ?? "/workspace");
+
+if (existsSync(target)) {
+  const targetStat = lstatSync(target);
+  if (targetStat.isSymbolicLink()) {
+    console.error(`microvm-next-init: target must not be a symbolic link: ${target}`);
+    process.exit(1);
+  }
+  if (!targetStat.isDirectory()) {
+    console.error(`microvm-next-init: target is not a directory: ${target}`);
+    process.exit(1);
+  }
+  if (readdirSync(target).length !== 0) {
+    console.error(
+      `microvm-next-init: target must be empty; refusing to overwrite: ${target}`,
+    );
+    process.exit(1);
+  }
+} else {
+  mkdirSync(target, { recursive: true });
+}
+
+for (const entry of readdirSync(sourceDirectory)) {
+  cpSync(join(sourceDirectory, entry), join(target, entry), {
+    recursive: true,
+    force: false,
+    errorOnExist: true,
+    preserveTimestamps: true,
+    verbatimSymlinks: true,
+  });
+}
+
+console.log(`Next.js workspace initialized at ${target}`);
