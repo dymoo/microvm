@@ -196,9 +196,18 @@ describe("static microVM cluster", () => {
       const webCluster = yield* makeMicrovmCluster({ endpoints: [{ url: webUrl, token: adminToken }] })
       const web = yield* webCluster.create(createPayload)
       const proxy = yield* web.http()
-      expect(Object.keys(proxy).sort()).toEqual(["handleRequest", "handleUpgrade"])
+      expect(Object.keys(proxy).sort()).toEqual([
+        "handleCheckContinue",
+        "handleConnect",
+        "handleRequest",
+        "handleUpgrade"
+      ])
       expect(typeof proxy.handleRequest).toBe("function")
       expect(typeof proxy.handleUpgrade).toBe("function")
+      // Node routes these to their own server events; a host that omits either
+      // wiring gets a silent close or an interim `100 Continue` instead.
+      expect(typeof proxy.handleConnect).toBe("function")
+      expect(typeof proxy.handleCheckContinue).toBe("function")
       expect("httpIngressToken" in web).toBe(false)
       expect(yield* web.http()).toBe(proxy)
     })))

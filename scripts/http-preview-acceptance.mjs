@@ -101,7 +101,7 @@ const boundedRpc = (label, effect, milliseconds = DEADLINES.rpcMs) =>
   Effect.raceFirst(effect, Effect.delay(Effect.die(expired(label, milliseconds)), milliseconds))
 
 const listenProxy = (proxy) => Effect.acquireRelease(
-  Effect.promise(() => listenTrustedProxy(proxy.handleRequest, proxy.handleUpgrade)),
+  Effect.promise(() => listenTrustedProxy(proxy)),
   (handle) => Effect.promise(handle.close)
 )
 
@@ -441,6 +441,18 @@ const program = Effect.scoped(Effect.gen(function*() {
   assert(
     (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "GET", "http://example.invalid/"))) === 400,
     "absolute-form target was not rejected"
+  )
+  operationSucceeded()
+
+  // `Expect: 100-continue` is delivered to the server's `checkContinue` event.
+  // The probe reads the first status line, so an interim `100 Continue` would
+  // fail here exactly as a wrongly continued body would in a browser.
+  operationStarted("Expect 100-continue probe")
+  assert(
+    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "POST", "/", {
+      headers: { expect: "100-continue", "content-length": "5" }
+    }))) === 400,
+    "Expect: 100-continue was not refused without an interim 100"
   )
   operationSucceeded()
 

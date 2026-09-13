@@ -158,6 +158,23 @@ Request and response handling is semantic, not a raw byte tunnel:
   response-head time are bounded; bodies remain streaming and backpressured;
 - SSE flushes immediately and occupies one of eight per-VM long-lived slots.
 
+A trusted Node host MUST wire the adapter to all four server events, because
+Node routes them independently and a partial wiring fails silently:
+
+| Event | Handler | Refusal |
+| --- | --- | --- |
+| `request` | `handleRequest` | proxied, or a bounded local rejection |
+| `upgrade` | `handleUpgrade` | `426`/`400`/`502`, or the validated WebSocket tunnel |
+| `connect` | `handleConnect` | `405` written on the detached socket, which is then drained, dropped, and closed; `head` is never read |
+| `checkContinue` | `handleCheckContinue` | the same admission as `request`, with `Connection: close` and no interim `100 Continue` |
+
+With no `connect` listener Node closes a CONNECT socket without any response,
+and with no `checkContinue` listener it writes an interim `100 Continue` before
+emitting `request` — inviting a body this adapter never forwards. Neither
+callback can open, return, or dial anything: the adapter exposes exactly one
+VM-bound HTTP surface, so a CONNECT or an unanswered expectation only ever
+terminates.
+
 A WebSocket request is admitted only after a valid RFC 6455 version/key and a
 valid guest `101` accept/subprotocol response. Extensions are disabled.
 Client-to-server frames must be masked, server-to-client frames unmasked, RSV

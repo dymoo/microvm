@@ -53,12 +53,18 @@ interface Harness {
   readonly daemonOrigin: string
   readonly publicOrigin: string
   readonly publicPort: number
+  readonly daemonConnections: () => number
+  readonly daemonRequests: () => number
 }
 
 const harness = async (
   handler: (request: IncomingMessage, response: ServerResponse) => void
 ): Promise<Harness> => {
   const daemon = createServer(handler)
+  let daemonConnections = 0
+  let daemonRequests = 0
+  daemon.on("connection", () => { daemonConnections++ })
+  daemon.on("request", () => { daemonRequests++ })
   const daemonAddress = await listen(daemon)
   const proxy = makeSandboxHttpProxy({
     daemonOrigin: new URL(daemonAddress.origin),
@@ -67,13 +73,19 @@ const harness = async (
   })
   const publicServer = createServer(proxy.handleRequest)
   publicServer.on("upgrade", proxy.handleUpgrade)
-  publicServer.on("connect", proxy.handleUpgrade)
+  // Node routes CONNECT to `connect` and `Expect: 100-continue` to
+  // `checkContinue`, never to `request`, so a host must wire both refusals or
+  // the socket is either answered silently or invited to send a body first.
+  publicServer.on("connect", proxy.handleConnect)
+  publicServer.on("checkContinue", proxy.handleCheckContinue)
   const publicAddress = await listen(publicServer)
   return {
     daemon,
     daemonOrigin: daemonAddress.origin,
     publicOrigin: publicAddress.origin,
-    publicPort: publicAddress.port
+    publicPort: publicAddress.port,
+    daemonConnections: () => daemonConnections,
+    daemonRequests: () => daemonRequests
   }
 }
 
@@ -453,6 +465,47 @@ describe("SandboxHttpProxy WebSocket upgrades", () => {
   })
 })
 
+describe("SandboxHttpProxy refused semantics", () => {
+  it("refuses CONNECT and Expect locally, then still serves ordinary requests", async () => {
+    const test = await harness((_incoming, response) => response.end("ok"))
+
+    // CONNECT arrives on the server's `connect` event. With no listener Node
+    // closes the socket silently, so this is the one refusal a host must wire;
+    // trailing bytes after the head must never become a tunnel.
+    const connect = await rawRequest(
+      test.publicPort,
+      "CONNECT attacker.invalid:443 HTTP/1.1\r\n" +
+      "Host: attacker.invalid\r\n\r\n" +
+      "raw-tunnel-bytes"
+    )
+    expect(connect).toContain("HTTP/1.1 405 Method Not Allowed")
+    expect(connect).toContain("Connection: close")
+    expect(connect.toLowerCase()).not.toContain("101")
+    expect(connect).not.toContain("raw-tunnel-bytes")
+
+    // `Expect: 100-continue` arrives on `checkContinue`. Node answers an
+    // unwired expectation itself by writing an interim `100 Continue` and then
+    // emitting `request`, which invites a body this adapter will never forward.
+    const expectContinue = await rawRequest(
+      test.publicPort,
+      "POST /upload HTTP/1.1\r\n" +
+      `Host: 127.0.0.1:${test.publicPort}\r\n` +
+      "Expect: 100-continue\r\n" +
+      "Content-Length: 5\r\n\r\n"
+    )
+    expect(expectContinue).toContain("HTTP/1.1 400 Bad Request")
+    expect(expectContinue.toLowerCase()).not.toContain("100 continue")
+    expect(expectContinue.toLowerCase()).toContain("connection: close")
+
+    // Neither refusal may cross the daemon seam at all.
+    expect(test.daemonConnections()).toBe(0)
+    expect(test.daemonRequests()).toBe(0)
+
+    expect((await exchange(test.publicOrigin, "/ordinary")).body).toBe("ok")
+    expect(test.daemonRequests()).toBe(1)
+  })
+})
+
 describe("SandboxHttpProxy target and header safety", () => {
   it("rejects non-origin targets, forbidden methods, malformed upgrades, and reserved fields locally", async () => {
     let daemonRequests = 0
@@ -475,6 +528,8 @@ describe("SandboxHttpProxy target and header safety", () => {
         status: 405
       },
       {
+        // Routed to the proxy's `handleConnect` through the server's connect
+        // event; without a listener Node would close with no response at all.
         payload: "CONNECT attacker.invalid:443 HTTP/1.1\r\nHost: attacker.invalid\r\n\r\n",
         status: 405
       },

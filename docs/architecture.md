@@ -13,7 +13,7 @@ One Firecracker runtime, three credential scopes, four trust boundaries.
 | `src/firecracker.ts` | `Firecracker.boot`, `VmHandle`, exec/HTTP/service channels, readiness probe | Jailer argv, UDS HTTP API, guest framing, transactional teardown |
 | `src/daemon-http-proxy.ts` | Authenticated `/http/v1/vms/:id/*` HTTP and WebSocket ingress | Admission quotas, semantic parsing, sanitization, streaming, frame validation |
 | `src/daemon.ts` | `daemonLayer(config)` | Registry, quotas, request leases, service serialization, TTL reaper, recovery, HTTP(S) serving |
-| `src/http-proxy.ts` | `SandboxHttpProxy.handleRequest` / `handleUpgrade` | Ingress capability injection and the trusted Node reverse-proxy hop |
+| `src/http-proxy.ts` | `SandboxHttpProxy` handlers for Node's `request`, `upgrade`, `connect`, and `checkContinue` events | Ingress capability injection and the trusted Node reverse-proxy hop |
 | `src/client.ts` | `makeMicrovmClient` | Endpoint resolution, TLS enforcement, wire decoding |
 | `src/cluster.ts` | `SandboxHandle`, `WebServiceHandle` | Endpoint ownership, hidden credentials, semantic HTTP and durable service APIs, normalization of omitted optional request keys |
 | `src/ai.ts` | `createSandboxTools`, prompt exports | Tool schemas, bounds, cancellation wiring |
@@ -31,11 +31,15 @@ from either higher-level consumer.
    ingress.
 2. **Trusted web server -> daemon HTTP data plane.** `SandboxHandle.http()`
    closes over a dedicated VM-bound ingress capability and exposes only
-   semantic Node HTTP/upgrade handlers. The daemon authenticates
+   semantic Node handlers for the four server events Node routes separately
+   (`request`, `upgrade`, `connect`, `checkContinue`). The daemon authenticates
    `Proxy-Authorization`, verifies the token-to-VM binding before guest I/O,
    strips routing, hop-by-hop, forwarding, proxy, and reserved headers, and
    dials only the registered VM's fixed HTTP channel. Application
-   `Authorization` remains application data.
+   `Authorization` remains application data. A CONNECT is answered `405` on the
+   detached socket and an `Expect: 100-continue` is refused without an interim
+   `100`: neither can open, return, or dial anything, so the only reachable
+   target stays the one VM-bound HTTP surface.
 3. **Daemon -> Firecracker.** The daemon runs as root; Firecracker never does.
    Every boot goes through `jailer` with per-VM uid/gid and chroot; cgroup v2
    ceilings and rlimits are set by the jailer. The Firecracker API and three

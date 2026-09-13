@@ -62,13 +62,15 @@ export const requestStatus = (
 /**
  * Sends one raw HTTP request under an absolute wall-clock deadline, including
  * connection establishment. Every terminal path shares one idempotent cleanup.
+ * Extra `headers` are appended verbatim, so an `Expect` probe reaches Node's
+ * `checkContinue` path exactly as a client would send it.
  */
 export const rawStatus = (
   label,
   port,
   method,
   target,
-  { timeoutMs = PROBE_DEADLINE_MS, connect = openConnection } = {}
+  { timeoutMs = PROBE_DEADLINE_MS, connect = openConnection, headers = {} } = {}
 ) => {
   const result = Promise.withResolvers()
   let socket
@@ -94,8 +96,14 @@ export const rawStatus = (
     socket.once("error", (error) => settle(error))
     socket.once("close", () => settle(new Error(`${label} connection closed before response`)))
     socket.once("connect", () => {
+      const lines = [
+        `${method} ${target} HTTP/1.1`,
+        "Host: trusted.invalid",
+        "Connection: close",
+        ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`)
+      ]
       try {
-        socket.write(`${method} ${target} HTTP/1.1\r\nHost: trusted.invalid\r\nConnection: close\r\n\r\n`)
+        socket.write(`${lines.join("\r\n")}\r\n\r\n`)
       } catch (error) {
         settle(error, undefined, true)
       }
@@ -117,12 +125,22 @@ export const rawStatus = (
 /**
  * Starts the trusted loopback proxy server for the preview acceptance run.
  *
- * Node's HTTP server detaches upgraded sockets from its connection accounting,
- * so every accepted connection is tracked explicitly. Release first stops
- * admission, then destroys every connection (including upgraded Duplexes), and
- * finally waits under a labelled deadline for the listener to close.
+ * It takes the whole `SandboxHttpProxy` rather than loose handlers, and refuses
+ * one that is missing any handler: Node routes ordinary requests, upgrades,
+ * CONNECT, and `Expect: 100-continue` to four different server events, so a
+ * partially wired proxy fails silently (a closed socket, an interim `100`)
+ * instead of loudly. Node detaches upgraded and CONNECT sockets from its own
+ * connection accounting, so every accepted connection is tracked explicitly.
+ * Release first stops admission, then destroys every connection (including
+ * upgraded Duplexes), and finally waits under a labelled deadline for the
+ * listener to close.
  */
-export const listenTrustedProxy = async (handleRequest, handleUpgrade) => {
+export const listenTrustedProxy = async (proxy) => {
+  for (const handler of ["handleRequest", "handleUpgrade", "handleConnect", "handleCheckContinue"]) {
+    if (typeof proxy?.[handler] !== "function") {
+      throw new Error(`trusted proxy requires a ${handler} handler`)
+    }
+  }
   const sockets = new Set()
   let accepting = true
 
@@ -145,12 +163,25 @@ export const listenTrustedProxy = async (handleRequest, handleUpgrade) => {
       response.end()
       return
     }
-    handleRequest(request, response)
+    proxy.handleRequest(request, response)
   })
   server.on("connection", track)
   server.on("upgrade", (request, socket, head) => {
     if (!track(socket)) return
-    handleUpgrade(request, socket, head)
+    proxy.handleUpgrade(request, socket, head)
+  })
+  server.on("connect", (request, socket, head) => {
+    if (!track(socket)) return
+    proxy.handleConnect(request, socket, head)
+  })
+  server.on("checkContinue", (request, response) => {
+    if (!accepting) {
+      response.shouldKeepAlive = false
+      response.writeHead(503)
+      response.end()
+      return
+    }
+    proxy.handleCheckContinue(request, response)
   })
   const listening = Promise.withResolvers()
   const onError = (error) => {

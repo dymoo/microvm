@@ -168,6 +168,23 @@ export interface SandboxHttpProxy {
   readonly handleRequest: RequestListener
   /** Proxies a validated WebSocket upgrade without exposing either upstream socket. */
   readonly handleUpgrade: (request: IncomingMessage, socket: Duplex, head: Buffer) => void
+  /**
+   * Refuses a CONNECT tunnel with one bounded HTTP response, then closes the
+   * socket. Node routes CONNECT to the server's `connect` event and never to
+   * `request`, and with no `connect` listener it closes the socket without any
+   * response at all, so a host MUST wire this:
+   * `server.on("connect", proxy.handleConnect)`. No tunnel is opened and no
+   * caller ever receives a guest socket.
+   */
+  readonly handleConnect: (request: IncomingMessage, socket: Duplex, head: Buffer) => void
+  /**
+   * Refuses `Expect: 100-continue` through the same admission as
+   * {@link handleRequest}, without ever writing an interim `100 Continue`. Node
+   * answers an unwired expectation itself — it writes the interim response and
+   * then emits `request` — which invites a body this adapter refuses, so a host
+   * MUST wire this: `server.on("checkContinue", proxy.handleCheckContinue)`.
+   */
+  readonly handleCheckContinue: RequestListener
 }
 
 interface SandboxHttpProxyBinding {
@@ -295,7 +312,12 @@ const responseHeaders = (response: IncomingMessage): OutgoingHttpHeaders | undef
   return filteredHeaders(collected)
 }
 
-const sendError = (response: ServerResponse, status: number): void => {
+/**
+ * Sends one bounded error response. `close` ends the connection after it
+ * flushes, which is required whenever the request body was never invited or
+ * read: the connection must not be reusable for bytes nobody validated.
+ */
+const sendError = (response: ServerResponse, status: number, close = false): void => {
   if (response.headersSent || response.destroyed) {
     response.destroy()
     return
@@ -303,24 +325,52 @@ const sendError = (response: ServerResponse, status: number): void => {
   const body = Buffer.from(`${STATUS_CODES[status] ?? "Proxy Error"}\n`, "utf8")
   response.writeHead(status, {
     "cache-control": "no-store",
+    ...(close ? { connection: "close" } : {}),
     "content-length": body.byteLength,
     "content-type": "text/plain; charset=utf-8"
   })
   response.end(body)
 }
 
+/**
+ * Bounds how long a refused detached socket may stay open while its refusal
+ * flushes, and how many inbound bytes a refusal absorbs before it stops reading.
+ */
+const REFUSAL_DEADLINE_MS = 2_000
+const REFUSAL_DRAIN_BYTES = 64 * 1024
+
+/**
+ * Answers a request Node delivered on a detached raw socket (a CONNECT, or an
+ * upgrade the adapter refuses) with one final status line and closes it. The
+ * client's bytes after the head are drained and dropped, never read into a
+ * tunnel and never forwarded; the socket still dies at a fixed bound if the
+ * peer neither closes nor stops sending.
+ */
 const socketError = (socket: Duplex, status: number): void => {
   if (socket.destroyed) return
   const reason = STATUS_CODES[status] ?? "Proxy Error"
   const body = Buffer.from(`${reason}\n`, "utf8")
-  socket.end(
+  const head = Buffer.from(
     `HTTP/1.1 ${status} ${reason}\r\n` +
     "Cache-Control: no-store\r\n" +
     "Connection: close\r\n" +
     "Content-Type: text/plain; charset=utf-8\r\n" +
-    `Content-Length: ${body.byteLength}\r\n\r\n` +
-    body.toString("utf8")
+    `Content-Length: ${body.byteLength}\r\n\r\n`,
+    "latin1"
   )
+  let drained = 0
+  const ignore = (chunk: Buffer): void => {
+    drained += chunk.byteLength
+    if (drained >= REFUSAL_DRAIN_BYTES) socket.pause()
+  }
+  const deadline = setTimeout(() => socket.destroy(), REFUSAL_DEADLINE_MS)
+  deadline.unref()
+  socket.once("close", () => {
+    clearTimeout(deadline)
+    socket.off("data", ignore)
+  })
+  socket.on("data", ignore)
+  socket.end(Buffer.concat([head, body]))
 }
 
 const terminateDuplex = (socket: Duplex): void => {
@@ -668,5 +718,22 @@ export const makeSandboxHttpProxy = (binding: SandboxHttpProxyBinding): SandboxH
     outgoing.end()
   }
 
-  return { handleRequest, handleUpgrade }
+  // There is no tunnel to open: the adapter exposes exactly one VM-bound HTTP
+  // surface, so a CONNECT is refused rather than dropped or dialed. Node hands
+  // this event a detached socket, and `head` is deliberately unread.
+  const handleConnect = (_request: IncomingMessage, socket: Duplex, _head: Buffer): void =>
+    socketError(socket, 405)
+
+  // Node answers `Expect: 100-continue` on its own unless this handler is
+  // wired: it writes the interim `100 Continue` and only then emits `request`,
+  // so the refusal would arrive after the client was invited to send a body.
+  // Admission refuses every `Expect` value, so a status is always available;
+  // the fallback keeps the refusal total instead of ever continuing.
+  const handleCheckContinue: RequestListener = (request, response) => {
+    const admission = admitOrdinaryRequest(request)
+    request.resume()
+    sendError(response, "status" in admission ? admission.status : 417, true)
+  }
+
+  return { handleRequest, handleUpgrade, handleConnect, handleCheckContinue }
 }
