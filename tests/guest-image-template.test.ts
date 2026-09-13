@@ -12,10 +12,12 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import { afterEach, describe, expect, it } from "vitest"
+import { STANDARD_NODE_GUEST_WEB_PORT } from "../src/protocol.js"
 
 const repositoryRoot = resolve(import.meta.dirname, "..")
 const templateDirectory = join(repositoryRoot, "guest/image/next-template")
 const initializer = join(repositoryRoot, "guest/image/microvm-next-init")
+const imageBuilder = join(repositoryRoot, "scripts/build-guest-image.sh")
 const packageManifest = JSON.parse(
   readFileSync(join(templateDirectory, "package.json"), "utf8")
 ) as {
@@ -104,12 +106,25 @@ describe("Next.js guest image inputs", () => {
     expect(existsSync(join(templateDirectory, ".npmrc"))).toBe(false)
   })
 
-  it("binds development and production servers only to guest loopback port 3000", () => {
+  it("keeps the protocol, generated manifest, and template scripts on the standard Node guest port", () => {
+    const rendered = spawnSync("bash", [
+      imageBuilder,
+      "--print-manifest",
+      "--arch",
+      process.arch === "arm64" ? "aarch64" : "x86_64",
+      "--name",
+      "standard-node"
+    ], { encoding: "utf8" })
+    expect(rendered.status, rendered.stderr).toBe(0)
+    const manifest = JSON.parse(rendered.stdout) as {
+      httpEndpoints: { web: { port: number } }
+    }
+    expect(manifest.httpEndpoints.web.port).toBe(STANDARD_NODE_GUEST_WEB_PORT)
     expect(packageManifest.scripts.dev).toBe(
-      "next dev --hostname 127.0.0.1 --port 3000"
+      `next dev --hostname 127.0.0.1 --port ${STANDARD_NODE_GUEST_WEB_PORT}`
     )
     expect(packageManifest.scripts.start).toBe(
-      "next start --hostname 127.0.0.1 --port 3000"
+      `next start --hostname 127.0.0.1 --port ${STANDARD_NODE_GUEST_WEB_PORT}`
     )
   })
 })

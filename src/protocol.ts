@@ -23,6 +23,9 @@ export const GUEST_HTTP_VSOCK_PORT = 1025
 /** Durable web-service control channel. */
 export const GUEST_SERVICE_VSOCK_PORT = 1026
 
+/** Standard loopback web port in the Node guest image and its manifest. */
+export const STANDARD_NODE_GUEST_WEB_PORT = 3000
+
 /** Default per-exec wall-clock limit. */
 export const DEFAULT_TIMEOUT_MS = 30_000
 /** Hard maximum per-exec wall-clock limit. */
@@ -33,6 +36,8 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 1_048_576
 export const MAX_OUTPUT_BYTES_PER_STREAM = 8_388_608
 /** Hard maximum size of one JSONL line in either direction. */
 export const MAX_JSONL_LINE_BYTES = 8_388_608
+/** Hard maximum UTF-8 JSON payload size for one service-control line, excluding newline. */
+export const MAX_SERVICE_CONTROL_LINE_BYTES = 256 * 1024
 
 // Request bounds the daemon enforces before opening a vsock connection.
 export const MAX_ARGV_ENTRIES = 64
@@ -155,7 +160,7 @@ export class ImageNotAllowed extends Schema.TaggedError<ImageNotAllowed>()("Imag
  */
 export class DestroyUncertain extends Schema.TaggedError<DestroyUncertain>()("DestroyUncertain", {
   vmId: VmId,
-  phase: Schema.Literals(["signal", "cgroup"]),
+  phase: Schema.Literals(["signal", "cgroup", "http"]),
   reason: Schema.String
 }) {}
 /** The image has no immutable `web` HTTP endpoint. */
@@ -266,12 +271,16 @@ export const webServiceStartRejection = (
   cwd: string | undefined,
   env: Readonly<Record<string, string>> | undefined
 ): string | undefined => {
-  const rejected = execRejection(argv, cwd, env)
-  if (rejected !== undefined) return rejected
-  if (env !== undefined && ("HOSTNAME" in env || "PORT" in env)) {
-    return "HOSTNAME and PORT are controlled by the image manifest"
+  try {
+    const rejected = execRejection(argv, cwd, env)
+    if (rejected !== undefined) return rejected
+    if (env !== undefined && ("HOSTNAME" in env || "PORT" in env)) {
+      return "HOSTNAME and PORT are controlled by the image manifest"
+    }
+    return undefined
+  } catch {
+    return "web service request could not be validated"
   }
-  return undefined
 }
 
 /**

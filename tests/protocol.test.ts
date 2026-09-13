@@ -6,6 +6,7 @@ import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CreateResult,
+  DestroyUncertain,
   ExecId,
   GUEST_EXEC_VSOCK_PORT,
   GUEST_HTTP_VSOCK_PORT,
@@ -57,6 +58,17 @@ describe("fixed guest channels", () => {
   })
 })
 
+describe("destroy uncertainty", () => {
+  it("names active ingress-scope proof failures as HTTP rather than cgroup teardown", () => {
+    expect(Schema.decodeUnknownResult(DestroyUncertain)({
+      _tag: "DestroyUncertain",
+      vmId: "mvm-abc12345",
+      phase: "http",
+      reason: "HTTP connection scopes remained active after VM teardown"
+    })._tag).toBe("Success")
+  })
+})
+
 describe("durable web-service wire schemas", () => {
   const decodeStartRequest = Schema.decodeUnknownResult(StartWebServiceRequest)
 
@@ -92,6 +104,20 @@ describe("durable web-service wire schemas", () => {
       "/workspace",
       { NODE_ENV: "development" }
     )).toBeUndefined()
+    expect(webServiceStartRejection(
+      ["/usr/bin/node", ...Array.from({ length: 16 }, () => "x".repeat(4_000))],
+      undefined,
+      { BIG: "y".repeat(8_192) }
+    )).toBeUndefined()
+  })
+
+  it("rejects an uninspectable service request instead of throwing", () => {
+    const env = new Proxy<Record<string, string>>({}, {
+      ownKeys: () => {
+        throw new Error("hostile property enumeration")
+      }
+    })
+    expect(webServiceStartRejection(["/bin/true"], undefined, env)).toBeDefined()
   })
 
   it("represents the create ingress capability only when configured", () => {

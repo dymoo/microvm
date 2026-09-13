@@ -69,6 +69,9 @@ export type ClusterDestroyError =
   | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
 export type ClusterListError =
   Forbidden | Unauthenticated | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
+export type ClusterServiceOperationError =
+  | ClusterServiceError | Forbidden | Unauthenticated | VmNotFound | VmPoisoned
+  | RpcClientError.RpcClientError
 
 /**
  * Public request inputs for the cluster convenience API. These are the shapes a
@@ -125,8 +128,8 @@ const startWebServiceWireRequest = (
 })
 
 export interface WebServiceHandle {
-  readonly status: () => Effect.Effect<WebServiceStatus, ClusterServiceError>
-  readonly stop: () => Effect.Effect<StopWebServiceResult, ClusterServiceError>
+  readonly status: () => Effect.Effect<WebServiceStatus, ClusterServiceOperationError>
+  readonly stop: () => Effect.Effect<StopWebServiceResult, ClusterServiceOperationError>
 }
 
 export interface SandboxHandle {
@@ -138,7 +141,7 @@ export interface SandboxHandle {
   /** Starts the single durable `web` service while ordinary execute remains available. */
   readonly startWebService: (
     request: SandboxStartWebServiceInput
-  ) => Effect.Effect<WebServiceHandle, ClusterServiceError>
+  ) => Effect.Effect<WebServiceHandle, ClusterServiceOperationError>
   readonly execute: (request: SandboxExecuteInput) => Effect.Effect<ExecResult, ClusterExecuteError>
   readonly inspect: () => Effect.Effect<VmInfo, ClusterInspectError>
   readonly destroy: () => Effect.Effect<DestroyResult, ClusterDestroyError>
@@ -157,14 +160,23 @@ export interface MicrovmCluster {
 const isCapacityExceeded = (error: unknown): error is CapacityExceeded =>
   error instanceof CapacityExceeded
 
-const serviceError = (vmId: VmId, error: unknown): ClusterServiceError =>
-  error instanceof ClusterServiceError
-    ? error
-    : new ClusterServiceError({
-      vmId,
-      code: "INTERNAL",
-      message: "web service control request failed"
-    })
+const serviceError = (vmId: VmId, error: unknown): ClusterServiceOperationError => {
+  if (
+    error instanceof ClusterServiceError ||
+    error instanceof Forbidden ||
+    error instanceof Unauthenticated ||
+    error instanceof VmNotFound ||
+    error instanceof VmPoisoned ||
+    error instanceof RpcClientError.RpcClientError
+  ) {
+    return error
+  }
+  return new ClusterServiceError({
+    vmId,
+    code: "INTERNAL",
+    message: "web service control request failed"
+  })
+}
 
 /**
  * Acquires a client for a static daemon set. Placement health checks are safe

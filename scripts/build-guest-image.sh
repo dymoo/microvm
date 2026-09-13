@@ -15,10 +15,12 @@ GUEST_PNPM_STORE=/var/lib/microvm/pnpm-store
 GUEST_PNPM_CACHE=/var/lib/microvm/pnpm-cache
 IMAGE_SIZE_MIB=2048
 IMAGE_NAME=microvm-agent
+STANDARD_NODE_GUEST_WEB_PORT=3000
 TARGET_ARCH=
 KERNEL=
 KERNEL_SHA256=
 OUTPUT_DIR=
+PRINT_MANIFEST=false
 
 usage() {
   cat >&2 <<'USAGE'
@@ -28,6 +30,8 @@ Usage: sudo scripts/build-guest-image.sh \
   --kernel-sha256 64_HEX_DIGEST \
   --output-dir /path/to/images \
   [--name microvm-agent] [--size-mib 2048]
+   or: scripts/build-guest-image.sh --print-manifest --arch x86_64|aarch64 \
+       [--name microvm-agent]
 
 Builds a pinned Debian 13 (Trixie) snapshot root image containing the maintained
 Node.js 24 LTS, Python 3.13, and Git runtimes, pnpm 11, an offline-ready
@@ -35,6 +39,11 @@ Next.js template, the minimal PID 1, and the AF_VSOCK guest runner. The kernel
 is deliberately not downloaded: an operator must supply a Firecracker-compatible
 kernel and its trusted SHA-256 digest.
 USAGE
+}
+
+render_manifest() {
+  printf '{"name":"%s","file":"%s.raw","arch":"%s","rootDevice":"/dev/vda","httpEndpoints":{"web":{"port":%d}}}\n' \
+    "$IMAGE_NAME" "$IMAGE_NAME" "$TARGET_ARCH" "$STANDARD_NODE_GUEST_WEB_PORT"
 }
 
 while (($#)); do
@@ -45,10 +54,18 @@ while (($#)); do
     --output-dir) OUTPUT_DIR=${2:-}; shift 2 ;;
     --name) IMAGE_NAME=${2:-}; shift 2 ;;
     --size-mib) IMAGE_SIZE_MIB=${2:-}; shift 2 ;;
+    --print-manifest) PRINT_MANIFEST=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ $PRINT_MANIFEST == true ]]; then
+  [[ $TARGET_ARCH == x86_64 || $TARGET_ARCH == aarch64 ]] || { echo "--arch must be x86_64 or aarch64" >&2; exit 2; }
+  [[ $IMAGE_NAME =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || { echo "--name must match [a-z0-9][a-z0-9._-]{0,63}" >&2; exit 2; }
+  render_manifest
+  exit 0
+fi
 
 [[ $(uname -s) == Linux ]] || { echo "guest images can only be built on Linux" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || { echo "guest image build requires root" >&2; exit 1; }
@@ -289,9 +306,7 @@ MANIFEST_OUTPUT=$OUTPUT_DIR/$IMAGE_NAME.json
 CHECKSUM_OUTPUT=$OUTPUT_DIR/$IMAGE_NAME.sha256
 install -o 0 -g 0 -m 0644 "$IMAGE_TMP" "$IMAGE_OUTPUT"
 install -o 0 -g 0 -m 0644 "$KERNEL" "$KERNEL_OUTPUT"
-cat >"$MANIFEST_OUTPUT" <<EOF
-{"name":"$IMAGE_NAME","file":"$IMAGE_NAME.raw","arch":"$TARGET_ARCH","rootDevice":"/dev/vda","httpEndpoints":{"web":{"port":3000}}}
-EOF
+render_manifest >"$MANIFEST_OUTPUT"
 (
   cd "$OUTPUT_DIR"
   sha256sum "$IMAGE_NAME.raw" "$IMAGE_NAME.kernel" "$IMAGE_NAME.json" >"$IMAGE_NAME.sha256"

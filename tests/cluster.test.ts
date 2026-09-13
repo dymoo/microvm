@@ -16,10 +16,12 @@ import {
   Firecracker,
   GuestExecChannel,
   GuestServiceChannel,
+  GuestServiceError,
   GuestTransportFault,
   type WebServiceState
 } from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
+import { MAX_SERVICE_CONTROL_LINE_BYTES } from "../src/protocol.js"
 
 const adminToken = "admin-token-for-cluster-integration"
 const roots: Array<string> = []
@@ -215,10 +217,10 @@ describe("static microVM cluster", () => {
   it("owns the durable web service lifecycle without blocking execute", async () => {
     const root = await fixture(3_000)
     let state: WebServiceState = { state: "not_started" }
-    let startOptions: Parameters<GuestServiceChannel["Service"]["start"]>[0] | undefined
+    let startRequest: Record<string, unknown> | undefined
     const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
       start: (options) => Effect.sync(() => {
-        startOptions = options
+        startRequest = JSON.parse(options.requestLine.subarray(0, -1).toString("utf8")) as Record<string, unknown>
         state = { state: "running", startedAtEpochMs: 1_700_000_000_000 }
         return state
       }),
@@ -261,12 +263,13 @@ describe("static microVM cluster", () => {
       expect(Buffer.from((yield* sandbox.execute(execPayload)).stdoutB64, "base64").toString()).toBe(
         "execute-remains-available"
       )
-      expect(startOptions).toMatchObject({
-        vmId: sandbox.vm.vmId,
+      expect(startRequest).toMatchObject({
+        version: 1,
+        op: "start",
         argv: ["/usr/bin/node", "server.js"],
         cwd: "/workspace",
         env: { NODE_ENV: "development" },
-        webPort: 3_000
+        port: 3_000
       })
       expect(yield* service.stop()).toEqual({ stopped: true })
       expect(yield* service.status()).toMatchObject({
@@ -280,18 +283,88 @@ describe("static microVM cluster", () => {
         argv: ["/usr/bin/node", "server.js"],
         env: { PORT: "9999" }
       }))
-      expect(Result.isFailure(reserved) && reserved.failure._tag).toBe("ClusterServiceError")
-      expect(Result.isFailure(reserved) && reserved.failure.code).toBe("INVALID_REQUEST")
+      if (Result.isSuccess(reserved)) throw new Error("reserved service environment must be rejected")
+      expect(reserved.failure).toMatchObject({ _tag: "ClusterServiceError", code: "INVALID_REQUEST" })
+
+      const large = yield* sandbox.startWebService({
+        argv: ["/usr/bin/node", ...Array.from({ length: 16 }, () => "x".repeat(4_000))],
+        env: { BIG: "y".repeat(8_192) }
+      })
+      expect(yield* large.status()).toMatchObject({ state: "running" })
+      expect((startRequest?.["argv"] as Array<string>).reduce(
+        (bytes, value) => bytes + Buffer.byteLength(value),
+        0
+      )).toBe(64_013)
+      expect((startRequest?.["env"] as Record<string, string>)["BIG"]).toHaveLength(8_192)
+      expect((yield* sandbox.inspect()).state).toBe("running")
+      expect(Buffer.from((yield* sandbox.execute(execPayload)).stdoutB64, "base64").toString()).toBe(
+        "execute-remains-available"
+      )
+    })))
+  })
+
+  it("rejects a public-bound start whose escaped JSON exceeds the wire limit without guest I/O or poison", async () => {
+    const root = await fixture(3_000)
+    let serviceCalls = 0
+    const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
+      start: () => Effect.sync(() => {
+        serviceCalls++
+        return { state: "running", startedAtEpochMs: 1_700_000_000_000 }
+      }),
+      status: () => Effect.sync(() => {
+        serviceCalls++
+        return { state: "not_started" }
+      }),
+      stop: () => Effect.succeed({ stopped: false })
+    }))
+    const argv = [
+      "/bin/true",
+      ...Array.from({ length: 15 }, () => "\\".repeat(4_096)),
+      "\\".repeat(4_087)
+    ]
+    const env = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [
+      `E${index}`,
+      "\\".repeat(index === 7 ? 8_176 : 8_192)
+    ]))
+    expect(argv.reduce((bytes, value) => bytes + Buffer.byteLength(value), 0)).toBe(65_536)
+    expect(Object.entries(env).reduce(
+      (bytes, [key, value]) => bytes + Buffer.byteLength(key) + Buffer.byteLength(value),
+      0
+    )).toBe(65_536)
+    expect(Buffer.byteLength(`${JSON.stringify({
+      version: 1,
+      id: "0".repeat(32),
+      op: "start",
+      argv,
+      port: 3_000,
+      env
+    })}\n`)).toBeGreaterThan(MAX_SERVICE_CONTROL_LINE_BYTES + 1)
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const server = createServer()
+      yield* start(root, 1, server, firecrackerLayer()(server), guestLayer("still-usable"), serviceLayer)
+      const url = `http://127.0.0.1:${yield* listeningPort(server)}`
+      const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
+      const sandbox = yield* cluster.create({ image: "node" })
+
+      const rejected = yield* Effect.result(sandbox.startWebService({ argv, env }))
+      if (Result.isSuccess(rejected)) throw new Error("oversized service wire request must be rejected")
+      expect(rejected.failure).toMatchObject({ _tag: "ClusterServiceError", code: "INVALID_REQUEST" })
+      expect(serviceCalls).toBe(0)
+      expect((yield* sandbox.inspect()).state).toBe("running")
+      expect(Buffer.from((yield* sandbox.execute({ argv: ["/marker"] })).stdoutB64, "base64").toString()).toBe(
+        "still-usable"
+      )
     })))
   })
 
   it("accepts argv-only request objects from a plain JavaScript caller", async () => {
     const root = await fixture(3_000)
     let state: WebServiceState = { state: "not_started" }
-    let serviceStart: Parameters<GuestServiceChannel["Service"]["start"]>[0] | undefined
+    let serviceRequest: Record<string, unknown> | undefined
     const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
       start: (options) => Effect.sync(() => {
-        serviceStart = options
+        serviceRequest = JSON.parse(options.requestLine.subarray(0, -1).toString("utf8")) as Record<string, unknown>
         state = { state: "running", startedAtEpochMs: 1_700_000_000_000 }
         return state
       }),
@@ -329,13 +402,53 @@ describe("static microVM cluster", () => {
       expect(Buffer.from(addressed.stdoutB64, "base64").toString()).toBe("argv-only")
 
       yield* sandbox.startWebService(serviceInput)
-      expect(serviceStart?.argv).toEqual(["/usr/bin/node", "server.js"])
-      expect(serviceStart?.cwd).toBeUndefined()
-      expect(serviceStart?.env).toBeUndefined()
-      expect(serviceStart?.webPort).toBe(3_000)
+      expect(serviceRequest).toMatchObject({
+        version: 1,
+        op: "start",
+        argv: ["/usr/bin/node", "server.js"],
+        port: 3_000
+      })
+      expect(serviceRequest).not.toHaveProperty("cwd")
+      expect(serviceRequest).not.toHaveProperty("env")
     })))
   })
 
+  it("keeps the VM usable when stop returns a well-formed INTERNAL service error", async () => {
+    const root = await fixture(3_000)
+    let state: WebServiceState = { state: "not_started" }
+    const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
+      start: () => Effect.sync(() => {
+        state = { state: "running", startedAtEpochMs: 1_700_000_000_000 }
+        return state
+      }),
+      status: () => Effect.sync(() => state),
+      stop: (options) => Effect.fail(new GuestServiceError({
+        vmId: options.vmId,
+        code: "INTERNAL",
+        message: "web service did not exit after cgroup kill"
+      }))
+    }))
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const server = createServer()
+      yield* start(root, 1, server, firecrackerLayer()(server), guestLayer("still-usable"), serviceLayer)
+      const url = `http://127.0.0.1:${yield* listeningPort(server)}`
+      const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
+      const sandbox = yield* cluster.create({ image: "node" })
+      const service = yield* sandbox.startWebService({ argv: ["/usr/bin/node", "server.js"] })
+
+      const stopped = yield* Effect.result(service.stop())
+      expect(Result.isFailure(stopped) && stopped.failure).toMatchObject({
+        _tag: "ClusterServiceError",
+        code: "INTERNAL",
+        message: "web service did not exit after cgroup kill"
+      })
+      expect((yield* sandbox.inspect()).state).toBe("running")
+      expect(Buffer.from((yield* sandbox.execute({ argv: ["/marker"] })).stdoutB64, "base64").toString()).toBe(
+        "still-usable"
+      )
+    })))
+  })
   it("poisons the VM when a service-control exchange faults", async () => {
     const root = await fixture(3_000)
     const faultingService = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
@@ -361,7 +474,7 @@ describe("static microVM cluster", () => {
       const sandbox = yield* cluster.create({ image: "node" })
 
       const failed = yield* Effect.result(sandbox.startWebService({ argv: ["/usr/bin/node", "server.js"] }))
-      expect(Result.isFailure(failed)).toBe(true)
+      expect(Result.isFailure(failed) && failed.failure._tag).toBe("VmPoisoned")
 
       // A bounded deadline is a transport fault, not an application outcome:
       // the VM must be unusable until it is destroyed, never half-controlled.

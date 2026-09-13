@@ -17,6 +17,22 @@ import (
 	"time"
 )
 
+func TestServiceControlLineLimit(t *testing.T) {
+	exact := strings.Repeat("x", MaximumServiceRequestBytes) + "\n"
+	line, err := readServiceRequestLine(bufio.NewReaderSize(strings.NewReader(exact), 4096))
+	if err != nil {
+		t.Fatalf("maximum service line failed: %v", err)
+	}
+	if len(line) != MaximumServiceRequestBytes {
+		t.Fatalf("maximum service line length = %d, want %d", len(line), MaximumServiceRequestBytes)
+	}
+
+	over := strings.Repeat("x", MaximumServiceRequestBytes+1) + "\n"
+	if _, err := readServiceRequestLine(bufio.NewReaderSize(strings.NewReader(over), 4096)); err == nil {
+		t.Fatal("service line over maximum was accepted")
+	}
+}
+
 func TestWebServiceOutlivesControlConnectionAndReceivesTrustedBinding(t *testing.T) {
 	platform := &serviceTestPlatform{}
 	controller := NewServiceController(platform)

@@ -23,6 +23,7 @@ export {
 } from "./cluster.js"
 export type {
   ClusterCreateError,
+  ClusterServiceOperationError,
   ClusterDestroyError,
   ClusterEndpoint,
   ClusterExecuteError,

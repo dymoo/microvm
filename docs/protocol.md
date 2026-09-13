@@ -186,6 +186,9 @@ Destroy blocks new admissions, aborts active HTTP/SSE/WebSocket scopes, waits
 a bounded interval, stops the VM, and proves the captured scopes closed before
 returning success. Teardown revokes ingress and sandbox-control credentials.
 
+Failure to prove those ingress scopes closed is `DestroyUncertain` phase
+`http`; process-signal and cgroup teardown failures retain their own phases.
+
 ### Idle policy and upgrade refusals
 
 One idle policy governs the ingress data plane: an ordinary response, an SSE
@@ -205,6 +208,14 @@ Port 1026 accepts one UTF-8 JSON line and returns one UTF-8 JSON line, then
 closes. The service process is owned by the guest controller, not by that
 connection, so it continues running after a successful `start` response.
 
+Each JSON payload is at most **262144 UTF-8 bytes** (256 KiB), excluding its
+single trailing newline. The host serializes and sizes the exact request line
+before opening the channel. An unencodable or oversized start is
+`ClusterServiceError` code `INVALID_REQUEST`; it performs no guest I/O and does
+not poison the VM. The host receive bound is the same 256 KiB.
+`MAX_SERVICE_CONTROL_LINE_BYTES` is the exported host authority;
+`MaximumServiceRequestBytes` is its Go guest mirror.
+
 Start request:
 
 ```json
@@ -215,6 +226,10 @@ Start request:
 descendant. The daemon supplies the immutable manifest `port`; caller
 `HOSTNAME` and `PORT` environment entries are rejected and the guest injects
 `HOSTNAME=127.0.0.1` plus the manifest port. Exactly one web service may run.
+The standard Node guest port is `3000` (`STANDARD_NODE_GUEST_WEB_PORT`). The
+TypeScript protocol, image builder, and template manifest cannot share imports
+across their language/tool boundaries, so a conformance test verifies that all
+three keep this value in lockstep.
 It runs as UID/GID 1000 in `/sys/fs/cgroup/microvm-service/web` with the same
 CPU, memory, PID, and group-kill posture as exec. stdout and stderr are drained
 into bounded 64 KiB tails so an unattended service cannot deadlock.
@@ -224,5 +239,10 @@ Status and stop requests contain only `version`, `id`, and `op` (`status` or
 and, after exit, code/signal. Stop freezes and kills the service cgroup, waits
 for confirmed exit, and is idempotent. Malformed control frames and unknown
 operations return bounded `INVALID_REQUEST`; start conflicts return
-`START_FAILED`. A well-formed guest service error is not VM poison, while a
-service-channel framing/transport fault is.
+`START_FAILED`. Every well-formed guest service error, including `INTERNAL`,
+remains a typed service-operation failure and does not poison the VM. Only
+uncertain service-channel framing or I/O faults poison it.
+
+The cluster facade preserves non-semantic failure tags such as `VmNotFound`,
+`Forbidden`, `VmPoisoned`, and `RpcClientError`; it does not collapse them into
+`ClusterServiceError(INTERNAL)`.

@@ -7,22 +7,25 @@
 import { once } from "node:events"
 import { mkdtempSync } from "node:fs"
 import { rm } from "node:fs/promises"
-import { Effect } from "effect"
+import { Effect, Result } from "effect"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createServer, type Server, type Socket } from "node:net"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   awaitGuestReadiness,
+  encodeGuestServiceStartRequest,
   GuestExecChannel,
   GuestExecChannelLive,
   GuestHttpChannel,
   GuestHttpChannelLive,
   GuestServiceChannel,
   GuestServiceChannelLive,
+  GuestServiceError,
   GuestTransportFault,
   type GuestExecSuccess
 } from "../src/firecracker.js"
+import { MAX_SERVICE_CONTROL_LINE_BYTES } from "../src/protocol.js"
 
 interface FakeGuest {
   readonly path: string
@@ -344,6 +347,296 @@ describe("guest exec v1 channel", () => {
       }
     })
     await expect(runExec(guest.path)).rejects.toBeInstanceOf(GuestTransportFault)
+  })
+
+  it("sends a protocol-valid service start whose JSON line exceeds 64 KiB", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    let receivedBytes = 0
+    const server = createServer((socket) => {
+      let buffer = Buffer.alloc(0)
+      let connected = false
+      socket.on("data", (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk])
+        const newline = buffer.indexOf(0x0a)
+        if (newline === -1) return
+        if (!connected) {
+          expect(buffer.subarray(0, newline).toString("ascii")).toBe("CONNECT 1026")
+          buffer = buffer.subarray(newline + 1)
+          connected = true
+          socket.write("OK 1073741824\n")
+          return
+        }
+        const request = JSON.parse(buffer.subarray(0, newline).toString("utf8")) as Record<string, unknown>
+        receivedBytes = newline
+        socket.end(`${JSON.stringify({
+          version: 1,
+          id: request["id"],
+          type: "started",
+          startedAtEpochMs: 42
+        })}\n`)
+      })
+    })
+    server.listen(path)
+    await started(server)
+    const guest = track({
+      path,
+      cleanup: async () => {
+        server.close()
+        await closed(server)
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+
+    const state = await Effect.runPromise(
+      Effect.gen(function*() {
+        const requestId = "large-start"
+        const requestLine = yield* encodeGuestServiceStartRequest({
+          vmId: "mvm-test0001",
+          requestId,
+          argv: ["/usr/bin/node", ...Array.from({ length: 16 }, () => "x".repeat(4_000))],
+          env: { BIG: "y".repeat(8_192) },
+          webPort: 3_000
+        })
+        const service = yield* GuestServiceChannel
+        return yield* service.start({
+          vmId: "mvm-test0001",
+          vsockSocket: guest.path,
+          requestId,
+          requestLine
+        })
+      }).pipe(Effect.provide(GuestServiceChannelLive))
+    )
+
+    expect(receivedBytes).toBeGreaterThan(64 * 1024)
+    expect(state).toEqual({ state: "running", startedAtEpochMs: 42 })
+  })
+
+  it("preserves a well-formed guest INTERNAL response as a service failure", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    const server = createServer((socket) => {
+      let buffer = ""
+      let connected = false
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8")
+        const newline = buffer.indexOf("\n")
+        if (newline === -1) return
+        if (!connected) {
+          buffer = buffer.slice(newline + 1)
+          connected = true
+          socket.write("OK 1073741824\n")
+          return
+        }
+        const request = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>
+        socket.end(`${JSON.stringify({
+          version: 1,
+          id: request["id"],
+          type: "error",
+          code: "INTERNAL",
+          message: "could not stop web service"
+        })}\n`)
+      })
+    })
+    server.listen(path)
+    await started(server)
+    const guest = track({
+      path,
+      cleanup: async () => {
+        server.close()
+        await closed(server)
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+
+    const failure = await Effect.runPromise(
+      Effect.gen(function*() {
+        const service = yield* GuestServiceChannel
+        return yield* service.stop({
+          vmId: "mvm-test0001",
+          vsockSocket: guest.path,
+          requestId: "internal-stop"
+        })
+      }).pipe(Effect.provide(GuestServiceChannelLive), Effect.flip)
+    )
+
+    expect(failure).toBeInstanceOf(GuestServiceError)
+    expect(failure).toMatchObject({
+      code: "INTERNAL",
+      message: "could not stop web service"
+    })
+  })
+
+  it("accepts the maximum service request line and rejects one byte over before opening a channel", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    let accepted = 0
+    const server = createServer((socket) => {
+      accepted++
+      let buffer = Buffer.alloc(0)
+      let connected = false
+      socket.on("data", (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk])
+        const newline = buffer.indexOf(0x0a)
+        if (newline === -1) return
+        if (!connected) {
+          buffer = buffer.subarray(newline + 1)
+          connected = true
+          socket.write("OK 1073741824\n")
+          return
+        }
+        const request = JSON.parse(buffer.subarray(0, newline).toString("utf8")) as Record<string, unknown>
+        socket.end(`${JSON.stringify({
+          version: 1,
+          id: request["id"],
+          type: "started",
+          startedAtEpochMs: 42
+        })}\n`)
+      })
+    })
+    server.listen(path)
+    await started(server)
+    const guest = track({
+      path,
+      cleanup: async () => {
+        server.close()
+        await closed(server)
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+    const requestId = "wire-bound"
+    const baseLineBytes = Buffer.byteLength(JSON.stringify({
+      version: 1,
+      id: requestId,
+      op: "start",
+      argv: [""],
+      port: 3_000
+    }) + "\n")
+    const maximumArgument = "x".repeat(MAX_SERVICE_CONTROL_LINE_BYTES + 1 - baseLineBytes)
+    const runStart = (argument: string) =>
+      Effect.gen(function*() {
+        const requestLine = yield* encodeGuestServiceStartRequest({
+          vmId: "mvm-test0001",
+          requestId,
+          argv: [argument],
+          webPort: 3_000
+        })
+        const service = yield* GuestServiceChannel
+        return yield* service.start({
+          vmId: "mvm-test0001",
+          vsockSocket: guest.path,
+          requestId,
+          requestLine
+        })
+      }).pipe(Effect.provide(GuestServiceChannelLive))
+
+    expect(await Effect.runPromise(runStart(maximumArgument))).toEqual({
+      state: "running",
+      startedAtEpochMs: 42
+    })
+    const rejected = await Effect.runPromise(Effect.result(runStart(`${maximumArgument}x`)))
+    expect(Result.isFailure(rejected) && rejected.failure).toBeInstanceOf(GuestServiceError)
+    expect(Result.isFailure(rejected) && rejected.failure).toMatchObject({ code: "INVALID_REQUEST" })
+    expect(accepted).toBe(1)
+  })
+
+  it("accepts the maximum guest service response line and faults one byte over", async () => {
+    const requestId = "reply-bound"
+    const baseResponse = {
+      version: 1,
+      id: requestId,
+      type: "error",
+      code: "INTERNAL",
+      message: ""
+    }
+    const baseResponseBytes = Buffer.byteLength(JSON.stringify(baseResponse))
+    const maximumMessage = "x".repeat(MAX_SERVICE_CONTROL_LINE_BYTES - baseResponseBytes)
+    const maximumResponse = `${JSON.stringify({ ...baseResponse, message: maximumMessage })}\n`
+    const oversizedResponse = `${JSON.stringify({ ...baseResponse, message: `${maximumMessage}x` })}\n`
+    expect(Buffer.byteLength(maximumResponse)).toBe(MAX_SERVICE_CONTROL_LINE_BYTES + 1)
+    expect(Buffer.byteLength(oversizedResponse)).toBe(MAX_SERVICE_CONTROL_LINE_BYTES + 2)
+
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    let accepted = 0
+    const server = createServer((socket) => {
+      accepted++
+      let buffer = ""
+      let connected = false
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8")
+        const newline = buffer.indexOf("\n")
+        if (newline === -1) return
+        if (!connected) {
+          buffer = buffer.slice(newline + 1)
+          connected = true
+          socket.write("OK 1073741824\n")
+          return
+        }
+        socket.end(accepted === 1 ? maximumResponse : oversizedResponse)
+      })
+    })
+    server.listen(path)
+    await started(server)
+    const guest = track({
+      path,
+      cleanup: async () => {
+        server.close()
+        await closed(server)
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+    const runStatus = Effect.gen(function*() {
+      const service = yield* GuestServiceChannel
+      return yield* service.status({
+        vmId: "mvm-test0001",
+        vsockSocket: guest.path,
+        requestId
+      })
+    }).pipe(Effect.provide(GuestServiceChannelLive))
+
+    const maximum = await Effect.runPromise(Effect.result(runStatus))
+    expect(Result.isFailure(maximum) && maximum.failure).toMatchObject({
+      _tag: "GuestServiceError",
+      code: "INTERNAL"
+    })
+    const oversized = await Effect.runPromise(Effect.result(runStatus))
+    expect(Result.isFailure(oversized) && oversized.failure).toMatchObject({
+      _tag: "GuestTransportFault",
+      reason: "guest service response exceeded maximum line size"
+    })
+  })
+
+  it("returns a typed rejection when a service request cannot be JSON-encoded", async () => {
+    const env = new Proxy<Record<string, string>>({}, {
+      ownKeys: () => {
+        throw new Error("hostile property enumeration")
+      }
+    })
+    const rejected = await Effect.runPromise(
+      Effect.gen(function*() {
+        const requestId = "unencodable"
+        const requestLine = yield* encodeGuestServiceStartRequest({
+          vmId: "mvm-test0001",
+          requestId,
+          argv: ["/bin/true"],
+          env,
+          webPort: 3_000
+        })
+        const service = yield* GuestServiceChannel
+        return yield* service.start({
+          vmId: "mvm-test0001",
+          vsockSocket: join(tmpdir(), "service-must-not-open.sock"),
+          requestId,
+          requestLine
+        })
+      }).pipe(Effect.provide(GuestServiceChannelLive), Effect.flip)
+    )
+
+    expect(rejected).toMatchObject({
+      _tag: "GuestServiceError",
+      code: "INVALID_REQUEST"
+    })
   })
 })
 

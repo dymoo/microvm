@@ -33,6 +33,7 @@ import {
   GuestExecError,
   MAX_JSONL_LINE_BYTES,
   MAX_OUTPUT_BYTES_PER_STREAM,
+  MAX_SERVICE_CONTROL_LINE_BYTES,
   MAX_TIMEOUT_MS
 } from "./protocol.js"
 import {
@@ -692,7 +693,7 @@ export const GuestExecChannelLive: Layer.Layer<GuestExecChannel> = Layer.effect(
 
 export class GuestServiceError extends Schema.TaggedError<GuestServiceError>()("GuestServiceError", {
   vmId: Schema.String,
-  code: Schema.Literals(["INVALID_REQUEST", "START_FAILED"]),
+  code: Schema.Literals(["INVALID_REQUEST", "START_FAILED", "INTERNAL"]),
   message: Schema.String
 }) {}
 
@@ -750,11 +751,8 @@ interface GuestServiceCommonOptions {
 
 export class GuestServiceChannel extends Context.Service<GuestServiceChannel, {
   readonly start: (options: GuestServiceCommonOptions & {
-    readonly argv: ReadonlyArray<string>
-    readonly cwd?: string | undefined
-    readonly env?: Readonly<Record<string, string>> | undefined
-    /** Immutable image-manifest port; encoded as trusted guest control data. */
-    readonly webPort: number
+    /** Exact validated JSON request plus its terminal newline. */
+    readonly requestLine: Buffer
   }) => Effect.Effect<WebServiceState, GuestServiceError | GuestTransportFault>
   readonly status: (
     options: GuestServiceCommonOptions
@@ -764,7 +762,6 @@ export class GuestServiceChannel extends Context.Service<GuestServiceChannel, {
   ) => Effect.Effect<{ readonly stopped: boolean }, GuestServiceError | GuestTransportFault>
 }>()("microvm/firecracker/GuestServiceChannel") {}
 
-const SERVICE_LINE_LIMIT_BYTES = 64 * 1024
 /**
  * Default bound on one guest service-control reply. Generous against the guest's
  * own frozen-cgroup kill wait (5s) so a real stop still answers, but finite so a
@@ -806,14 +803,66 @@ const decodeServiceStatus = Schema.decodeUnknownResult(serviceStatusSchema)
 const decodeServiceStopped = Schema.decodeUnknownResult(serviceStoppedSchema)
 const decodeServiceError = Schema.decodeUnknownResult(serviceErrorSchema)
 
+const encodeServiceRequest = Effect.fn("encodeServiceRequest")(
+  function*(
+    request: Readonly<Record<string, unknown>>,
+    vmId: string
+  ): Effect.fn.Return<Buffer, GuestServiceError> {
+    const json = yield* Effect.try({
+      try: () => JSON.stringify(request),
+      catch: () => new GuestServiceError({
+        vmId,
+        code: "INVALID_REQUEST",
+        message: "guest service request could not be encoded as JSON"
+      })
+    })
+    if (json === undefined) {
+      return yield* new GuestServiceError({
+        vmId,
+        code: "INVALID_REQUEST",
+        message: "guest service request could not be encoded as JSON"
+      })
+    }
+    if (Buffer.byteLength(json, "utf8") > MAX_SERVICE_CONTROL_LINE_BYTES) {
+      return yield* new GuestServiceError({
+        vmId,
+        code: "INVALID_REQUEST",
+        message: `guest service request exceeds ${MAX_SERVICE_CONTROL_LINE_BYTES} byte line limit`
+      })
+    }
+    return Buffer.from(`${json}\n`, "utf8")
+  }
+)
+
+export const encodeGuestServiceStartRequest = Effect.fn("encodeGuestServiceStartRequest")(
+  function*(options: {
+    readonly vmId: string
+    readonly requestId: string
+    readonly argv: ReadonlyArray<string>
+    readonly cwd?: string | undefined
+    readonly env?: Readonly<Record<string, string>> | undefined
+    readonly webPort: number
+  }): Effect.fn.Return<Buffer, GuestServiceError> {
+    const request: Record<string, unknown> = {
+      version: 1,
+      id: options.requestId,
+      op: "start",
+      argv: options.argv,
+      port: options.webPort
+    }
+    if (options.cwd !== undefined) request["cwd"] = options.cwd
+    if (options.env !== undefined) request["env"] = options.env
+    return yield* encodeServiceRequest(request, options.vmId)
+  }
+)
+
 const serviceExchange = (
   socket: Socket,
-  request: Readonly<Record<string, unknown>>,
+  requestLine: Buffer,
   vmId: string,
   deadlineMs: number
 ): Effect.Effect<unknown, GuestTransportFault> =>
   Effect.callback<unknown, GuestTransportFault>((resume, signal) => {
-    const requestLine = Buffer.from(`${JSON.stringify(request)}\n`, "utf8")
     let chunks: Array<Buffer> = []
     let bytes = 0
     let finished = false
@@ -834,7 +883,7 @@ const serviceExchange = (
     const onData = (chunk: Buffer): void => {
       const newline = chunk.indexOf(0x0a)
       if (newline === -1) {
-        if (bytes + chunk.length > SERVICE_LINE_LIMIT_BYTES) {
+        if (bytes + chunk.length > MAX_SERVICE_CONTROL_LINE_BYTES) {
           fault("guest service response exceeded maximum line size")
           return
         }
@@ -842,9 +891,9 @@ const serviceExchange = (
         bytes += chunk.length
         return
       }
-      if (bytes + newline > SERVICE_LINE_LIMIT_BYTES || newline + 1 !== chunk.length) {
+      if (bytes + newline > MAX_SERVICE_CONTROL_LINE_BYTES || newline + 1 !== chunk.length) {
         fault(
-          bytes + newline > SERVICE_LINE_LIMIT_BYTES
+          bytes + newline > MAX_SERVICE_CONTROL_LINE_BYTES
             ? "guest service response exceeded maximum line size"
             : "guest service sent bytes after its terminal response"
         )
@@ -865,10 +914,6 @@ const serviceExchange = (
     const onError = (cause: Error): void => fault(`guest service socket error: ${String(cause)}`)
     const onClose = (): void => fault("guest service closed before its terminal response")
 
-    if (requestLine.length > SERVICE_LINE_LIMIT_BYTES + 1) {
-      fault("guest service request exceeded maximum line size")
-      return
-    }
     socket.on("data", onData)
     socket.once("error", onError)
     socket.once("close", onClose)
@@ -902,12 +947,6 @@ const serviceFailure = (
         : "guest service sent an unknown or invalid response"
     }))
   }
-  if (error.success.code === "INTERNAL") {
-    return Effect.fail(new GuestTransportFault({
-      vmId,
-      reason: `guest service INTERNAL: ${error.success.message.slice(0, 300)}`
-    }))
-  }
   return Effect.fail(new GuestServiceError({
     vmId,
     code: error.success.code,
@@ -918,33 +957,36 @@ const serviceFailure = (
 export const GuestServiceChannelLive: Layer.Layer<GuestServiceChannel> = Layer.effect(
   GuestServiceChannel,
   Effect.sync(() => {
-    const exchange = (
-      options: GuestServiceCommonOptions,
-      request: Readonly<Record<string, unknown>>
-    ): Effect.Effect<unknown, GuestTransportFault> =>
-      Effect.scoped(
-        openGuestServiceSocket(options.vsockSocket).pipe(
-          Effect.mapError((reason) => new GuestTransportFault({
-            vmId: options.vmId,
-            reason: `service vsock connect failed: ${reason}`
-          })),
-          Effect.flatMap((socket) =>
-            serviceExchange(socket, request, options.vmId, options.deadlineMs ?? SERVICE_EXCHANGE_DEADLINE_MS)
+    const exchangeLine = Effect.fn("GuestServiceChannel.exchangeLine")(
+      function*(
+        options: GuestServiceCommonOptions,
+        requestLine: Buffer
+      ): Effect.fn.Return<unknown, GuestTransportFault> {
+        return yield* Effect.scoped(
+          openGuestServiceSocket(options.vsockSocket).pipe(
+            Effect.mapError((reason) => new GuestTransportFault({
+              vmId: options.vmId,
+              reason: `service vsock connect failed: ${reason}`
+            })),
+            Effect.flatMap((socket) =>
+              serviceExchange(socket, requestLine, options.vmId, options.deadlineMs ?? SERVICE_EXCHANGE_DEADLINE_MS)
+            )
           )
         )
-      )
+      }
+    )
+    const exchange = Effect.fn("GuestServiceChannel.exchange")(
+      function*(
+        options: GuestServiceCommonOptions,
+        request: Readonly<Record<string, unknown>>
+      ): Effect.fn.Return<unknown, GuestServiceError | GuestTransportFault> {
+        const requestLine = yield* encodeServiceRequest(request, options.vmId)
+        return yield* exchangeLine(options, requestLine)
+      }
+    )
 
     const start: GuestServiceChannel["Service"]["start"] = (options) => {
-      const request: Record<string, unknown> = {
-        version: 1,
-        id: options.requestId,
-        op: "start",
-        argv: [...options.argv],
-        port: options.webPort
-      }
-      if (options.cwd !== undefined) request["cwd"] = options.cwd
-      if (options.env !== undefined) request["env"] = { ...options.env }
-      return exchange(options, request).pipe(
+      return exchangeLine(options, options.requestLine).pipe(
         Effect.flatMap((parsed) => {
           const started = decodeServiceStarted(parsed)
           if (started._tag === "Success") {

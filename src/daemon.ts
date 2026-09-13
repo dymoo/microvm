@@ -1,5 +1,19 @@
 import { NodeHttpServer } from "@effect/platform-node"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, FileSystem, Layer, Result, Schema, Scope, Semaphore } from "effect"
+import {
+  Cause,
+  Context,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  FileSystem,
+  Layer,
+  Predicate,
+  Result,
+  Schema,
+  Scope,
+  Semaphore
+} from "effect"
 import { HttpRouter, HttpServer as EffectHttpServer, HttpServerRequest } from "effect/unstable/http"
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc"
 import { randomBytes } from "node:crypto"
@@ -23,6 +37,7 @@ import { isLoopbackHost, secureOrigin } from "./endpoint.js"
 import {
   clampLimits,
   defaultLimits,
+  encodeGuestServiceStartRequest,
   Firecracker,
   FirecrackerLive,
   GuestExecChannel,
@@ -136,12 +151,8 @@ const logShutdown = (line: string): Effect.Effect<void> =>
   })
 
 const failureDetail = (failure: unknown): string => {
-  const tag = typeof failure === "object" && failure !== null && "_tag" in failure
-    ? String(failure._tag)
-    : "Error"
-  const reason = typeof failure === "object" && failure !== null && "reason" in failure
-    ? String(failure.reason)
-    : String(failure)
+  const tag = Predicate.hasProperty(failure, "_tag") ? String(failure._tag) : "Error"
+  const reason = Predicate.hasProperty(failure, "reason") ? String(failure.reason) : String(failure)
   return `${tag}: ${reason}`
 }
 
@@ -216,16 +227,26 @@ interface HttpLeaseState {
   readonly done: Deferred.Deferred<void>
 }
 
+type DestroyRecordError = DaemonRuntimeError | VmTeardownFault | DestroyUncertain
+
 interface VmRecord extends Allocation {
   info: VmInfo
   readonly handle: VmHandle
   readonly layout: VmLayout
   readonly webPort: number | undefined
   poisoned: boolean
-  destroyGate: Deferred.Deferred<DestroyResult, DaemonRuntimeError | VmTeardownFault> | undefined
+  destroyGate: Deferred.Deferred<DestroyResult, DestroyRecordError> | undefined
   readonly execSemaphore: Semaphore.Semaphore
   readonly serviceSemaphore: Semaphore.Semaphore
   readonly httpScopes: Set<HttpLeaseState>
+}
+
+type VmAvailability = "available" | "unavailable" | "expired"
+
+const classifyVmAvailability = (record: VmRecord, nowEpochMs: number): VmAvailability => {
+  if (record.poisoned || record.destroyGate !== undefined) return "unavailable"
+  if (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= nowEpochMs) return "expired"
+  return "available"
 }
 
 interface Quarantine {
@@ -626,11 +647,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
           if (record === undefined || record.webPort === undefined) {
             throw new DaemonHttpAdmissionError("not-found")
           }
-          if (
-            record.destroyGate !== undefined ||
-            record.poisoned ||
-            (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= Date.now())
-          ) {
+          if (classifyVmAvailability(record, Date.now()) !== "available") {
             throw new DaemonHttpAdmissionError("unavailable")
           }
           if (record.httpScopes.size >= 32) throw new DaemonHttpAdmissionError("quota")
@@ -702,9 +719,9 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
 
     const destroyRecord = (
       record: VmRecord
-    ): Effect.Effect<DestroyResult, DaemonRuntimeError | VmTeardownFault> =>
+    ): Effect.Effect<DestroyResult, DestroyRecordError> =>
       Effect.gen(function*() {
-        const candidate = yield* Deferred.make<DestroyResult, DaemonRuntimeError | VmTeardownFault>()
+        const candidate = yield* Deferred.make<DestroyResult, DestroyRecordError>()
         return yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function*() {
             const claim = yield* mutex.withPermit(Effect.sync(() => {
@@ -726,7 +743,9 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             const ownerOutcome = yield* Effect.exit(Effect.gen(function*() {
               yield* teardown(record)
               if (!(yield* waitForHttpScopes(claim.scopes))) {
-                return yield* Effect.fail(new DaemonRuntimeError({
+                return yield* Effect.fail(new DestroyUncertain({
+                  vmId: record.info.vmId,
+                  phase: "http",
                   reason: "HTTP connection scopes remained active after VM teardown"
                 }))
               }
@@ -939,10 +958,11 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         return yield* record.execSemaphore.withPermit(Effect.gen(function*() {
           const live = yield* mutex.withPermit(Effect.sync(() => records.get(request.vmId) === record))
           if (!live) return yield* Effect.fail(new VmNotFound({ vmId: request.vmId }))
-          if (record.poisoned || record.destroyGate !== undefined) {
+          const availability = classifyVmAvailability(record, Date.now())
+          if (availability === "unavailable") {
             return yield* Effect.fail(new VmPoisoned({ vmId: request.vmId, message: "VM is being destroyed" }))
           }
-          if (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= Date.now()) {
+          if (availability === "expired") {
             yield* Effect.result(destroyRecord(record))
             return yield* Effect.fail(new VmPoisoned({ vmId: request.vmId, message: "VM lifetime expired" }))
           }
@@ -1035,10 +1055,11 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         return yield* record.serviceSemaphore.withPermit(Effect.gen(function*() {
           const live = yield* mutex.withPermit(Effect.sync(() => records.get(vmId) === record))
           if (!live) return yield* Effect.fail(new VmNotFound({ vmId }))
-          if (record.poisoned || record.destroyGate !== undefined) {
+          const availability = classifyVmAvailability(record, Date.now())
+          if (availability === "unavailable") {
             return yield* Effect.fail(new VmPoisoned({ vmId, message: "VM is being destroyed" }))
           }
-          if (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= Date.now()) {
+          if (availability === "expired") {
             yield* Effect.result(destroyRecord(record))
             return yield* Effect.fail(new VmPoisoned({ vmId, message: "VM lifetime expired" }))
           }
@@ -1066,6 +1087,19 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
           }
           return withServiceRecord(request.vmId, (record, webPort) =>
             Effect.gen(function*() {
+              const requestId = randomBytes(16).toString("hex")
+              const requestLine = yield* runServiceChannel(
+                record,
+                request.vmId,
+                encodeGuestServiceStartRequest({
+                  vmId: request.vmId,
+                  requestId,
+                  argv: request.argv,
+                  cwd: request.cwd,
+                  env: request.env,
+                  webPort
+                })
+              )
               const status = yield* runServiceChannel(record, request.vmId, guestService.status({
                 vmId: request.vmId,
                 vsockSocket: record.layout.vsockSocket,
@@ -1081,11 +1115,8 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
               const started = yield* runServiceChannel(record, request.vmId, guestService.start({
                 vmId: request.vmId,
                 vsockSocket: record.layout.vsockSocket,
-                requestId: randomBytes(16).toString("hex"),
-                argv: request.argv,
-                cwd: request.cwd,
-                env: request.env,
-                webPort
+                requestId,
+                requestLine
               }))
               return yield* serviceStatusResult(request.vmId, started)
             })
@@ -1125,13 +1156,14 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
       withCredential(credential, authorizeVm(vmId)).pipe(
         Effect.andThen(getRecord(vmId)),
         Effect.flatMap((record) => destroyRecord(record)),
-        Effect.mapError((cause) => cause instanceof Forbidden || cause instanceof VmNotFound
-          ? cause
-          : new DestroyUncertain({
-            vmId,
-            phase: cause instanceof VmTeardownFault ? cause.phase : "cgroup",
-            reason: cause.reason
-          }))
+        Effect.mapError((cause) =>
+          cause instanceof Forbidden || cause instanceof VmNotFound || cause instanceof DestroyUncertain
+            ? cause
+            : new DestroyUncertain({
+              vmId,
+              phase: cause instanceof VmTeardownFault ? cause.phase : "cgroup",
+              reason: cause.reason
+            }))
       )
 
     const list = (credential: Credential) =>
