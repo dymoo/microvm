@@ -11,23 +11,25 @@ Research status: 2026-09-12; acceptance status: 2026-09-13. This note records pr
 
 ## Hosted acceptance evidence
 
-[`hosted-linux-acceptance` run 34750139284](https://github.com/dymoo/microvm/actions/runs/34750139284) completed successfully on commit [`8e9c095625bc0a8b61b78d63adc77d52d233c003`](https://github.com/dymoo/microvm/commit/8e9c095625bc0a8b61b78d63adc77d52d233c003). The uploaded [`hosted-acceptance-evidence` artifact (ID 10315388428)](https://github.com/dymoo/microvm/actions/runs/34750139284/artifacts/10315388428) has digest `sha256:9fa626bf1fb082a3d47089876f1b752b24362385ed32cefb31eb946991abceaa`.
+[`hosted-linux-acceptance` run 34769481224](https://github.com/dymoo/microvm/actions/runs/34769481224) completed successfully on commit [`b6afe4fff591763e178a29bb98e51aed635b5fed`](https://github.com/dymoo/microvm/commit/b6afe4fff591763e178a29bb98e51aed635b5fed). The uploaded [`hosted-acceptance-evidence` artifact (ID 10321372494)](https://github.com/dymoo/microvm/actions/runs/34769481224#artifacts) has digest `sha256:2003ce71bbd744bd1c5492c11125bf7f3fa16b47b040830990696e05b59b4146`.
 
 The run observed:
 
-- 81/81 Linux Vitest tests with zero skipped or failed, all guest Go race packages passing, and the real `CID_LOCAL` rejection gate passing.
-- A 2,048 MiB image and the jailed CID 2 guest protocol, including the idle request-header deadline and Node.js/Python execution.
-- Two-VM authorization, isolation, and execution bounds; 52/52 hostile jailed-VM checks; and native teardown with no run-state or cgroup leftovers.
+- 154/154 Linux Vitest tests with zero skipped or failed, all guest Go race packages passing, and the real `CID_LOCAL` rejection gate passing.
+- A 2,048 MiB image and the jailed CID 2 guest protocol acceptance, including the idle request-header deadline.
+- Two-VM daemon/client acceptance covering Node.js and Python execution, authorization, and VM isolation; 52/52 hostile jailed-VM checks; and native teardown with no run-state or cgroup leftovers.
+- The HTTP-only guest preview acceptance: trusted-proxy service control, capability and credential separation, rejection of `CONNECT`, `TRACE`, absolute-form targets, and `Expect: 100-continue`, WebSocket echo, SSE pressure with slow-reader cancellation, and stream closure and revocation on destroy.
 
 The exact TOFU kernel digest `d8ced68bd61e27b6813e2c993cc53a4029c59e13210672180591c84109684fe4` booted and passed this scope. The result proves compatibility for this exact digest; it does not upgrade the digest's provenance or make the demonstration-only prebuilt kernel production-recommended.
 
 | GitHub-hosted Azure observation | Time |
 | --- | ---: |
-| Daemon cold start to listening | 657 ms |
-| First jailed VM create and readiness | 7,748 ms |
-| Guest protocol acceptance | 5,543 ms |
-| Two-VM acceptance | 26,360 ms |
-| Hostile jailed-VM abuse | 51,830 ms |
+| Daemon cold start to listening | 649 ms |
+| First jailed VM create and readiness | 9,104 ms |
+| Guest protocol acceptance | 18,478 ms |
+| HTTP-only preview acceptance | 29,961 ms |
+| Two-VM acceptance | 25,013 ms |
+| Hostile jailed-VM abuse | 49,635 ms |
 
 These timings are one GitHub-hosted Azure observation, not a Proxmox latency or capacity benchmark.
 
