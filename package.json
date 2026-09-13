@@ -46,7 +46,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
     "check-all": "pnpm typecheck && pnpm build && pnpm test",
     "test": "vitest run",
     "test:watch": "vitest"

@@ -1,0 +1,16 @@
+{
+  // Type-checks the public cluster API regression, which asserts that omitted
+  // optional request keys are valid TypeScript: vitest transforms tests without
+  // checking them, and the build config must keep emitting `dist/` from `src/`.
+  // Only the type-clean public-API suite is listed; the other test files predate
+  // the lib/toolchain typing this config would require.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["tests/cluster.test.ts", "src/**/*.ts"]
+}

@@ -30,7 +30,10 @@ export type {
   ClusterListError,
   MicrovmCluster,
   MicrovmClusterOptions,
+  SandboxCreateInput,
+  SandboxExecuteInput,
   SandboxHandle,
+  SandboxStartWebServiceInput,
   WebServiceHandle
 } from "./cluster.js"
 

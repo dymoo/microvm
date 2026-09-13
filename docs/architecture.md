@@ -15,7 +15,7 @@ One Firecracker runtime, three credential scopes, four trust boundaries.
 | `src/daemon.ts` | `daemonLayer(config)` | Registry, quotas, request leases, service serialization, TTL reaper, recovery, HTTP(S) serving |
 | `src/http-proxy.ts` | `SandboxHttpProxy.handleRequest` / `handleUpgrade` | Ingress capability injection and the trusted Node reverse-proxy hop |
 | `src/client.ts` | `makeMicrovmClient` | Endpoint resolution, TLS enforcement, wire decoding |
-| `src/cluster.ts` | `SandboxHandle`, `WebServiceHandle` | Endpoint ownership, hidden credentials, semantic HTTP and durable service APIs |
+| `src/cluster.ts` | `SandboxHandle`, `WebServiceHandle` | Endpoint ownership, hidden credentials, semantic HTTP and durable service APIs, normalization of omitted optional request keys |
 | `src/ai.ts` | `createSandboxTools`, prompt exports | Tool schemas, bounds, cancellation wiring |
 
 All outward adapters depend inward on `protocol.ts`: the daemon composes

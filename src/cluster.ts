@@ -22,7 +22,7 @@ import {
   type VmInfo,
   type CreateRequest,
   type ExecuteRequest,
-  type StartWebServiceRequest,
+  type StartWebServiceRpcRequest,
   type StopWebServiceResult,
   type WebServiceStatus
 } from "./protocol.js"
@@ -70,6 +70,60 @@ export type ClusterDestroyError =
 export type ClusterListError =
   Forbidden | Unauthenticated | RpcClientError.RpcClientError | ClusterRoutingError | ClusterEndpointUnavailable
 
+/**
+ * Public request inputs for the cluster convenience API. These are the shapes a
+ * plain-JavaScript consumer builds, so every property beyond the required core
+ * is optional: the cluster normalizes the keys the RPC payload declares as
+ * required-with-`undefined` before the wire schema sees them.
+ */
+export interface SandboxCreateInput {
+  readonly image: string
+  readonly cpus?: number | undefined
+  readonly memMib?: number | undefined
+  readonly ttlSeconds?: number | undefined
+}
+
+export interface SandboxExecuteInput {
+  /** Executed directly, with no shell; `argv[0]` is an absolute guest path. */
+  readonly argv: ReadonlyArray<string>
+  readonly cwd?: string | undefined
+  readonly env?: Readonly<Record<string, string>> | undefined
+  readonly timeoutMs?: number | undefined
+  readonly maxOutputBytes?: number | undefined
+}
+
+export interface SandboxStartWebServiceInput {
+  readonly argv: ReadonlyArray<string>
+  readonly cwd?: string | undefined
+  readonly env?: Readonly<Record<string, string>> | undefined
+}
+
+const createWireRequest = (input: SandboxCreateInput): CreateRequest => ({
+  image: input.image,
+  cpus: input.cpus,
+  memMib: input.memMib,
+  ttlSeconds: input.ttlSeconds
+})
+
+const executeWireRequest = (input: SandboxExecuteInput, vmId: VmId): ExecuteRequest => ({
+  vmId,
+  argv: input.argv,
+  cwd: input.cwd,
+  env: input.env,
+  timeoutMs: input.timeoutMs,
+  maxOutputBytes: input.maxOutputBytes
+})
+
+const startWebServiceWireRequest = (
+  input: SandboxStartWebServiceInput,
+  vmId: VmId
+): StartWebServiceRpcRequest => ({
+  vmId,
+  argv: input.argv,
+  cwd: input.cwd,
+  env: input.env
+})
+
 export interface WebServiceHandle {
   readonly status: () => Effect.Effect<WebServiceStatus, ClusterServiceError>
   readonly stop: () => Effect.Effect<StopWebServiceResult, ClusterServiceError>
@@ -83,17 +137,19 @@ export interface SandboxHandle {
   readonly http: () => Effect.Effect<SandboxHttpProxy, HttpNotConfigured>
   /** Starts the single durable `web` service while ordinary execute remains available. */
   readonly startWebService: (
-    request: StartWebServiceRequest
+    request: SandboxStartWebServiceInput
   ) => Effect.Effect<WebServiceHandle, ClusterServiceError>
-  readonly execute: (request: Omit<ExecuteRequest, "vmId">) => Effect.Effect<ExecResult, ClusterExecuteError>
+  readonly execute: (request: SandboxExecuteInput) => Effect.Effect<ExecResult, ClusterExecuteError>
   readonly inspect: () => Effect.Effect<VmInfo, ClusterInspectError>
   readonly destroy: () => Effect.Effect<DestroyResult, ClusterDestroyError>
 }
 
 export interface MicrovmCluster {
-  readonly create: (request: CreateRequest) => Effect.Effect<SandboxHandle, ClusterCreateError | ClusterListError>
+  readonly create: (request: SandboxCreateInput) => Effect.Effect<SandboxHandle, ClusterCreateError | ClusterListError>
   readonly inspect: (vmId: VmId) => Effect.Effect<VmInfo, ClusterInspectError | ClusterListError>
-  readonly execute: (request: ExecuteRequest) => Effect.Effect<ExecResult, ClusterExecuteError | ClusterListError>
+  readonly execute: (
+    request: SandboxExecuteInput & { readonly vmId: VmId }
+  ) => Effect.Effect<ExecResult, ClusterExecuteError | ClusterListError>
   readonly destroy: (vmId: VmId) => Effect.Effect<DestroyResult, ClusterDestroyError | ClusterListError>
   readonly list: () => Effect.Effect<ReadonlyArray<VmInfo>, ClusterListError>
 }
@@ -194,9 +250,10 @@ export const makeMicrovmCluster = (
       })
 
     const create = (
-      request: CreateRequest
+      request: SandboxCreateInput
     ): Effect.Effect<SandboxHandle, ClusterCreateError | ClusterListError> =>
       Effect.gen(function*() {
+        const wireRequest = createWireRequest(request)
         const health = yield* poll()
         const available = health.filter((entry) => Result.isSuccess(entry.result))
         if (available.length === 0) {
@@ -214,7 +271,7 @@ export const makeMicrovmCluster = (
         })
         let capacityFailure: CapacityExceeded | undefined
         for (const candidate of available) {
-          const result = yield* Effect.result(candidate.endpoint.client.create(request))
+          const result = yield* Effect.result(candidate.endpoint.client.create(wireRequest))
           if (Result.isFailure(result)) {
             if (isCapacityExceeded(result.failure)) {
               capacityFailure = result.failure
@@ -260,14 +317,16 @@ export const makeMicrovmCluster = (
           return {
             vm: result.success.vm,
             client: sandboxClient,
-            execute: (input) => sandboxClient.execute({ ...input, vmId }),
+            execute: (input) => sandboxClient.execute(executeWireRequest(input, vmId)),
             http: () => httpProxy === undefined
               ? Effect.fail(new HttpNotConfigured({ vmId }))
               : Effect.succeed(httpProxy),
-            startWebService: (input) => sandboxClient.startWebService({ ...input, vmId }).pipe(
-              Effect.mapError((error) => serviceError(vmId, error)),
-              Effect.map(() => webService)
-            ),
+            startWebService: (input) => sandboxClient
+              .startWebService(startWebServiceWireRequest(input, vmId))
+              .pipe(
+                Effect.mapError((error) => serviceError(vmId, error)),
+                Effect.map(() => webService)
+              ),
             inspect: () => sandboxClient.inspect({ vmId }),
             destroy: () => sandboxClient.destroy({ vmId })
           }
@@ -282,9 +341,11 @@ export const makeMicrovmCluster = (
       resolveOwner(vmId).pipe(Effect.flatMap((owner) => owner.client.inspect({ vmId })))
 
     const execute = (
-      request: ExecuteRequest
+      request: SandboxExecuteInput & { readonly vmId: VmId }
     ): Effect.Effect<ExecResult, ClusterExecuteError | ClusterListError> =>
-      resolveOwner(request.vmId).pipe(Effect.flatMap((owner) => owner.client.execute(request)))
+      resolveOwner(request.vmId).pipe(
+        Effect.flatMap((owner) => owner.client.execute(executeWireRequest(request, request.vmId)))
+      )
 
     const destroy = (
       vmId: VmId

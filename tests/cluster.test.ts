@@ -5,7 +5,12 @@ import { join } from "node:path"
 import { Deferred, Effect, Fiber, Layer, Result } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
 import { makeMicrovmClient } from "../src/client.js"
-import { makeMicrovmCluster } from "../src/cluster.js"
+import {
+  makeMicrovmCluster,
+  type SandboxCreateInput,
+  type SandboxExecuteInput,
+  type SandboxStartWebServiceInput
+} from "../src/cluster.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import {
   Firecracker,
@@ -268,6 +273,57 @@ describe("static microVM cluster", () => {
       }))
       expect(Result.isFailure(reserved) && reserved.failure._tag).toBe("ClusterServiceError")
       expect(Result.isFailure(reserved) && reserved.failure.code).toBe("INVALID_REQUEST")
+    })))
+  })
+
+  it("accepts argv-only request objects from a plain JavaScript caller", async () => {
+    const root = await fixture(3_000)
+    let state: WebServiceState = { state: "not_started" }
+    let serviceStart: Parameters<GuestServiceChannel["Service"]["start"]>[0] | undefined
+    const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
+      start: (options) => Effect.sync(() => {
+        serviceStart = options
+        state = { state: "running", startedAtEpochMs: 1_700_000_000_000 }
+        return state
+      }),
+      status: () => Effect.sync(() => state),
+      stop: () => Effect.sync(() => {
+        state = {
+          state: "exited",
+          startedAtEpochMs: 1_700_000_000_000,
+          exitCode: 143,
+          signal: "SIGTERM"
+        }
+        return { stopped: true }
+      })
+    }))
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const server = createServer()
+      yield* start(root, 1, server, firecrackerLayer()(server), guestLayer("argv-only"), serviceLayer)
+      const url = `http://127.0.0.1:${yield* listeningPort(server)}`
+      const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
+
+      // The public contract allows omitting every optional key, so these
+      // argv-only literals must type-check (enforced by tsconfig.tests.json).
+      // Before the cluster normalized omitted keys, the execute RPC payload
+      // rejected the object client-side with MissingKey for `cwd`.
+      const createInput: SandboxCreateInput = { image: "node" }
+      const executeInput: SandboxExecuteInput = { argv: ["/marker"] }
+      const serviceInput: SandboxStartWebServiceInput = { argv: ["/usr/bin/node", "server.js"] }
+
+      const sandbox = yield* cluster.create(createInput)
+      const executed = yield* sandbox.execute(executeInput)
+      expect(Buffer.from(executed.stdoutB64, "base64").toString()).toBe("argv-only")
+
+      const addressed = yield* cluster.execute({ vmId: sandbox.vm.vmId, argv: ["/marker"] })
+      expect(Buffer.from(addressed.stdoutB64, "base64").toString()).toBe("argv-only")
+
+      yield* sandbox.startWebService(serviceInput)
+      expect(serviceStart?.argv).toEqual(["/usr/bin/node", "server.js"])
+      expect(serviceStart?.cwd).toBeUndefined()
+      expect(serviceStart?.env).toBeUndefined()
+      expect(serviceStart?.webPort).toBe(3_000)
     })))
   })
 
