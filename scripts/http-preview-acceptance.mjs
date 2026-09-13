@@ -20,6 +20,44 @@ const assert = (condition, message) => {
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
+/**
+ * Every wait in this script is bounded and labelled: the hosted phase must fail
+ * with the operation that stalled, never hang until the CI job deadline.
+ */
+const DEADLINES = {
+  readyMs: 120_000,
+  rpcMs: 60_000,
+  rpcCreateMs: 300_000,
+  requestMs: 30_000,
+  rawStatusMs: 30_000,
+  websocketMs: 30_000,
+  streamMs: 60_000
+}
+
+const expired = (label, milliseconds) => new Error(`${label} exceeded ${milliseconds}ms`)
+
+/** Resolves `work` or rejects with a labelled error once `milliseconds` elapse. */
+const bounded = (label, milliseconds, work) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(expired(label, milliseconds)), milliseconds)
+  timer.unref()
+  Promise.resolve(work).then(
+    (value) => { clearTimeout(timer); resolve(value) },
+    (error) => { clearTimeout(timer); reject(error) }
+  )
+})
+
+const fetchBounded = (label, url, init = {}, milliseconds = DEADLINES.requestMs) =>
+  fetch(url, { redirect: "manual", ...init, signal: AbortSignal.timeout(milliseconds) }).catch((error) => {
+    throw new Error(`${label} failed: ${String(error)}`)
+  })
+
+/**
+ * Bounds one RPC. Typed failures reach the caller unchanged; only a stall dies,
+ * loudly and with its label.
+ */
+const boundedRpc = (label, effect, milliseconds = DEADLINES.rpcMs) =>
+  Effect.raceFirst(effect, Effect.delay(Effect.die(expired(label, milliseconds)), milliseconds))
+
 const listenProxy = (proxy) => Effect.acquireRelease(
   Effect.promise(async () => {
     const server = createServer(proxy.handleRequest)
@@ -38,13 +76,13 @@ const listenProxy = (proxy) => Effect.acquireRelease(
   })
 )
 
-const waitForResponse = async (url, predicate, timeoutMs = 120_000) => {
+const waitForResponse = async (url, predicate, timeoutMs = DEADLINES.readyMs) => {
   const deadline = Date.now() + timeoutMs
   let last = "no response"
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url, { redirect: "manual" })
-      const body = await response.text()
+      const response = await fetchBounded(`readiness request ${url}`, url)
+      const body = await bounded(`readiness body ${url}`, DEADLINES.requestMs, response.text())
       last = `HTTP ${response.status}`
       if (predicate(response, body)) return { response, body }
     } catch (error) {
@@ -56,6 +94,7 @@ const waitForResponse = async (url, predicate, timeoutMs = 120_000) => {
 }
 
 const requestStatus = (origin, method, target, headers = {}) => new Promise((resolve, reject) => {
+  const label = `raw ${method} ${target}`
   const url = new URL(origin)
   const request = httpRequest({
     host: url.hostname,
@@ -68,11 +107,13 @@ const requestStatus = (origin, method, target, headers = {}) => new Promise((res
     response.resume()
     response.once("end", () => resolve(response.statusCode ?? 0))
   })
+  request.setTimeout(DEADLINES.requestMs, () => request.destroy(expired(label, DEADLINES.requestMs)))
   request.once("error", reject)
   request.end()
 })
 
 const requestJson = (origin, target, headers) => new Promise((resolve, reject) => {
+  const label = `header reflection ${target}`
   const url = new URL(origin)
   const request = httpRequest({
     host: url.hostname,
@@ -96,13 +137,19 @@ const requestJson = (origin, target, headers) => new Promise((resolve, reject) =
       }
     })
   })
+  request.setTimeout(DEADLINES.requestMs, () => request.destroy(expired(label, DEADLINES.requestMs)))
   request.once("error", reject)
   request.end()
 })
 
 const rawStatus = (port, method, target) => new Promise((resolve, reject) => {
+  const label = `raw ${method} ${target}`
   const socket = connect({ host: "127.0.0.1", port })
   let bytes = Buffer.alloc(0)
+  socket.setTimeout(DEADLINES.rawStatusMs, () => {
+    socket.destroy()
+    reject(expired(label, DEADLINES.rawStatusMs))
+  })
   socket.once("error", reject)
   socket.once("connect", () => socket.write(`${method} ${target} HTTP/1.1\r\nHost: trusted.invalid\r\nConnection: close\r\n\r\n`))
   socket.on("data", (chunk) => {
@@ -136,6 +183,7 @@ const openWebSocket = (port, path = "/ws") => new Promise((resolve, reject) => {
     socket.destroy()
     reject(error)
   }
+  socket.setTimeout(DEADLINES.websocketMs, () => fail(expired(`websocket handshake ${path}`, DEADLINES.websocketMs)))
   socket.once("error", fail)
   socket.once("connect", () => socket.write(
     `GET ${path} HTTP/1.1\r\nHost: trusted.invalid\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${key}\r\n\r\n`
@@ -152,6 +200,7 @@ const openWebSocket = (port, path = "/ws") => new Promise((resolve, reject) => {
       fail(new Error(`websocket upgrade failed: ${head.split("\r\n")[0]}`))
       return
     }
+    socket.setTimeout(0)
     resolve(socket)
   })
 })
@@ -169,8 +218,13 @@ const echoWebSocket = (socket, text) => new Promise((resolve, reject) => {
     if (length >= 126 || bytes.length < 2 + length) return
     socket.off("data", onData)
     socket.off("error", fail)
+    socket.setTimeout(0)
     resolve(bytes.subarray(2, 2 + length).toString("utf8"))
   }
+  socket.setTimeout(DEADLINES.websocketMs, () => {
+    fail(expired("websocket echo", DEADLINES.websocketMs))
+    socket.destroy()
+  })
   socket.once("error", fail)
   socket.on("data", onData)
   socket.write(websocketFrame(text))
@@ -236,18 +290,30 @@ const program = Effect.scoped(Effect.gen(function*() {
   const cluster = yield* makeMicrovmCluster({ endpoints: [{ url: daemonUrl, token: adminToken }] })
   const adminClient = yield* makeMicrovmClient({ url: daemonUrl, token: adminToken })
 
-  const next = yield* cluster.create({ image, cpus: 1, memMib: 768, ttlSeconds: 900 })
+  const next = yield* boundedRpc(
+    "cluster create (next preview)",
+    cluster.create({ image, cpus: 1, memMib: 768, ttlSeconds: 900 }),
+    DEADLINES.rpcCreateMs
+  )
   try {
-    const initialized = yield* next.execute({ argv: ["/usr/local/bin/microvm-next-init"] })
-    assert(initialized.exitCode === 0, "Next workspace initialization failed")
-    const forbiddenEnvironment = yield* Effect.result(next.startWebService({
-      argv: ["/usr/local/bin/pnpm", "dev"],
-      cwd: "/workspace",
-      env: { PORT: "3999" }
+    const initialized = yield* boundedRpc("exec microvm-next-init", next.execute({
+      argv: ["/usr/local/bin/microvm-next-init"]
     }))
+    assert(initialized.exitCode === 0, "Next workspace initialization failed")
+    const forbiddenEnvironment = yield* Effect.result(boundedRpc(
+      "startWebService with reserved PORT",
+      next.startWebService({
+        argv: ["/usr/local/bin/pnpm", "dev"],
+        cwd: "/workspace",
+        env: { PORT: "3999" }
+      })
+    ))
     assert(Result.isFailure(forbiddenEnvironment), "web service accepted caller-controlled PORT")
 
-    const nextService = yield* next.startWebService({ argv: ["/usr/local/bin/pnpm", "dev"], cwd: "/workspace" })
+    const nextService = yield* boundedRpc("startWebService pnpm dev", next.startWebService({
+      argv: ["/usr/local/bin/pnpm", "dev"],
+      cwd: "/workspace"
+    }))
     const nextProxy = yield* next.http()
     const nextPublic = yield* listenProxy(nextProxy)
     const initial = yield* Effect.promise(() => waitForResponse(
@@ -256,36 +322,45 @@ const program = Effect.scoped(Effect.gen(function*() {
     ))
     const assetPath = /(?:src|href)="(\/_next\/[^"?]+(?:\?[^" ]*)?)"/.exec(initial.body)?.[1]
     assert(assetPath !== undefined, "Next page did not reference a _next asset")
-    const asset = yield* Effect.promise(() => fetch(`${nextPublic.origin}${assetPath}`))
+    const asset = yield* Effect.promise(() => fetchBounded("Next asset", `${nextPublic.origin}${assetPath}`))
     assert(asset.status === 200, `Next asset returned HTTP ${asset.status}`)
-    yield* Effect.promise(() => asset.arrayBuffer())
+    yield* Effect.promise(() => bounded("Next asset body", DEADLINES.requestMs, asset.arrayBuffer()))
 
-    const mutated = yield* next.execute({
+    const mutated = yield* boundedRpc("exec workspace mutation", next.execute({
       argv: [
         "/usr/bin/python3",
         "-c",
         "p='/workspace/app/page.tsx';s=open(p).read();open(p,'w').write(s.replace('Ready to build.','Updated through concurrent exec.'))"
       ]
-    })
+    }))
     assert(mutated.exitCode === 0, "concurrent exec could not mutate the running Next workspace")
-    const status = yield* nextService.status()
+    const status = yield* boundedRpc("next service status", nextService.status())
     assert(status.state === "running", "Next service did not survive concurrent exec")
     yield* Effect.promise(() => waitForResponse(
       `${nextPublic.origin}/`,
       (response, body) => response.status === 200 && body.includes("Updated through concurrent exec.")
     ))
 
-    const network = yield* next.execute({
+    const network = yield* boundedRpc("exec external-network probe", next.execute({
       argv: ["/usr/bin/python3", "-c", "import socket;s=socket.socket();s.settimeout(.5);s.connect(('1.1.1.1',53))"]
-    })
+    }))
     assert(network.exitCode !== 0, "preview-enabled guest unexpectedly reached an external network")
-    assert((yield* nextService.stop()).stopped === true, "Next service stop was not confirmed")
+    assert(
+      (yield* boundedRpc("next service stop", nextService.stop())).stopped === true,
+      "Next service stop was not confirmed"
+    )
   } finally {
-    yield* next.destroy().pipe(Effect.catch(() => Effect.void))
+    yield* boundedRpc("destroy next preview VM", next.destroy()).pipe(Effect.catch(() => Effect.void))
   }
 
-  const protocol = yield* cluster.create({ image, cpus: 1, memMib: 512, ttlSeconds: 900 })
-  const protocolService = yield* protocol.startWebService({ argv: ["/usr/bin/node", "-e", guestProtocolService] })
+  const protocol = yield* boundedRpc(
+    "cluster create (protocol service)",
+    cluster.create({ image, cpus: 1, memMib: 512, ttlSeconds: 900 }),
+    DEADLINES.rpcCreateMs
+  )
+  const protocolService = yield* boundedRpc("startWebService guest protocol service", protocol.startWebService({
+    argv: ["/usr/bin/node", "-e", guestProtocolService]
+  }))
   const protocolProxy = yield* protocol.http()
   const publicServer = yield* listenProxy(protocolProxy)
   yield* Effect.promise(() => waitForResponse(
@@ -306,7 +381,11 @@ const program = Effect.scoped(Effect.gen(function*() {
     { "proxy-authorization": `Bearer ${adminToken}` }
   ))
   assert(controlCredential === 401, `admin credential authenticated data ingress: HTTP ${controlCredential}`)
-  const tokenDonor = yield* adminClient.create({ image, cpus: 1, memMib: 256, ttlSeconds: 300 })
+  const tokenDonor = yield* boundedRpc(
+    "cluster create (cross-VM token donor)",
+    adminClient.create({ image, cpus: 1, memMib: 256, ttlSeconds: 300 }),
+    DEADLINES.rpcCreateMs
+  )
   try {
     const crossVmCredential = yield* Effect.promise(() => requestStatus(
       daemonUrl,
@@ -316,7 +395,8 @@ const program = Effect.scoped(Effect.gen(function*() {
     ))
     assert(crossVmCredential === 404, `cross-VM ingress credential returned HTTP ${crossVmCredential}`)
   } finally {
-    yield* adminClient.destroy({ vmId: tokenDonor.vm.vmId }).pipe(Effect.catch(() => Effect.void))
+    yield* boundedRpc("destroy token donor VM", adminClient.destroy({ vmId: tokenDonor.vm.vmId }))
+      .pipe(Effect.catch(() => Effect.void))
   }
   assert((yield* Effect.promise(() => rawStatus(publicServer.port, "CONNECT", "example.invalid:443"))) === 405, "CONNECT was not rejected")
   assert((yield* Effect.promise(() => rawStatus(publicServer.port, "TRACE", "/"))) === 405, "TRACE was not rejected")
@@ -335,45 +415,53 @@ const program = Effect.scoped(Effect.gen(function*() {
 
   const heldSse = []
   for (let index = 0; index < 8; index++) {
-    const response = yield* Effect.promise(() => fetch(`${publicServer.origin}/sse`))
+    const response = yield* Effect.promise(() => fetchBounded(`SSE slot ${index}`, `${publicServer.origin}/sse`))
     assert(response.status === 200 && response.body !== null, `SSE slot ${index} failed with HTTP ${response.status}`)
     const reader = response.body.getReader()
-    const first = yield* Effect.promise(() => reader.read())
+    const first = yield* Effect.promise(() => bounded(`SSE slot ${index} first event`, DEADLINES.streamMs, reader.read()))
     assert(!first.done && Buffer.from(first.value).includes("data: ready"), `SSE slot ${index} did not flush immediately`)
     heldSse.push(reader)
   }
-  const saturated = yield* Effect.promise(() => fetch(`${publicServer.origin}/sse`))
+  const saturated = yield* Effect.promise(() => fetchBounded("ninth SSE", `${publicServer.origin}/sse`))
   assert(saturated.status === 429, `ninth SSE returned HTTP ${saturated.status}, expected 429`)
-  yield* Effect.promise(() => saturated.body?.cancel())
-  for (const reader of heldSse) yield* Effect.promise(() => reader.cancel())
+  yield* Effect.promise(() => bounded("saturated SSE cancel", DEADLINES.streamMs, saturated.body?.cancel()))
+  for (const reader of heldSse) {
+    yield* Effect.promise(() => bounded("held SSE cancel", DEADLINES.streamMs, reader.cancel()))
+  }
 
-  const slow = yield* Effect.promise(() => fetch(`${publicServer.origin}/large`))
+  const slow = yield* Effect.promise(() => fetchBounded("large streamed response", `${publicServer.origin}/large`))
   assert(slow.status === 200 && slow.body !== null, "large streamed response did not start")
   yield* Effect.promise(async () => {
     const reader = slow.body.getReader()
-    await reader.read()
-    await reader.cancel()
+    await bounded("large response first chunk", DEADLINES.streamMs, reader.read())
+    await bounded("large response cancel", DEADLINES.streamMs, reader.cancel())
   })
-  assert((yield* protocolService.status()).state === "running", "slow-reader cancellation killed the web service")
+  assert(
+    (yield* boundedRpc("protocol service status after slow reader", protocolService.status())).state === "running",
+    "slow-reader cancellation killed the web service"
+  )
 
-  const activeSse = yield* Effect.promise(() => fetch(`${publicServer.origin}/sse`))
+  const activeSse = yield* Effect.promise(() => fetchBounded("active teardown SSE", `${publicServer.origin}/sse`))
   assert(activeSse.status === 200 && activeSse.body !== null, "active teardown SSE did not start")
   const activeReader = activeSse.body.getReader()
-  yield* Effect.promise(() => activeReader.read())
+  yield* Effect.promise(() => bounded("active SSE first event", DEADLINES.streamMs, activeReader.read()))
   const sseClosed = (async () => {
     try {
       while (!(await activeReader.read()).done) {}
     } catch {}
   })()
   const websocketClosed = once(websocket, "close")
-  const destroyed = yield* protocol.destroy()
+  const destroyed = yield* boundedRpc("destroy protocol VM", protocol.destroy())
   assert(destroyed.destroyed === true, "protocol VM destroy was not confirmed")
   yield* Effect.promise(() => closeWithin(sseClosed, 2_000, "active SSE"))
   yield* Effect.promise(() => closeWithin(websocketClosed, 2_000, "active websocket"))
 
-  const revoked = yield* Effect.promise(() => fetch(`${publicServer.origin}/`))
+  const revoked = yield* Effect.promise(() => fetchBounded("revoked ingress", `${publicServer.origin}/`))
   assert([401, 404, 503].includes(revoked.status), `revoked ingress returned HTTP ${revoked.status}`)
-  assert(Result.isFailure(yield* Effect.result(protocolService.status())), "destroyed VM retained service-control authority")
+  assert(
+    Result.isFailure(yield* Effect.result(boundedRpc("service status after destroy", protocolService.status()))),
+    "destroyed VM retained service-control authority"
+  )
 }))
 
 await Effect.runPromise(program)

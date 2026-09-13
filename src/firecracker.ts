@@ -744,6 +744,8 @@ interface GuestServiceCommonOptions {
   readonly vmId: string
   readonly vsockSocket: string
   readonly requestId: string
+  /** Bound on the guest's reply for this exchange. */
+  readonly deadlineMs?: number | undefined
 }
 
 export class GuestServiceChannel extends Context.Service<GuestServiceChannel, {
@@ -763,6 +765,12 @@ export class GuestServiceChannel extends Context.Service<GuestServiceChannel, {
 }>()("microvm/firecracker/GuestServiceChannel") {}
 
 const SERVICE_LINE_LIMIT_BYTES = 64 * 1024
+/**
+ * Default bound on one guest service-control reply. Generous against the guest's
+ * own frozen-cgroup kill wait (5s) so a real stop still answers, but finite so a
+ * wedged controller faults (and poisons through the caller) instead of hanging.
+ */
+const SERVICE_EXCHANGE_DEADLINE_MS = 15_000
 
 const serviceStartedSchema = Schema.Struct({
   version: Schema.Literal(1),
@@ -801,15 +809,18 @@ const decodeServiceError = Schema.decodeUnknownResult(serviceErrorSchema)
 const serviceExchange = (
   socket: Socket,
   request: Readonly<Record<string, unknown>>,
-  vmId: string
+  vmId: string,
+  deadlineMs: number
 ): Effect.Effect<unknown, GuestTransportFault> =>
   Effect.callback<unknown, GuestTransportFault>((resume, signal) => {
     const requestLine = Buffer.from(`${JSON.stringify(request)}\n`, "utf8")
     let chunks: Array<Buffer> = []
     let bytes = 0
     let finished = false
+    let deadline: NodeJS.Timeout | undefined
 
     const detach = (): void => {
+      clearTimeout(deadline)
       socket.off("data", onData)
       socket.off("error", onError)
       socket.off("close", onClose)
@@ -861,11 +872,17 @@ const serviceExchange = (
     socket.on("data", onData)
     socket.once("error", onError)
     socket.once("close", onClose)
+    deadline = setTimeout(
+      () => fault("guest service response deadline exceeded"),
+      deadlineMs
+    )
+    deadline.unref()
     signal.addEventListener("abort", () => {
       if (finished) return
       finished = true
       detach()
       socket.destroy()
+      resume(Effect.interrupt)
     }, { once: true })
     socket.write(requestLine)
     socket.resume()
@@ -911,7 +928,9 @@ export const GuestServiceChannelLive: Layer.Layer<GuestServiceChannel> = Layer.e
             vmId: options.vmId,
             reason: `service vsock connect failed: ${reason}`
           })),
-          Effect.flatMap((socket) => serviceExchange(socket, request, options.vmId))
+          Effect.flatMap((socket) =>
+            serviceExchange(socket, request, options.vmId, options.deadlineMs ?? SERVICE_EXCHANGE_DEADLINE_MS)
+          )
         )
       )
 

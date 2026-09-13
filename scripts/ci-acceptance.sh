@@ -603,8 +603,11 @@ print(
   # from a trusted loopback webserver, starts the prepared Next service through
   # durable service control, and covers HTTP assets, SSE, WebSocket, capability
   # separation/revocation, concurrent exec, pressure cancellation, and no NIC.
+  # The script bounds every operation internally; this outer deadline is the
+  # second layer, so a stall is reported here rather than at the job cap.
   started=$(now_ms)
   MICROVM_URL=$URL MICROVM_TOKEN=$admin_token MICROVM_IMAGE=node \
+    timeout --signal=TERM --kill-after=30s 10m \
     node "$ROOT/scripts/http-preview-acceptance.mjs" \
     | tee "$EVIDENCE_DIR/http-preview.log"
   finished=$(now_ms)

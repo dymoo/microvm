@@ -4,6 +4,7 @@
  * docs/protocol.md. This proves the transport implementation is portable
  * (pure JS over AF_UNIX) without needing Firecracker or Linux.
  */
+import { once } from "node:events"
 import { mkdtempSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { Effect } from "effect"
@@ -344,4 +345,99 @@ describe("guest exec v1 channel", () => {
     })
     await expect(runExec(guest.path)).rejects.toBeInstanceOf(GuestTransportFault)
   })
+})
+
+/**
+ * Every channel opens before the protocol above it can bound anything, so a
+ * guest that accepts a connection and then stops answering must fault the
+ * caller instead of suspending it. These drive the real UDS seam.
+ */
+describe("bounded fixed-purpose opens", () => {
+  const cleanupFns: Array<() => Promise<void>> = []
+
+  afterEach(async () => {
+    while (cleanupFns.length > 0) {
+      await cleanupFns.pop()?.()
+    }
+  })
+
+  const startSilentGuest = async (acknowledge: boolean) => {
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    const accepted = Promise.withResolvers<Socket>()
+    const connections: Array<Socket> = []
+    const server = createServer((socket) => {
+      connections.push(socket)
+      accepted.resolve(socket)
+      socket.on("error", () => undefined)
+      // Read so the peer's teardown is observable as a close on this side.
+      socket.resume()
+      if (acknowledge) socket.write("OK 1073741824\n")
+    })
+    server.listen(path)
+    await started(server)
+    cleanupFns.push(async () => {
+      for (const connection of connections) connection.destroy()
+      server.close()
+      await closed(server)
+      await rm(dir, { recursive: true, force: true })
+    })
+    return { path, accepted: accepted.promise }
+  }
+
+  it("interrupts a pending CONNECT handshake, settles, and destroys the connection", async () => {
+    const guest = await startSilentGuest(false)
+    const opening = Effect.runPromise(
+      Effect.scoped(Effect.gen(function*() {
+        const channel = yield* GuestHttpChannel
+        return yield* channel.open({ vmId: "mvm-test0001", vsockSocket: guest.path })
+      })).pipe(
+        Effect.provide(GuestHttpChannelLive),
+        Effect.timeout({ milliseconds: 250 }),
+        Effect.exit
+      )
+    )
+    const connection = await guest.accepted
+    const connectionClosed = once(connection, "close")
+    // The red loop for this fix: while the handshake suspended inside an
+    // uninterruptible acquisition, this interrupt never settled at all.
+    expect((await opening)._tag).toBe("Failure")
+    await connectionClosed
+    expect(connection.destroyed).toBe(true)
+  })
+
+  it("fails a silent CONNECT handshake with the bounded handshake deadline", async () => {
+    // The deadline is armed against the platform clock inside the opener, and
+    // the peer is a real socket, so fake timers cannot drive this.
+    const guest = await startSilentGuest(false)
+    const startedAt = Date.now()
+    const fault = await Effect.runPromise(
+      Effect.scoped(Effect.gen(function*() {
+        const channel = yield* GuestHttpChannel
+        return yield* channel.open({ vmId: "mvm-test0001", vsockSocket: guest.path })
+      })).pipe(Effect.provide(GuestHttpChannelLive), Effect.flip)
+    )
+    const elapsed = Date.now() - startedAt
+    expect(fault._tag).toBe("GuestTransportFault")
+    expect(fault.reason).toContain("vsock handshake acknowledgement deadline exceeded")
+    expect(elapsed).toBeGreaterThanOrEqual(4_500)
+    expect(elapsed).toBeLessThan(10_000)
+  }, 20_000)
+
+  it("fails an acknowledged but silent service-control reply with the caller deadline", async () => {
+    const guest = await startSilentGuest(true)
+    const fault = await Effect.runPromise(
+      Effect.gen(function*() {
+        const service = yield* GuestServiceChannel
+        return yield* service.status({
+          vmId: "mvm-test0001",
+          vsockSocket: guest.path,
+          requestId: "deadline-1",
+          deadlineMs: 250
+        })
+      }).pipe(Effect.provide(GuestServiceChannelLive), Effect.flip)
+    )
+    expect(fault._tag).toBe("GuestTransportFault")
+    expect(fault.reason).toBe("guest service response deadline exceeded")
+  }, 15_000)
 })

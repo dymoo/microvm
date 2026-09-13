@@ -115,6 +115,14 @@ continues on that same socket. Fragmented acknowledgements are accumulated;
 bytes coalesced after the newline remain application data. No public API
 accepts a UDS path, vsock port, guest host, or guest TCP port.
 
+The host arms two deadlines of its own so a wedged guest can never suspend it:
+the CONNECT/ACK handshake is bounded at 5 s (reason
+`vsock handshake acknowledgement deadline exceeded`), and one web-service
+control reply is bounded at 15 s by default (reason
+`guest service response deadline exceeded`). Both are host transport faults:
+they fail the caller, and the VM is poisoned rather than left half-controlled.
+An interrupted channel open destroys its socket and settles the caller.
+
 ## HTTP preview v1
 
 The image manifest may declare exactly one immutable endpoint:

@@ -16,6 +16,7 @@ import {
   Firecracker,
   GuestExecChannel,
   GuestServiceChannel,
+  GuestTransportFault,
   type WebServiceState
 } from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
@@ -324,6 +325,40 @@ describe("static microVM cluster", () => {
       expect(serviceStart?.cwd).toBeUndefined()
       expect(serviceStart?.env).toBeUndefined()
       expect(serviceStart?.webPort).toBe(3_000)
+    })))
+  })
+
+  it("poisons the VM when a service-control exchange faults", async () => {
+    const root = await fixture(3_000)
+    const faultingService = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
+      start: (options) => Effect.fail(new GuestTransportFault({
+        vmId: options.vmId,
+        reason: "guest service response deadline exceeded"
+      })),
+      status: (options) => Effect.fail(new GuestTransportFault({
+        vmId: options.vmId,
+        reason: "guest service response deadline exceeded"
+      })),
+      stop: (options) => Effect.fail(new GuestTransportFault({
+        vmId: options.vmId,
+        reason: "guest service response deadline exceeded"
+      }))
+    }))
+
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const server = createServer()
+      yield* start(root, 1, server, firecrackerLayer()(server), guestLayer("unused"), faultingService)
+      const url = `http://127.0.0.1:${yield* listeningPort(server)}`
+      const cluster = yield* makeMicrovmCluster({ endpoints: [{ url, token: adminToken }] })
+      const sandbox = yield* cluster.create({ image: "node" })
+
+      const failed = yield* Effect.result(sandbox.startWebService({ argv: ["/usr/bin/node", "server.js"] }))
+      expect(Result.isFailure(failed)).toBe(true)
+
+      // A bounded deadline is a transport fault, not an application outcome:
+      // the VM must be unusable until it is destroyed, never half-controlled.
+      const poisoned = yield* Effect.result(sandbox.execute({ argv: ["/marker"] }))
+      expect(Result.isFailure(poisoned) && poisoned.failure._tag).toBe("VmPoisoned")
     })))
   })
 
