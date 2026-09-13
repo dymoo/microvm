@@ -1,6 +1,6 @@
 # Runtime artifact pins for Linux/KVM acceptance
 
-Research and acceptance status: 2026-09-12. This note records provenance, configuration evidence, and the successful hosted Linux/KVM acceptance run for the exact pinned inputs below. Runtime compatibility evidence does not change an artifact's provenance label.
+Research status: 2026-09-12; acceptance status: 2026-09-13. This note records provenance, configuration evidence, and the current successful hosted Linux/KVM acceptance run for the exact pinned inputs below. Runtime compatibility evidence does not change an artifact's provenance label.
 
 ## Trust labels
 
@@ -11,24 +11,27 @@ Research and acceptance status: 2026-09-12. This note records provenance, config
 
 ## Hosted acceptance evidence
 
-[`hosted-linux-acceptance` run 34714700955](https://github.com/dymoo/microvm/actions/runs/34714700955) completed successfully on commit [`92590474064f222f13483b3130b2abdb530958e0`](https://github.com/dymoo/microvm/commit/92590474064f222f13483b3130b2abdb530958e0). The uploaded [`hosted-acceptance-evidence` artifact (ID 10304307833)](https://github.com/dymoo/microvm/actions/runs/34714700955/artifacts/10304307833) has digest `sha256:440f2ef3681205c737c09759cf432894d74c935b880826f5c761830d3f7d993a`.
+[`hosted-linux-acceptance` run 34750139284](https://github.com/dymoo/microvm/actions/runs/34750139284) completed successfully on commit [`8e9c095625bc0a8b61b78d63adc77d52d233c003`](https://github.com/dymoo/microvm/commit/8e9c095625bc0a8b61b78d63adc77d52d233c003). The uploaded [`hosted-acceptance-evidence` artifact (ID 10315388428)](https://github.com/dymoo/microvm/actions/runs/34750139284/artifacts/10315388428) has digest `sha256:9fa626bf1fb082a3d47089876f1b752b24362385ed32cefb31eb946991abceaa`.
 
 The run observed:
 
-- 57/57 Linux Vitest tests, guest Go race tests, and the real `CID_LOCAL` rejection gate.
+- 81/81 Linux Vitest tests with zero skipped or failed, all guest Go race packages passing, and the real `CID_LOCAL` rejection gate passing.
 - A 2,048 MiB image and the jailed CID 2 guest protocol, including the idle request-header deadline and Node.js/Python execution.
-- Two-VM authorization, isolation, and execution bounds, followed by native teardown with no run-state or cgroup leftovers.
+- Two-VM authorization, isolation, and execution bounds; 52/52 hostile jailed-VM checks; and native teardown with no run-state or cgroup leftovers.
 
 The exact TOFU kernel digest `d8ced68bd61e27b6813e2c993cc53a4029c59e13210672180591c84109684fe4` booted and passed this scope. The result proves compatibility for this exact digest; it does not upgrade the digest's provenance or make the demonstration-only prebuilt kernel production-recommended.
 
 | GitHub-hosted Azure observation | Time |
 | --- | ---: |
-| Daemon cold start to listening | 723 ms |
-| First jailed VM create and readiness | 7,816 ms |
-| Guest protocol acceptance | 5,532 ms |
-| Two-VM acceptance | 26,671 ms |
+| Daemon cold start to listening | 657 ms |
+| First jailed VM create and readiness | 7,748 ms |
+| Guest protocol acceptance | 5,543 ms |
+| Two-VM acceptance | 26,360 ms |
+| Hostile jailed-VM abuse | 51,830 ms |
 
 These timings are one GitHub-hosted Azure observation, not a Proxmox latency or capacity benchmark.
+
+Residual scope is deliberate: disk pressure is bounded to 32 MiB, and the suite does not attempt full disk exhaustion, OOM or CPU starvation, kernel fuzzing or guest breakout, private-network, metadata, or host-vsock probing, or Proxmox qualification. None of those scenarios is claimed.
 
 ## Firecracker and jailer: use v1.17.0
 
