@@ -12,16 +12,12 @@ import {
 } from "node:http"
 import { request as httpsRequest } from "node:https"
 import { Transform, type Duplex, type TransformCallback } from "node:stream"
+import { HTTP_PREVIEW_LIMITS } from "./protocol.js"
 
-const MAX_HEADER_BYTES = 16 * 1024
-const MAX_HEADER_FIELDS = 64
-const MAX_TARGET_BYTES = 8 * 1024
-const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
-const RESPONSE_HEAD_TIMEOUT_MS = 120_000
-const UPLOAD_IDLE_TIMEOUT_MS = 30_000
-const MAX_STREAM_BUFFER_BYTES = 64 * 1024
-const MAX_UPGRADE_HEAD_BYTES = MAX_STREAM_BUFFER_BYTES
-const MAX_WEBSOCKET_MESSAGE_BYTES = 1024 * 1024
+/** A coalesced upgrade `head` larger than one framed stream buffer is refused. */
+const MAX_UPGRADE_HEAD_BYTES = HTTP_PREVIEW_LIMITS.frameBufferBytes
+/** Inbound bytes one refusal absorbs before it stops reading the socket. */
+const REFUSAL_DRAIN_BYTES = 64 * 1024
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 const HOP_BY_HOP: Readonly<Record<string, true>> = {
@@ -58,8 +54,8 @@ class WebSocketFrameValidator extends Transform {
 
   constructor(expectMasked: boolean) {
     super({
-      readableHighWaterMark: MAX_STREAM_BUFFER_BYTES,
-      writableHighWaterMark: MAX_STREAM_BUFFER_BYTES
+      readableHighWaterMark: HTTP_PREVIEW_LIMITS.frameBufferBytes,
+      writableHighWaterMark: HTTP_PREVIEW_LIMITS.frameBufferBytes
     })
     this.#expectMasked = expectMasked
   }
@@ -72,7 +68,7 @@ class WebSocketFrameValidator extends Transform {
           throw new Error("WebSocket continuation without fragmented message")
         }
         const aggregate = this.#fragmentedMessageBytes + payloadBytes
-        if (aggregate > MAX_WEBSOCKET_MESSAGE_BYTES) throw new Error("WebSocket message exceeds limit")
+        if (aggregate > HTTP_PREVIEW_LIMITS.maxWebSocketMessageBytes) throw new Error("WebSocket message exceeds limit")
         this.#fragmentedMessageBytes = final ? undefined : aggregate
         return
       }
@@ -81,7 +77,7 @@ class WebSocketFrameValidator extends Transform {
         if (this.#fragmentedMessageBytes !== undefined) {
           throw new Error("WebSocket data frame interrupted fragmented message")
         }
-        if (payloadBytes > MAX_WEBSOCKET_MESSAGE_BYTES) throw new Error("WebSocket message exceeds limit")
+        if (payloadBytes > HTTP_PREVIEW_LIMITS.maxWebSocketMessageBytes) throw new Error("WebSocket message exceeds limit")
         if (!final) this.#fragmentedMessageBytes = payloadBytes
         return
       case 8:
@@ -212,14 +208,14 @@ const parseTokens = (values: ReadonlyArray<string>): ReadonlyArray<string> =>
   values.flatMap((value) => value.split(",")).map((value) => value.trim().toLowerCase()).filter(Boolean)
 
 const collectHeaders = (rawHeaders: ReadonlyArray<string>): HeaderBag | undefined => {
-  if (rawHeaders.length % 2 !== 0 || rawHeaders.length / 2 > MAX_HEADER_FIELDS) return undefined
+  if (rawHeaders.length % 2 !== 0 || rawHeaders.length / 2 > HTTP_PREVIEW_LIMITS.maxHeaderFields) return undefined
   let bytes = 0
   const mutable = new Map<string, Array<string>>()
   for (let index = 0; index < rawHeaders.length; index += 2) {
     const name = rawHeaders[index]!
     const value = rawHeaders[index + 1]!
     bytes += Buffer.byteLength(name, "latin1") + Buffer.byteLength(value, "latin1") + 4
-    if (bytes > MAX_HEADER_BYTES) return undefined
+    if (bytes > HTTP_PREVIEW_LIMITS.maxHeaderBytes) return undefined
     try {
       validateHeaderName(name)
       validateHeaderValue(name, value)
@@ -256,7 +252,7 @@ const targetIsOriginForm = (target: string): boolean =>
   target.length > 0 &&
   target.startsWith("/") &&
   !target.startsWith("//") &&
-  Buffer.byteLength(target, "utf8") <= MAX_TARGET_BYTES &&
+  Buffer.byteLength(target, "utf8") <= HTTP_PREVIEW_LIMITS.maxTargetBytes &&
   !target.includes("#") &&
   !target.includes("\\") &&
   !/[\u0000-\u0020\u007f]/.test(target)
@@ -297,7 +293,7 @@ const admitOrdinaryRequest = (request: IncomingMessage): RequestAdmission | { re
   }
   const declaredBodyBytes = contentLength(headers)
   if (declaredBodyBytes === false) return { status: 400 }
-  if (declaredBodyBytes !== undefined && declaredBodyBytes > MAX_REQUEST_BODY_BYTES) return { status: 413 }
+  if (declaredBodyBytes !== undefined && declaredBodyBytes > HTTP_PREVIEW_LIMITS.maxRequestBodyBytes) return { status: 413 }
   if (headerValues(headers, "authorization").length > 1) return { status: 400 }
   return {
     target,
@@ -333,13 +329,6 @@ const sendError = (response: ServerResponse, status: number, close = false): voi
 }
 
 /**
- * Bounds how long a refused detached socket may stay open while its refusal
- * flushes, and how many inbound bytes a refusal absorbs before it stops reading.
- */
-const REFUSAL_DEADLINE_MS = 2_000
-const REFUSAL_DRAIN_BYTES = 64 * 1024
-
-/**
  * Answers a request Node delivered on a detached raw socket (a CONNECT, or an
  * upgrade the adapter refuses) with one final status line and closes it. The
  * client's bytes after the head are drained and dropped, never read into a
@@ -363,7 +352,7 @@ const socketError = (socket: Duplex, status: number): void => {
     drained += chunk.byteLength
     if (drained >= REFUSAL_DRAIN_BYTES) socket.pause()
   }
-  const deadline = setTimeout(() => socket.destroy(), REFUSAL_DEADLINE_MS)
+  const deadline = setTimeout(() => socket.destroy(), HTTP_PREVIEW_LIMITS.refusalDeadlineMs)
   deadline.unref()
   socket.once("close", () => {
     clearTimeout(deadline)
@@ -381,7 +370,7 @@ const socketError = (socket: Duplex, status: number): void => {
  */
 const refuseRequestInput = (request: IncomingMessage, response: ServerResponse, status: number): void => {
   let drained = 0
-  const deadline = setTimeout(() => request.destroy(), REFUSAL_DEADLINE_MS)
+  const deadline = setTimeout(() => request.destroy(), HTTP_PREVIEW_LIMITS.refusalDeadlineMs)
   deadline.unref()
   request.once("close", () => clearTimeout(deadline))
   request.on("data", (chunk: Buffer | string) => {
@@ -435,7 +424,7 @@ const upstreamRequest = (
     agent: false,
     ca: binding.ca,
     rejectUnauthorized: true,
-    maxHeaderSize: MAX_HEADER_BYTES
+    maxHeaderSize: HTTP_PREVIEW_LIMITS.maxHeaderBytes
   })
 }
 
@@ -557,7 +546,7 @@ export const makeSandboxHttpProxy = (binding: SandboxHttpProxyBinding): SandboxH
       headTimer = setTimeout(() => {
         responseHeadTimedOut = true
         outgoing.destroy(new Error("response head timeout"))
-      }, RESPONSE_HEAD_TIMEOUT_MS)
+      }, HTTP_PREVIEW_LIMITS.responseHeadMs)
       headTimer.unref()
     })
 
@@ -565,14 +554,14 @@ export const makeSandboxHttpProxy = (binding: SandboxHttpProxyBinding): SandboxH
     const resetUploadTimer = (): void => {
       if (!admission.hasBody) return
       clearTimeout(uploadTimer)
-      uploadTimer = setTimeout(() => outgoing.destroy(new Error("upload idle timeout")), UPLOAD_IDLE_TIMEOUT_MS)
+      uploadTimer = setTimeout(() => outgoing.destroy(new Error("upload idle timeout")), HTTP_PREVIEW_LIMITS.uploadIdleMs)
       uploadTimer.unref()
     }
     resetUploadTimer()
 
     request.on("data", (chunk: Buffer | string) => {
       bodyBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength
-      if (bodyBytes > MAX_REQUEST_BODY_BYTES) {
+      if (bodyBytes > HTTP_PREVIEW_LIMITS.maxRequestBodyBytes) {
         clearTimeout(uploadTimer)
         completed = true
         request.unpipe(outgoing)
@@ -650,7 +639,7 @@ export const makeSandboxHttpProxy = (binding: SandboxHttpProxyBinding): SandboxH
         completed = true
         outgoing.destroy(new Error("response head timeout"))
         socketError(socket, 504)
-      }, RESPONSE_HEAD_TIMEOUT_MS)
+      }, HTTP_PREVIEW_LIMITS.responseHeadMs)
       headTimer.unref()
     })
 

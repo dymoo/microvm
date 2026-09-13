@@ -50,6 +50,37 @@ export const MAX_ENV_TOTAL_BYTES = 65_536
 export const MAX_CWD_BYTES = 4096
 
 // ---------------------------------------------------------------------------
+// HTTP preview ingress bounds.
+//
+// These numbers are policy, not validation: the public Node adapter
+// (`src/http-proxy.ts`) and the daemon data plane (`src/daemon-http-proxy.ts`)
+// each enforce them with their own independent parsing, so a mistake in one hop
+// is caught by the other rather than shared. Only the numbers live here, so the
+// two hops cannot drift apart silently.
+// ---------------------------------------------------------------------------
+
+export const HTTP_PREVIEW_LIMITS = {
+  /** Longest accepted origin-form request target, in bytes. */
+  maxTargetBytes: 8 * 1024,
+  /** Largest accepted request header block, in bytes. */
+  maxHeaderBytes: 16 * 1024,
+  /** Largest accepted number of request header fields. */
+  maxHeaderFields: 64,
+  /** Largest accepted request body, in bytes. */
+  maxRequestBodyBytes: 16 * 1024 * 1024,
+  /** Quiet period, in ms, after the last upload byte before an upload is abandoned. */
+  uploadIdleMs: 30_000,
+  /** Deadline, in ms, for the guest application's response head. */
+  responseHeadMs: 120_000,
+  /** Bound, in ms, on one refused detached socket flushing before it is destroyed. */
+  refusalDeadlineMs: 2_000,
+  /** Largest aggregate WebSocket message, in bytes. */
+  maxWebSocketMessageBytes: 1024 * 1024,
+  /** Read/write high-water mark for one framed WebSocket direction, in bytes. */
+  frameBufferBytes: 64 * 1024
+} as const
+
+// ---------------------------------------------------------------------------
 // Shared primitive schemas
 // ---------------------------------------------------------------------------
 

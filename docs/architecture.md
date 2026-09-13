@@ -6,7 +6,7 @@ One Firecracker runtime, three credential scopes, four trust boundaries.
 
 | Module | Interface (what callers know) | Implementation (what it hides) |
 | --- | --- | --- |
-| `src/protocol.ts` | `MicrovmRpc` group, wire schemas, `Auth`/`SandboxContext` seam, fixed channel ports, request bounds | Everything about what crosses the wire |
+| `src/protocol.ts` | `MicrovmRpc` group, wire schemas, `Auth`/`SandboxContext` seam, fixed channel ports, request bounds, `HTTP_PREVIEW_LIMITS` | Everything about what crosses the wire |
 | `src/auth.ts` | `CredentialStore`, `authLayer`, `requireAdmin`/`authorizeVm`, `clientAuthLayer` | Digest-only admin, sandbox-control, and VM-bound HTTP-ingress capabilities |
 | `src/host.ts` | `HostPrereqs`, `ImageAllowlist`, immutable image HTTP endpoint, diagnostic state evidence, allocators | Trusted-path posture, chroot layout, atomic writes, CID/UID ranges |
 | `src/vsock.ts` | Fixed-purpose exec, HTTP, and service socket openers | Fragment-safe bounded Firecracker UDS acknowledgement parsing |

@@ -12,26 +12,19 @@ import {
 } from "node:http"
 import { isIP, type Socket } from "node:net"
 import { Duplex, Transform, pipeline, type TransformCallback } from "node:stream"
+import { HTTP_PREVIEW_LIMITS } from "./protocol.js"
 
 export const DAEMON_HTTP_ROUTE_PREFIX = "/http/v1/vms/"
 
-export const DAEMON_HTTP_LIMITS = {
-  maxTargetBytes: 8 * 1024,
-  maxHeaderBytes: 16 * 1024,
-  maxHeaders: 64,
-  maxRequestBodyBytes: 16 * 1024 * 1024,
-  uploadIdleMs: 30_000,
-  responseHeadMs: 120_000,
-  maxWebSocketMessageBytes: 1024 * 1024,
-  /**
-   * The one idle policy of the ingress data plane: an ordinary response, an SSE
-   * stream, or an upgraded tunnel that carries no bytes in either direction for
-   * this long is closed. Traffic in either direction resets it, closure is an
-   * ordinary close (the VM stays healthy), and no message is buffered to police
-   * it because callers touch the guard from their byte path.
-   */
-  idleMs: 300_000
-} as const
+/**
+ * The one idle policy of the ingress data plane: an ordinary response, an SSE
+ * stream, or an upgraded tunnel that carries no bytes in either direction for
+ * this long is closed. Traffic in either direction resets it, closure is an
+ * ordinary close (the VM stays healthy), and no message is buffered to police
+ * it because callers touch the guard from their byte path. Only this hop guards
+ * idleness, so the value lives here rather than in the shared bounds.
+ */
+export const INGRESS_IDLE_MS = 300_000
 
 export interface IngressIdleGuard {
   /** Records traffic in either direction and restarts the idle window. */
@@ -144,9 +137,6 @@ const statusForAdmission = (error: unknown): number =>
         : 503
     : 503
 
-/** Bounds how long a refused detached socket may stay open while it flushes. */
-const REFUSAL_DEADLINE_MS = 2_000
-
 const errorBody = (status: number): Buffer =>
   Buffer.from(`${STATUS_CODES[status] ?? "Request Failed"}\n`, "utf8")
 
@@ -185,7 +175,7 @@ const sendSocketError = (socket: Duplex, status: number): void => {
   socket.end(Buffer.concat([Buffer.from(lines.join("\r\n"), "latin1"), body]))
   // A refusal must not linger half-open while it flushes: the detached socket is
   // destroyed at a fixed bound if the peer neither reads nor closes.
-  const deadline = setTimeout(() => socket.destroy(), REFUSAL_DEADLINE_MS)
+  const deadline = setTimeout(() => socket.destroy(), HTTP_PREVIEW_LIMITS.refusalDeadlineMs)
   deadline.unref()
   socket.once("close", () => clearTimeout(deadline))
 }
@@ -263,7 +253,7 @@ const appendHeader = (headers: OutgoingHttpHeaders, name: string, value: string)
 
 const validateTarget = (request: IncomingMessage): { readonly vmId: string; readonly target: string } => {
   const raw = request.url
-  if (raw === undefined || Buffer.byteLength(raw, "utf8") > DAEMON_HTTP_LIMITS.maxTargetBytes) {
+  if (raw === undefined || Buffer.byteLength(raw, "utf8") > HTTP_PREVIEW_LIMITS.maxTargetBytes) {
     throw new PublicRequestError(400)
   }
   if (!raw.startsWith(DAEMON_HTTP_ROUTE_PREFIX) || /[\u0000-\u0020\u007f#]/.test(raw)) {
@@ -290,7 +280,7 @@ const parseBearer = (pairs: HeaderPairs): string => {
 }
 
 const validateRawHeaders = (request: IncomingMessage, pairs: HeaderPairs): void => {
-  if (pairs.length > DAEMON_HTTP_LIMITS.maxHeaders) throw new PublicRequestError(400)
+  if (pairs.length > HTTP_PREVIEW_LIMITS.maxHeaderFields) throw new PublicRequestError(400)
   let bytes = 0
   for (const [name, value] of pairs) {
     bytes += Buffer.byteLength(name, "latin1") + Buffer.byteLength(value, "latin1") + 4
@@ -299,7 +289,7 @@ const validateRawHeaders = (request: IncomingMessage, pairs: HeaderPairs): void 
     }
     if (name.toLowerCase().startsWith("microvm-")) throw new PublicRequestError(400)
   }
-  if (bytes > DAEMON_HTTP_LIMITS.maxHeaderBytes) throw new PublicRequestError(400)
+  if (bytes > HTTP_PREVIEW_LIMITS.maxHeaderBytes) throw new PublicRequestError(400)
   if (request.method === undefined || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(request.method)) {
     throw new PublicRequestError(400)
   }
@@ -350,7 +340,7 @@ const validateFraming = (pairs: HeaderPairs): { readonly contentLength: number |
     if (!/^(0|[1-9][0-9]*)$/.test(raw)) throw new PublicRequestError(400)
     contentLength = Number(raw)
     if (!Number.isSafeInteger(contentLength)) throw new PublicRequestError(400)
-    if (contentLength > DAEMON_HTTP_LIMITS.maxRequestBodyBytes) throw new PublicRequestError(413)
+    if (contentLength > HTTP_PREVIEW_LIMITS.maxRequestBodyBytes) throw new PublicRequestError(413)
   }
   let chunked = false
   if (transferEncodingValues.length === 1) {
@@ -452,7 +442,7 @@ const validateWebSocketRequest = (request: IncomingMessage): ValidatedWebSocket 
 
 const guestResponseHeaders = (response: IncomingMessage): OutgoingHttpHeaders => {
   const pairs = headerPairs(response)
-  if (pairs.length > DAEMON_HTTP_LIMITS.maxHeaders) throw new PublicRequestError(502)
+  if (pairs.length > HTTP_PREVIEW_LIMITS.maxHeaderFields) throw new PublicRequestError(502)
   const nominated = connectionTokens(pairs)
   const headers: OutgoingHttpHeaders = {}
   for (const [name, value] of pairs) {
@@ -498,7 +488,7 @@ const writeRequestBody = (
   }
   const armTimer = (): void => {
     clearTimer()
-    timer = setTimeout(() => fail(408), DAEMON_HTTP_LIMITS.uploadIdleMs)
+    timer = setTimeout(() => fail(408), HTTP_PREVIEW_LIMITS.uploadIdleMs)
     timer.unref()
   }
   const cleanup = (): void => {
@@ -519,7 +509,7 @@ const writeRequestBody = (
   const onData = (chunk: Buffer): void => {
     armTimer()
     bytes += chunk.byteLength
-    if (bytes > DAEMON_HTTP_LIMITS.maxRequestBodyBytes) {
+    if (bytes > HTTP_PREVIEW_LIMITS.maxRequestBodyBytes) {
       fail(413)
       return
     }
@@ -560,7 +550,7 @@ const validateGuestUpgrade = (
 ): HeaderPairs => {
   if (response.statusCode !== 101) throw new PublicRequestError(502)
   const pairs = headerPairs(response)
-  if (pairs.length > DAEMON_HTTP_LIMITS.maxHeaders) throw new PublicRequestError(502)
+  if (pairs.length > HTTP_PREVIEW_LIMITS.maxHeaderFields) throw new PublicRequestError(502)
   if (valuesOf(pairs, "upgrade").length !== 1 ||
     valuesOf(pairs, "upgrade")[0]!.trim().toLowerCase() !== "websocket" ||
     !connectionTokens(pairs).has("upgrade")) {
@@ -611,7 +601,10 @@ class WebSocketFrameGuard extends Transform {
     private readonly requireMasked: boolean,
     private readonly onTraffic?: () => void
   ) {
-    super({ readableHighWaterMark: 64 * 1024, writableHighWaterMark: 64 * 1024 })
+    super({
+      readableHighWaterMark: HTTP_PREVIEW_LIMITS.frameBufferBytes,
+      writableHighWaterMark: HTTP_PREVIEW_LIMITS.frameBufferBytes
+    })
   }
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
@@ -670,7 +663,7 @@ class WebSocketFrameGuard extends Transform {
             this.fragmentedBytes = length
             this.fragmented = !fin
           }
-          if (this.fragmentedBytes > DAEMON_HTTP_LIMITS.maxWebSocketMessageBytes) {
+          if (this.fragmentedBytes > HTTP_PREVIEW_LIMITS.maxWebSocketMessageBytes) {
             throw new Error("websocket message is too large")
           }
           if (fin) this.fragmentedBytes = 0
@@ -792,11 +785,11 @@ export const makeDaemonHttpProxy = (dependencies: DaemonHttpProxyDependencies): 
             method: request.method,
             path: validated.target,
             port: 80,
-            maxHeaderSize: DAEMON_HTTP_LIMITS.maxHeaderBytes,
+            maxHeaderSize: HTTP_PREVIEW_LIMITS.maxHeaderBytes,
             setHost: false
           })
           upstream.once("finish", () => {
-            headTimer = setTimeout(() => fail(504), DAEMON_HTTP_LIMITS.responseHeadMs)
+            headTimer = setTimeout(() => fail(504), HTTP_PREVIEW_LIMITS.responseHeadMs)
             headTimer.unref()
           })
           upstream.once("error", () => fail(502))
@@ -824,7 +817,7 @@ export const makeDaemonHttpProxy = (dependencies: DaemonHttpProxyDependencies): 
               response.writeHead(guestResponse.statusCode ?? 502, headers)
               if (isEventStream(guestResponse.headers)) response.flushHeaders()
               // One idle policy for every ingress response: guest bytes reset it.
-              idle = ingressIdleGuard(DAEMON_HTTP_LIMITS.idleMs, () => {
+              idle = ingressIdleGuard(INGRESS_IDLE_MS, () => {
                 guestResponse.destroy()
                 response.destroy()
                 finish()
@@ -958,10 +951,10 @@ export const makeDaemonHttpProxy = (dependencies: DaemonHttpProxyDependencies): 
             method: "GET",
             path: validated.target,
             port: 80,
-            maxHeaderSize: DAEMON_HTTP_LIMITS.maxHeaderBytes,
+            maxHeaderSize: HTTP_PREVIEW_LIMITS.maxHeaderBytes,
             setHost: false
           })
-          timer = setTimeout(() => refuse(new PublicRequestError(504)), DAEMON_HTTP_LIMITS.responseHeadMs)
+          timer = setTimeout(() => refuse(new PublicRequestError(504)), HTTP_PREVIEW_LIMITS.responseHeadMs)
           timer.unref()
           upstream.once("error", () => refuse(new PublicRequestError(502)))
           upstream.once("response", (guestResponse) => {
@@ -976,7 +969,7 @@ export const makeDaemonHttpProxy = (dependencies: DaemonHttpProxyDependencies): 
               publicCommitted = true
               // One idle policy for the tunnel too: frames in either direction
               // reset it, and an idle tunnel is closed like any other exchange.
-              idle = ingressIdleGuard(DAEMON_HTTP_LIMITS.idleMs, () => terminateSilently())
+              idle = ingressIdleGuard(INGRESS_IDLE_MS, () => terminateSilently())
               const toGuest = new WebSocketFrameGuard(true, () => idle?.touch())
               const toPublic = new WebSocketFrameGuard(false, () => idle?.touch())
               if (head.byteLength > 0) toGuest.write(head)

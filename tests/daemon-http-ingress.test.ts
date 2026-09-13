@@ -17,7 +17,7 @@ import { Effect, Layer } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { makeMicrovmClient } from "../src/client.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
-import { DAEMON_HTTP_LIMITS, ingressIdleGuard } from "../src/daemon-http-proxy.js"
+import { INGRESS_IDLE_MS, ingressIdleGuard } from "../src/daemon-http-proxy.js"
 import {
   Firecracker,
   GuestExecChannel,
@@ -669,30 +669,29 @@ describe("daemon HTTP ingress lifecycle bounds", () => {
 })
 
 describe("ingress idle policy", () => {
-  it("arms one fixed window, resets on traffic, and stops after clear", () => {
+  it("closes a silent exchange at the documented five minutes, resets on traffic, and stops after clear", () => {
     vi.useFakeTimers()
     try {
+      // Five minutes is the documented ingress contract; the guard must honour
+      // exactly that window rather than the constant merely equalling it.
+      const documentedIdleMs = 300_000
       let closures = 0
-      const guard = ingressIdleGuard(DAEMON_HTTP_LIMITS.idleMs, () => {
+      const guard = ingressIdleGuard(INGRESS_IDLE_MS, () => {
         closures++
       })
-      vi.advanceTimersByTime(DAEMON_HTTP_LIMITS.idleMs - 1_000)
+      vi.advanceTimersByTime(documentedIdleMs - 1_000)
       expect(closures).toBe(0)
       guard.touch()
-      vi.advanceTimersByTime(DAEMON_HTTP_LIMITS.idleMs - 1_000)
+      vi.advanceTimersByTime(documentedIdleMs - 1_000)
       expect(closures).toBe(0)
       vi.advanceTimersByTime(2_000)
       expect(closures).toBe(1)
       guard.clear()
-      vi.advanceTimersByTime(DAEMON_HTTP_LIMITS.idleMs * 2)
+      vi.advanceTimersByTime(documentedIdleMs * 2)
       expect(closures).toBe(1)
     } finally {
       vi.useRealTimers()
     }
-  })
-
-  it("documents the five-minute response and tunnel idle contract", () => {
-    expect(DAEMON_HTTP_LIMITS.idleMs).toBe(300_000)
   })
 })
 
