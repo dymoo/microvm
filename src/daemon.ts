@@ -123,6 +123,26 @@ export class DaemonRuntimeError extends Schema.TaggedError<DaemonRuntimeError>()
   reason: Schema.String
 }) {}
 
+/**
+ * Shutdown diagnostics must survive process exit. The platform runtime calls
+ * `process.exit` immediately after the fiber's teardown, so a line queued
+ * through the usual logger can be dropped exactly when it matters most; each
+ * shutdown line is therefore written and flushed before the finalizer continues.
+ */
+const logShutdown = (line: string): Effect.Effect<void> =>
+  Effect.callback<void>((resume) => {
+    process.stdout.write(`[daemon] shutdown: ${line}\n`, () => resume(Effect.void))
+  })
+
+const failureDetail = (failure: unknown): string => {
+  const tag = typeof failure === "object" && failure !== null && "_tag" in failure
+    ? String(failure._tag)
+    : "Error"
+  const reason = typeof failure === "object" && failure !== null && "reason" in failure
+    ? String(failure.reason)
+    : String(failure)
+  return `${tag}: ${reason}`
+}
 
 const expandEnvironment = (value: unknown): unknown => {
   if (typeof value === "string") {
@@ -666,6 +686,19 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         return true
       })
 
+    /**
+     * Reports state that survived a teardown which claimed success, so a leak
+     * names itself instead of surfacing later as a CI leftover.
+     */
+    const proveReleased = (record: VmRecord): Effect.Effect<void, DaemonRuntimeError> => {
+      const remaining = [record.layout.vmDir, record.layout.cgroupDir].filter((path) => existsSync(path))
+      return remaining.length === 0
+        ? Effect.void
+        : Effect.fail(new DaemonRuntimeError({
+          reason: `VM release unproven: ${remaining.join(" and ")} still present after teardown`
+        }))
+    }
+
     const destroyRecord = (
       record: VmRecord
     ): Effect.Effect<DestroyResult, DaemonRuntimeError | VmTeardownFault> =>
@@ -696,6 +729,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
                   reason: "HTTP connection scopes remained active after VM teardown"
                 }))
               }
+              yield* proveReleased(record)
               const removed = yield* forgetRecord(record)
               return new DestroyResult({ vmId: record.info.vmId, destroyed: removed })
             }))
@@ -1141,18 +1175,23 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
     const shutdown = Effect.gen(function*() {
       for (const cancel of Array.from(bootCancels)) yield* cancel()
       const live = yield* mutex.withPermit(Effect.sync(() => Array.from(records.values())))
+      const held = yield* mutex.withPermit(Effect.sync(() => Array.from(quarantines.values())))
+      yield* logShutdown(
+        `starting with ${live.length} live VM(s) and ${held.length} quarantined VM(s)`
+      )
       for (const record of live) {
         const outcome = yield* Effect.result(destroyRecord(record))
-        if (Result.isFailure(outcome)) {
-          yield* Effect.logError(`failed to stop ${record.info.vmId} during daemon shutdown`, outcome.failure)
-        }
+        yield* logShutdown(Result.isFailure(outcome)
+          ? `failed to stop ${record.info.vmId} - ${failureDetail(outcome.failure)}`
+          : `stopped ${record.info.vmId}`)
       }
-      const held = yield* mutex.withPermit(Effect.sync(() => Array.from(quarantines.values())))
       for (const quarantine of held) {
-        yield* cleanupQuarantine(quarantine).pipe(
-          Effect.catchCause((cause) => Effect.logError(`failed to clean ${quarantine.vmId} during shutdown`, cause))
-        )
+        const outcome = yield* Effect.result(cleanupQuarantine(quarantine))
+        yield* logShutdown(Result.isFailure(outcome)
+          ? `failed to clean quarantined ${quarantine.vmId} - ${failureDetail(outcome.failure)}`
+          : `cleaned quarantined ${quarantine.vmId}`)
       }
+      yield* logShutdown("complete")
     })
     yield* Scope.addFinalizer(daemonScope, shutdown)
     yield* Effect.forever(
