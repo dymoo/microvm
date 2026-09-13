@@ -6,6 +6,12 @@ const PROBE_DEADLINE_MS = 5_000
 
 const timedOut = (label, milliseconds) => new Error(`${label} exceeded ${milliseconds}ms`)
 
+export const assertRevokedIngress = (status) => {
+  if (status !== 401) {
+    throw new Error(`revoked ingress returned HTTP ${status}`)
+  }
+}
+
 /**
  * Reads one HTTP status under an absolute wall-clock deadline. The timer is
  * armed before Node creates the request, so stalled connection setup is bounded.

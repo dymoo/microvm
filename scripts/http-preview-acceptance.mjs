@@ -7,7 +7,7 @@ import { request as httpRequest } from "node:http"
 import { connect } from "node:net"
 import { Effect, Exit, Result } from "effect"
 import { makeMicrovmClient, makeMicrovmCluster } from "../dist/index.js"
-import { listenTrustedProxy, rawStatus, requestStatus } from "./http-preview-proxy.mjs"
+import { assertRevokedIngress, listenTrustedProxy, rawStatus, requestStatus } from "./http-preview-proxy.mjs"
 import { guestProtocolService } from "./http-preview-fixture.mjs"
 
 let currentOperation = "initialization"
@@ -519,7 +519,7 @@ const program = Effect.scoped(Effect.gen(function*() {
 
   step("destroy closed active SSE and websocket streams")
   const revoked = yield* Effect.promise(() => fetchBounded("revoked ingress", `${publicServer.origin}/`))
-  assert([401, 404, 503].includes(revoked.status), `revoked ingress returned HTTP ${revoked.status}`)
+  assertRevokedIngress(revoked.status)
   step("revoked ingress refused")
   assert(
     Result.isFailure(yield* Effect.result(boundedRpc("service status after destroy", protocolService.status()))),

@@ -10,7 +10,7 @@ import {
 import { connect, Socket } from "node:net"
 import { describe, expect, it } from "vitest"
 import { makeSandboxHttpProxy } from "../src/http-proxy.js"
-import { listenTrustedProxy, rawStatus, requestStatus } from "../scripts/http-preview-proxy.mjs"
+import { assertRevokedIngress, listenTrustedProxy, rawStatus, requestStatus } from "../scripts/http-preview-proxy.mjs"
 
 const WEBSOCKET_KEY = "MDEyMzQ1Njc4OWFiY2RlZg=="
 const RELEASE_LIMIT_MS = 500
@@ -111,6 +111,22 @@ describe("trusted preview proxy refusals", () => {
     } finally {
       await proxy.close()
       await closeServer(daemon)
+    }
+  })
+
+  it("distinguishes revoked credentials from temporary ingress unavailability", async () => {
+    const server = createServer((request, response) => {
+      response.writeHead(request.url === "/revoked" ? 401 : 503)
+      response.end()
+    })
+    const port = await listenOnLoopback(server)
+    try {
+      const revoked = await requestStatus("revoked credential probe", `http://127.0.0.1:${port}`, "GET", "/revoked")
+      expect(() => assertRevokedIngress(revoked)).not.toThrow()
+      const unavailable = await requestStatus("unavailable ingress probe", `http://127.0.0.1:${port}`, "GET", "/unavailable")
+      expect(() => assertRevokedIngress(unavailable)).toThrow("revoked ingress returned HTTP 503")
+    } finally {
+      await closeServer(server)
     }
   })
 

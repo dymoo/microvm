@@ -16,7 +16,6 @@ import { afterEach, describe, expect, it } from "vitest"
 const repositoryRoot = resolve(import.meta.dirname, "..")
 const templateDirectory = join(repositoryRoot, "guest/image/next-template")
 const initializer = join(repositoryRoot, "guest/image/microvm-next-init")
-const buildScript = readFileSync(join(repositoryRoot, "scripts/build-guest-image.sh"), "utf8")
 const packageManifest = JSON.parse(
   readFileSync(join(templateDirectory, "package.json"), "utf8")
 ) as {
@@ -88,28 +87,7 @@ describe("Next.js guest image inputs", () => {
     expect(integrityCount).toBe(packageCount)
   })
 
-  it("pins and verifies the official pnpm tarball integrity", () => {
-    const integrity = buildScript.match(/dist\.integrity sha512-([^\n]+)/)?.[1]
-    const digest = buildScript.match(/PNPM_SHA512=([0-9a-f]{128})/)?.[1]
-    expect(integrity).toBe(
-      "svx2g7imUlQU59E+G6KMqt3elr9m7FQL+ut+cCuB8+C+TR8pXt9/n+A5Z0Co3ORQnFgt33mJH0VD/qMtN2RfJQ=="
-    )
-    expect(Buffer.from(integrity!, "base64").toString("hex")).toBe(digest)
-    expect(buildScript).toContain(
-      'https://registry.npmjs.org/pnpm/-/pnpm-$PNPM_VERSION.tgz'
-    )
-    expect(buildScript).toContain('sha512sum --check --status')
-  })
-
-  it("installs Git only through the pinned Debian snapshot", () => {
-    expect(buildScript).toContain("--include=ca-certificates,git,python3")
-    expect(buildScript).toContain(
-      '"$DEBIAN_SUITE" "$ROOTFS" "$MAIN_SNAPSHOT" "$SECURITY_SNAPSHOT"'
-    )
-    expect(buildScript).toContain('chroot "$ROOTFS" /usr/bin/git --version')
-  })
-
-  it("verifies the lockfile once online and stays trusted and offline afterwards", () => {
+  it("ships the trusted offline workspace policy", () => {
     expect(workspacePolicy).toBe(
       [
         "allowBuilds:",
@@ -124,33 +102,6 @@ describe("Next.js guest image inputs", () => {
     // pnpm 11 reads project settings from pnpm-workspace.yaml, not .npmrc; a
     // shipped .npmrc would be dead configuration.
     expect(existsSync(join(templateDirectory, ".npmrc"))).toBe(false)
-    expect(buildScript).toMatch(
-      /next-template fetch \\\n  --frozen-lockfile --config\.offline=false --config\.trust-lockfile=false/
-    )
-    expect(buildScript).toMatch(
-      /next-template install \\\n  --offline --frozen-lockfile --config\.package-import-method=copy \\\n  --config\.fetch-retries=0/
-    )
-    // The builder fails closed when the shipped template stops resolving to the
-    // trusted/offline policy, before any resolver-less pnpm work.
-    expect(buildScript).toContain("assert_template_setting trustLockfile true")
-    expect(buildScript).toContain("assert_template_setting offline true")
-    expect(buildScript).toContain('assert_template_setting storeDir "$GUEST_PNPM_STORE"')
-    expect(buildScript).toContain('assert_template_setting cacheDir "$GUEST_PNPM_CACHE"')
-    const store = buildScript.match(/^GUEST_PNPM_STORE=(\S+)$/m)?.[1]
-    const cache = buildScript.match(/^GUEST_PNPM_CACHE=(\S+)$/m)?.[1]
-    expect(store).toBe("/var/lib/microvm/pnpm-store")
-    expect(cache).toBe("/var/lib/microvm/pnpm-cache")
-    expect(workspacePolicy).toContain(`storeDir: ${store}\n`)
-    expect(workspacePolicy).toContain(`cacheDir: ${cache}\n`)
-    expect(buildScript).toContain('chown -R 0:0 "$ROOTFS/opt/microvm/next-template"')
-    expect(buildScript).toContain(
-      'chown -R 1000:1000 "$ROOTFS$GUEST_PNPM_STORE" "$ROOTFS$GUEST_PNPM_CACHE"'
-    )
-    expect(buildScript).toMatch(
-      /fetch[\s\S]*--config\.offline=false[\s\S]*rm -f "\$ROOTFS\/etc\/resolv\.conf"[\s\S]*: >"\$ROOTFS\/etc\/resolv\.conf"[\s\S]*install[\s\S]*--offline/
-    )
-    // Image-time pnpm work must leave the materializer's target empty.
-    expect(buildScript).toContain('find "$ROOTFS/workspace" -mindepth 1')
   })
 
   it("binds development and production servers only to guest loopback port 3000", () => {

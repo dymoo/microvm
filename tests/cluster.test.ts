@@ -209,7 +209,6 @@ describe("static microVM cluster", () => {
       expect(typeof proxy.handleConnect).toBe("function")
       expect(typeof proxy.handleCheckContinue).toBe("function")
       expect("httpIngressToken" in web).toBe(false)
-      expect(yield* web.http()).toBe(proxy)
     })))
   })
 

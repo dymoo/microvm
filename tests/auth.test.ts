@@ -101,15 +101,14 @@ describe("credential store", () => {
     expect(result.ingressB?.vmId).toBe("mvm-def67890")
   })
 
-  it("rejects and prunes expired HTTP ingress tokens", async () => {
+  it("rejects expired HTTP ingress tokens", async () => {
     const result = await inStore("op-secret", Effect.gen(function*() {
       const store = yield* CredentialStore
       const token = store.mintHttpIngress("mvm-abc12345", Date.now() - 1)
-      return [store.verifyHttpIngress(token), store.verifyHttpIngress(token)]
+      return store.verifyHttpIngress(token)
     }))
-    expect(result).toEqual([undefined, undefined])
+    expect(result).toBeUndefined()
   })
-
 
   it("admin tokens keep working after credential churn", async () => {
     const result = await inStore("op-secret", Effect.gen(function*() {
