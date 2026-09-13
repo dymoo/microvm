@@ -373,6 +373,25 @@ const socketError = (socket: Duplex, status: number): void => {
   socket.end(Buffer.concat([head, body]))
 }
 
+/**
+ * Refuses a request whose body is still arriving. The refusal closes the
+ * connection, and the input is absorbed only up to the drain cap (or the
+ * refusal deadline) before the socket is destroyed, so a rejected body can
+ * never keep a trusted server's socket draining under Node's broad defaults.
+ */
+const refuseRequestInput = (request: IncomingMessage, response: ServerResponse, status: number): void => {
+  let drained = 0
+  const deadline = setTimeout(() => request.destroy(), REFUSAL_DEADLINE_MS)
+  deadline.unref()
+  request.once("close", () => clearTimeout(deadline))
+  request.on("data", (chunk: Buffer | string) => {
+    drained += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength
+    if (drained >= REFUSAL_DRAIN_BYTES) request.pause()
+  })
+  sendError(response, status, true)
+  request.resume()
+}
+
 const terminateDuplex = (socket: Duplex): void => {
   const resetAndDestroy = (socket as Duplex & { readonly resetAndDestroy?: () => void }).resetAndDestroy
   if (resetAndDestroy === undefined) {
@@ -518,8 +537,7 @@ export const makeSandboxHttpProxy = (binding: SandboxHttpProxyBinding): SandboxH
   const handleRequest: RequestListener = (request, response) => {
     const admission = admitOrdinaryRequest(request)
     if ("status" in admission) {
-      request.resume()
-      sendError(response, admission.status)
+      refuseRequestInput(request, response, admission.status)
       return
     }
 
@@ -559,8 +577,7 @@ export const makeSandboxHttpProxy = (binding: SandboxHttpProxyBinding): SandboxH
         completed = true
         request.unpipe(outgoing)
         outgoing.destroy()
-        request.resume()
-        sendError(response, 413)
+        refuseRequestInput(request, response, 413)
         return
       }
       resetUploadTimer()
@@ -731,8 +748,7 @@ export const makeSandboxHttpProxy = (binding: SandboxHttpProxyBinding): SandboxH
   // the fallback keeps the refusal total instead of ever continuing.
   const handleCheckContinue: RequestListener = (request, response) => {
     const admission = admitOrdinaryRequest(request)
-    request.resume()
-    sendError(response, "status" in admission ? admission.status : 417, true)
+    refuseRequestInput(request, response, "status" in admission ? admission.status : 417)
   }
 
   return { handleRequest, handleUpgrade, handleConnect, handleCheckContinue }

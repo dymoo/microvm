@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { once } from "node:events"
 import {
   createServer,
   get,
@@ -504,6 +505,42 @@ describe("SandboxHttpProxy refused semantics", () => {
     expect((await exchange(test.publicOrigin, "/ordinary")).body).toBe("ok")
     expect(test.daemonRequests()).toBe(1)
   })
+})
+
+describe("SandboxHttpProxy refusal pressure", () => {
+  it("refuses an over-limit body without draining it or holding the socket", async () => {
+    const test = await harness((_request, response) => response.end("unexpected"))
+    const socket = connect({ host: "127.0.0.1", port: test.publicPort })
+    const chunks: Array<Buffer> = []
+    const received = Promise.withResolvers<string>()
+    const deadline = setTimeout(() => received.reject(new Error("no refusal within 2000ms")), 2_000)
+    deadline.unref()
+    const closed = Promise.withResolvers<void>()
+    socket.on("data", (chunk) => {
+      chunks.push(chunk)
+      const text = Buffer.concat(chunks).toString("latin1")
+      if (text.includes("\r\n\r\n")) received.resolve(text)
+    })
+    socket.once("error", received.reject)
+    socket.once("close", () => {
+      clearTimeout(deadline)
+      closed.resolve()
+    })
+    await once(socket, "connect")
+    // Declare (and never finish) a body far past the adapter's cap: the refusal
+    // must be immediate, must close the connection, and must not leave the
+    // trusted server draining an attacker-sized body.
+    socket.write(
+      "POST /submit HTTP/1.1\r\nHost: preview.test\r\n" +
+      `Content-Length: ${16 * 1024 * 1024 + 1}\r\n` +
+      "Content-Type: application/octet-stream\r\n\r\n"
+    )
+    const refusal = await received.promise
+    expect(refusal).toContain(" 413 ")
+    expect(refusal.toLowerCase()).toContain("connection: close")
+    await closed.promise
+    expect(socket.destroyed).toBe(true)
+  }, 20_000)
 })
 
 describe("SandboxHttpProxy target and header safety", () => {

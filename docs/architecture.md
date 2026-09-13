@@ -68,6 +68,12 @@ from either higher-level consumer.
   HTTP/SSE/WebSocket leases, tears down Firecracker, and proves those leases
   closed before it revokes credentials and reports success. Unproven teardown
   is `DestroyUncertain`.
+- **Independent validation at every boundary.** The public adapter, the daemon
+  ingress, and the guest proxy each validate the same request, frame, and
+  handshake rules rather than sharing one validator. That duplication is
+  deliberate defence in depth: a bug in one boundary's parser must not become
+  the next boundary's trust assumption, and each layer's refusals stay
+  observable on its own. Do not de-duplicate these validators.
 - **No blind retries.** `create`, exec, service control, and individual HTTP
   exchanges are never replayed. Exec interruption poisons and destroys the VM
   instead of leaving unowned work running.

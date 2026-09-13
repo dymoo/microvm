@@ -186,6 +186,19 @@ Destroy blocks new admissions, aborts active HTTP/SSE/WebSocket scopes, waits
 a bounded interval, stops the VM, and proves the captured scopes closed before
 returning success. Teardown revokes ingress and sandbox-control credentials.
 
+### Idle policy and upgrade refusals
+
+One idle policy governs the ingress data plane: an ordinary response, an SSE
+stream, or an upgraded tunnel that carries no bytes in either direction for five
+minutes is closed. Real traffic in either direction restarts the window from the
+last byte, closure is an ordinary close (the VM stays healthy), and no message is
+buffered to police it. A refused upgrade that failed after guest I/O — a guest
+that answered `200`, reset the socket, sent an invalid `101`, or never answered
+within the 120 s response-head deadline — is rendered to the caller as a bounded
+`502`/`504` with `Connection: close`, and that socket is destroyed at a fixed
+bound. Direct-daemon upgrades must be HTTP/1.1, matching the public adapter and
+the guest proxy.
+
 ## Durable web-service control v1
 
 Port 1026 accepts one UTF-8 JSON line and returns one UTF-8 JSON line, then

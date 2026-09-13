@@ -14,9 +14,10 @@ import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer } from "effect"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { makeMicrovmClient } from "../src/client.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
+import { DAEMON_HTTP_LIMITS, ingressIdleGuard } from "../src/daemon-http-proxy.js"
 import {
   Firecracker,
   GuestExecChannel,
@@ -665,4 +666,201 @@ describe("daemon HTTP ingress lifecycle bounds", () => {
       await closeServer(origin)
     }
   })
+})
+
+describe("daemon ingress refusal and idle contract", () => {
+  const wsKey = Buffer.from("0123456789abcdef").toString("base64")
+  const upgradeHead = (vmId: string, token: string, target: string, version = "HTTP/1.1"): string =>
+    `GET /http/v1/vms/${vmId}${target} ${version}\r\n` +
+    "Host: preview.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+    "Sec-WebSocket-Version: 13\r\n" +
+    `Sec-WebSocket-Key: ${wsKey}\r\n` +
+    `Proxy-Authorization: Bearer ${token}\r\n\r\n`
+
+  /** Sends a request head and reads the refusal while keeping the client writable. */
+  const readRefusal = async (port: number, payload: string): Promise<string> => {
+    const socket = connect({ host: "127.0.0.1", port })
+    const chunks: Array<Buffer> = []
+    const head = Promise.withResolvers<string>()
+    const deadline = setTimeout(
+      () => head.reject(new Error(`no refusal within 2000ms (${Buffer.concat(chunks).length} bytes)`)),
+      2_000
+    )
+    deadline.unref()
+    socket.on("data", (chunk) => {
+      chunks.push(chunk)
+      const text = Buffer.concat(chunks).toString("latin1")
+      if (text.includes("\r\n\r\n")) head.resolve(text)
+    })
+    socket.once("error", head.reject)
+    socket.once("close", () => clearTimeout(deadline))
+    socket.once("connect", () => socket.write(payload))
+    try {
+      return await head.promise
+    } finally {
+      clearTimeout(deadline)
+      socket.destroy()
+    }
+  }
+
+  it.each([
+    { kind: "ordinary", headers: {} as Record<string, string> },
+    { kind: "SSE", headers: { accept: "text/event-stream" } }
+  ])("completes destroy while a pending $kind guest open is still pending", async ({ headers }) => {
+    const root = await prepareFixture()
+    const openStarted = Promise.withResolvers<void>()
+    const pendingGuest = Layer.succeed(GuestHttpChannel, GuestHttpChannel.of({
+      open: () => Effect.sync(() => openStarted.resolve()).pipe(Effect.andThen(Effect.never))
+    }))
+    const origin = createServer()
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    let stopCalls: () => number = () => 0
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort, { guestHttp: pendingGuest })
+        const { admin, created } = yield* createVm(daemon.port)
+        stopCalls = daemon.stopCalls
+        // Settle handlers are attached immediately: the daemon rejecting this
+        // response is expected, and an unhandled rejection would fail the suite.
+        const pending = requestDaemon({
+          port: daemon.port,
+          path: `/http/v1/vms/${created.vm.vmId}/`,
+          headers: proxyHeaders(created.httpIngressToken, headers)
+        }).then(() => "resolved" as const, () => "rejected" as const)
+        yield* Effect.promise(() => openStarted.promise)
+        const destroyStarted = Date.now()
+        const destroyed = yield* admin.destroy({ vmId: created.vm.vmId })
+        expect(Date.now() - destroyStarted).toBeLessThan(7_000)
+        expect(destroyed.destroyed).toBe(true)
+        // The public response settles instead of hanging on the abandoned open.
+        const settled = yield* Effect.promise(() => pending)
+        expect(settled).toBe("rejected")
+        expect(existsSync(join(root, "run", "vms", created.vm.vmId))).toBe(false)
+      })))
+      expect(stopCalls()).toBe(1)
+    } finally {
+      await closeServer(origin)
+    }
+  }, 30_000)
+})
+
+describe("ingress idle policy", () => {
+  it("arms one fixed window, resets on traffic, and stops after clear", () => {
+    vi.useFakeTimers()
+    try {
+      let closures = 0
+      const guard = ingressIdleGuard(DAEMON_HTTP_LIMITS.idleMs, () => {
+        closures++
+      })
+      vi.advanceTimersByTime(DAEMON_HTTP_LIMITS.idleMs - 1_000)
+      expect(closures).toBe(0)
+      guard.touch()
+      vi.advanceTimersByTime(DAEMON_HTTP_LIMITS.idleMs - 1_000)
+      expect(closures).toBe(0)
+      vi.advanceTimersByTime(2_000)
+      expect(closures).toBe(1)
+      guard.clear()
+      vi.advanceTimersByTime(DAEMON_HTTP_LIMITS.idleMs * 2)
+      expect(closures).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("documents the five-minute response and tunnel idle contract", () => {
+    expect(DAEMON_HTTP_LIMITS.idleMs).toBe(300_000)
+  })
+})
+
+describe("daemon ingress destroy during a pending guest open", () => {
+  it.each([
+    { kind: "ordinary", headers: {} as Record<string, string> },
+    { kind: "SSE", headers: { accept: "text/event-stream" } }
+  ])("completes destroy while a pending $kind guest open is still pending", async ({ headers }) => {
+    const root = await prepareFixture()
+    const openStarted = Promise.withResolvers<void>()
+    const pendingGuest = Layer.succeed(GuestHttpChannel, GuestHttpChannel.of({
+      open: () => Effect.sync(() => openStarted.resolve()).pipe(Effect.andThen(Effect.never))
+    }))
+    const origin = createServer()
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    let stopCalls: () => number = () => 0
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort, { guestHttp: pendingGuest })
+        const { admin, created } = yield* createVm(daemon.port)
+        stopCalls = daemon.stopCalls
+        // Settle handlers are attached immediately: the daemon rejecting this
+        // response is expected, and an unhandled rejection would fail the suite.
+        const pending = requestDaemon({
+          port: daemon.port,
+          path: `/http/v1/vms/${created.vm.vmId}/`,
+          headers: proxyHeaders(created.httpIngressToken, headers)
+        }).then(() => "resolved" as const, () => "rejected" as const)
+        yield* Effect.promise(() => openStarted.promise)
+        const destroyStarted = Date.now()
+        const destroyed = yield* admin.destroy({ vmId: created.vm.vmId })
+        // The abort must be observed even though it lands inside the open.
+        expect(Date.now() - destroyStarted).toBeLessThan(7_000)
+        expect(destroyed.destroyed).toBe(true)
+        const settled = yield* Effect.promise(() => pending)
+        expect(settled).toBe("rejected")
+        expect(existsSync(join(root, "run", "vms", created.vm.vmId))).toBe(false)
+      })))
+      expect(stopCalls()).toBe(1)
+    } finally {
+      await closeServer(origin)
+    }
+  }, 30_000)
+})
+
+describe("daemon ingress upgrade protocol version", () => {
+  const wsKey = Buffer.from("0123456789abcdef").toString("base64")
+
+  it("refuses a direct-daemon upgrade that is not HTTP/1.1", async () => {
+    const root = await prepareFixture()
+    let guestUpgrades = 0
+    const origin = createServer()
+    origin.on("upgrade", (_request, socket) => {
+      guestUpgrades++
+      socket.destroy()
+    })
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort)
+        const { created } = yield* createVm(daemon.port)
+        const socket = connect({ host: "127.0.0.1", port: daemon.port })
+        const chunks: Array<Buffer> = []
+        const read = Promise.withResolvers<string>()
+        const deadline = setTimeout(() => read.reject(new Error("no refusal within 2000ms")), 2_000)
+        deadline.unref()
+        socket.on("data", (chunk) => {
+          chunks.push(chunk)
+          const text = Buffer.concat(chunks).toString("latin1")
+          if (text.includes("\r\n\r\n")) read.resolve(text)
+        })
+        socket.once("error", read.reject)
+        socket.once("close", () => clearTimeout(deadline))
+        yield* Effect.promise(() => once(socket, "connect"))
+        socket.write(
+          `GET /http/v1/vms/${created.vm.vmId}/socket HTTP/1.0\r\n` +
+          "Host: preview.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+          "Sec-WebSocket-Version: 13\r\n" +
+          `Sec-WebSocket-Key: ${wsKey}\r\n` +
+          `Proxy-Authorization: Bearer ${created.httpIngressToken}\r\n\r\n`
+        )
+        const refusal = yield* Effect.promise(() => read.promise)
+        clearTimeout(deadline)
+        socket.destroy()
+        expect(refusal).toContain(" 426 ")
+        expect(guestUpgrades).toBe(0)
+      })))
+    } finally {
+      await closeServer(origin)
+    }
+  }, 20_000)
 })
