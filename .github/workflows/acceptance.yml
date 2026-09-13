@@ -16,8 +16,9 @@
 #
 # No secrets: the daemon's admin token is generated ephemerally in the job,
 # masked before any output, and only reaches the daemon via a ${ENV} config
-# reference. Uploaded evidence contains versions, checksums, logs, and
-# timings only — never tokens, rootfs images, or daemon config.
+# reference. Uploaded evidence contains versions, checksums, timings, and
+# scenario-only abuse results — never credentials, captured guest output,
+# rootfs images, or daemon configuration.
 name: hosted-linux-acceptance
 
 on:
@@ -120,7 +121,7 @@ jobs:
           MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
           bash scripts/ci-acceptance.sh image
 
-      - name: Daemon, jailed guest-protocol, and two-VM acceptance
+      - name: Daemon, jailed acceptance, and hostile guest abuse
         run: >-
           sudo env PATH="$PATH"
           FIRECRACKER_URL="$FIRECRACKER_URL"
@@ -147,8 +148,8 @@ jobs:
           MICROVM_CI_EVIDENCE_DIR="$MICROVM_CI_EVIDENCE_DIR"
           bash scripts/ci-acceptance.sh clean
 
-      # Nonsecret evidence only: versions, checksums, manifests, logs,
-      # timings. No tokens, no rootfs image, no daemon config.
+      # Nonsecret evidence only: versions, checksums, manifests, logs, timings,
+      # and abuse scenario labels. No tokens, guest output, rootfs, or config.
       - name: Upload acceptance evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

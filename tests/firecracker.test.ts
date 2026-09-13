@@ -1,7 +1,8 @@
 import { createServer } from "node:http"
+import { existsSync, watch } from "node:fs"
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { Effect, Result } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
 import { Firecracker, FirecrackerLive } from "../src/firecracker.js"
@@ -10,7 +11,51 @@ import { ImageNotAllowed } from "../src/protocol.js"
 
 const roots: Array<string> = []
 
-const fixture = async (respondToApi: boolean) => {
+/**
+ * A pending wait for a path to exist. Callers MUST `close()` it (in a
+ * `finally`) so the watcher never outlives the wait.
+ */
+interface FileWait {
+  readonly found: Promise<void>
+  readonly close: () => void
+}
+
+/**
+ * Waits for `path` to exist. Uses the real filesystem event plus existence
+ * checks on both sides of the watch registration, so there is no polling
+ * timer and no window in which an already-created file is missed.
+ */
+const waitForFile = (path: string): FileWait => {
+  const { promise, resolve } = Promise.withResolvers<void>()
+  if (existsSync(path)) {
+    resolve()
+    return { found: promise, close: () => undefined }
+  }
+  let settled = false
+  const watcher = watch(dirname(path), { persistent: false }, () => {
+    if (settled || !existsSync(path)) return
+    settled = true
+    watcher.close()
+    resolve()
+  })
+  // The file may have appeared between the check above and the watcher
+  // registration; the watcher itself cannot report an event that predates it.
+  if (existsSync(path)) {
+    settled = true
+    watcher.close()
+    resolve()
+  }
+  return {
+    found: promise,
+    close: () => {
+      if (settled) return
+      settled = true
+      watcher.close()
+    }
+  }
+}
+
+const fixture = async (respondToApi: boolean, bootTimeoutMs = 500) => {
   const root = await mkdtemp(join(tmpdir(), "fc-"))
   roots.push(root)
   const jailer = join(root, "jailer")
@@ -31,13 +76,9 @@ const fixture = async (respondToApi: boolean) => {
     await mkdir(chrootBase, { recursive: true })
     await writeFile(join(chrootBase, "respond"), "1")
   }
-  await writeFile(jailer, `#!/usr/bin/python3
-import os
-import time
-with open(${JSON.stringify(pidPath)}, "w", encoding="utf-8") as pid_file:
-    pid_file.write(str(os.getpid()))
-while True:
-    time.sleep(1)
+  await writeFile(jailer, `#!/bin/sh
+echo $$ > ${JSON.stringify(pidPath)}
+while true; do sleep 1; done
 `)
   await chmod(jailer, 0o755)
 
@@ -67,7 +108,7 @@ while True:
     maxPidsPerVm: 16,
     jailerFsizeBytes: 1_048_576,
     jailerNoFileLimit: 64,
-    bootTimeoutMs: 500,
+    bootTimeoutMs,
     guestReadinessTimeoutMs: 75
   }
   const image: ResolvedImage = {
@@ -83,8 +124,8 @@ while True:
   return { config, image, layout, pidPath, vmId }
 }
 
-const bootResult = async (respondToApi: boolean) => {
-  const { config, image, layout, pidPath, vmId } = await fixture(respondToApi)
+const bootResult = async (respondToApi: boolean, bootTimeoutMs = 500) => {
+  const { config, image, layout, pidPath, vmId } = await fixture(respondToApi, bootTimeoutMs)
   const api = createServer((request, response) => {
     if (!respondToApi) {
       request.resume()
@@ -94,7 +135,7 @@ const bootResult = async (respondToApi: boolean) => {
     request.on("data", (chunk: Buffer) => {
       bodyBytes += chunk.byteLength
     })
-    request.on("end", () => {
+    request.on("end", async () => {
       const header = request.headers["content-length"]
       const contentLength = typeof header === "string" && /^\d+$/.test(header)
         ? Number(header)
@@ -110,8 +151,30 @@ const bootResult = async (respondToApi: boolean) => {
         response.end("Empty PUT request")
         return
       }
-      response.writeHead(204, { "content-length": "0" })
-      response.end()
+      // A real jailer serves the Firecracker API only once its process (and
+      // the VMM it launched) is up. The fixture jailer publishes its pid as
+      // its first action, so acknowledge only after that publication: the
+      // rollback assertions below then describe a process that provably
+      // existed, without guessing how fast the fixture starts. The response
+      // close race keeps the handler from awaiting forever if the caller
+      // gives up on this request first.
+      const publication = waitForFile(pidPath)
+      const clientGone = Promise.withResolvers<void>()
+      const onClose = (): void => clientGone.resolve()
+      response.once("close", onClose)
+      if (response.destroyed) clientGone.resolve()
+      try {
+        await Promise.race([publication.found, clientGone.promise])
+      } finally {
+        publication.close()
+        response.off("close", onClose)
+      }
+      // The caller may have aborted while we waited: never write to a
+      // response whose underlying connection is gone.
+      if (!response.destroyed && !response.writableEnded) {
+        response.writeHead(204, { "content-length": "0" })
+        response.end()
+      }
     })
   })
   await new Promise<void>((resolve, reject) => {
@@ -132,8 +195,17 @@ const bootResult = async (respondToApi: boolean) => {
         gid: process.getgid?.() ?? 0
       }, image))
     }).pipe(Effect.provide(FirecrackerLive(config))))
-    const pid = Number(await readFile(pidPath, "utf8"))
-    expect(() => process.kill(pid, 0)).toThrow()
+    // Deterministic rollback evidence: teardown removes the per-VM cgroup it
+    // uses as its proven-complete marker, so a failed boot that left the
+    // process tree (or the cgroup) behind cannot pass this helper.
+    expect(existsSync(layout.cgroupDir)).toBe(false)
+    // When the fixture jailer published its identity, it must be dead. The
+    // API acknowledgement above waits for that publication, so this is the
+    // normal path rather than a timing guess.
+    if (existsSync(pidPath)) {
+      const pid = Number(await readFile(pidPath, "utf8"))
+      expect(() => process.kill(pid, 0)).toThrow()
+    }
     return result
   } finally {
     api.closeAllConnections()
@@ -152,7 +224,12 @@ describe("Firecracker boot transaction", () => {
   })
 
   it("rolls back a configured VM whose guest runner never becomes ready", async () => {
-    const result = await bootResult(true)
+    // The fake API acknowledges a request only after the fixture jailer has
+    // published its pid, and the first execution of a freshly written script
+    // costs a few hundred milliseconds on some hosts. The readiness failure
+    // is what this test is about, so the boot budget must not race that
+    // publication; the timeout test below still pins the timeout path.
+    const result = await bootResult(true, 10_000)
     expect(Result.isFailure(result) ? result.failure : result).toMatchObject({ _tag: "BootFailed" })
   })
 })

@@ -4,6 +4,7 @@ import { Effect, Schema } from "effect"
 import { constants } from "node:os"
 import { decodeExecResult, makeMicrovmClient } from "../client.js"
 import { GuestExecError } from "../protocol.js"
+import type { CreateRequest, ExecuteRequest } from "../protocol.js"
 
 interface ParsedArguments {
   readonly command: string
@@ -122,33 +123,89 @@ const exitCodeForError = (error: unknown): number => {
   }
 }
 
-const runCommand = (parsed: ParsedArguments) =>
-  Effect.scoped(Effect.gen(function*() {
-    const client = yield* makeMicrovmClient({ url: parsed.url, token: parsed.token })
-    switch (parsed.command) {
-      case "create": {
-        const result = yield* client.create({
+/** One parsed command, with its fully typed request, before any client exists. */
+type CliCommand =
+  | { readonly _tag: "create"; readonly request: CreateRequest }
+  | { readonly _tag: "exec"; readonly request: ExecuteRequest }
+  | { readonly _tag: "status"; readonly vmId: string }
+  | { readonly _tag: "list" }
+  | { readonly _tag: "destroy"; readonly vmId: string }
+  | { readonly _tag: "cleanup" }
+
+/**
+ * Builds the typed command from its options. Throws `CliUsageError` for a
+ * usage mistake; {@link parseCommand} converts exactly that error, so option
+ * parsing never reaches the RPC layer as a defect.
+ */
+const buildCommand = (parsed: ParsedArguments): CliCommand => {
+  switch (parsed.command) {
+    case "create":
+      return {
+        _tag: "create",
+        request: {
           image: requiredOption(parsed.args, "--image"),
           cpus: integerOption(parsed.args, "--cpus"),
           memMib: integerOption(parsed.args, "--mem-mib"),
           ttlSeconds: integerOption(parsed.args, "--ttl-s")
-        })
+        }
+      }
+    case "exec": {
+      const delimiter = parsed.args.indexOf("--")
+      if (delimiter === -1 || delimiter === parsed.args.length - 1) {
+        throw new CliUsageError({ message: "exec requires -- followed by an absolute argv" })
+      }
+      const options = parsed.args.slice(0, delimiter)
+      return {
+        _tag: "exec",
+        request: {
+          vmId: requiredOption(options, "--vm"),
+          argv: parsed.args.slice(delimiter + 1),
+          cwd: option(options, "--cwd"),
+          env: undefined,
+          timeoutMs: integerOption(options, "--timeout-ms"),
+          maxOutputBytes: integerOption(options, "--max-output-bytes")
+        }
+      }
+    }
+    case "status":
+      return { _tag: "status", vmId: requiredOption(parsed.args, "--vm") }
+    case "list":
+      return { _tag: "list" }
+    case "destroy":
+      return { _tag: "destroy", vmId: requiredOption(parsed.args, "--vm") }
+    case "cleanup":
+      return { _tag: "cleanup" }
+    default:
+      throw new CliUsageError({ message: `unknown command ${parsed.command}; ${usage}` })
+  }
+}
+
+/**
+ * Parses the command into a typed request before any client is constructed or
+ * any scope entered. A `CliUsageError` becomes an ordinary typed failure;
+ * anything else thrown by the parser is a genuine defect and is NOT relabelled
+ * as a usage error.
+ */
+const parseCommand = (parsed: ParsedArguments): Effect.Effect<CliCommand, CliUsageError> =>
+  Effect.suspend(() => {
+    try {
+      return Effect.succeed(buildCommand(parsed))
+    } catch (cause) {
+      return cause instanceof CliUsageError ? Effect.fail(cause) : Effect.die(cause)
+    }
+  })
+
+const executeCommand = (parsed: ParsedArguments, command: CliCommand) =>
+  Effect.scoped(Effect.gen(function*() {
+    const client = yield* makeMicrovmClient({ url: parsed.url, token: parsed.token })
+    switch (command._tag) {
+      case "create": {
+        const result = yield* client.create(command.request)
         emit({ ...result.vm, sandboxToken: result.sandboxToken })
         return
       }
       case "exec": {
-        const delimiter = parsed.args.indexOf("--")
-        if (delimiter === -1 || delimiter === parsed.args.length - 1) {
-          return yield* Effect.fail(new CliUsageError({ message: "exec requires -- followed by an absolute argv" }))
-        }
-        const result = yield* client.execute({
-          vmId: requiredOption(parsed.args, "--vm"),
-          argv: parsed.args.slice(delimiter + 1),
-          cwd: option(parsed.args.slice(0, delimiter), "--cwd"),
-          env: undefined,
-          timeoutMs: integerOption(parsed.args.slice(0, delimiter), "--timeout-ms"),
-          maxOutputBytes: integerOption(parsed.args.slice(0, delimiter), "--max-output-bytes")
-        })
+        const result = yield* client.execute(command.request)
         const decoded = decodeExecResult(result)
         emit(decoded)
         if (decoded.signal !== undefined) {
@@ -160,7 +217,7 @@ const runCommand = (parsed: ParsedArguments) =>
         return
       }
       case "status": {
-        emit(yield* client.inspect({ vmId: requiredOption(parsed.args, "--vm") }))
+        emit(yield* client.inspect({ vmId: command.vmId }))
         return
       }
       case "list": {
@@ -168,15 +225,13 @@ const runCommand = (parsed: ParsedArguments) =>
         return
       }
       case "destroy": {
-        emit(yield* client.destroy({ vmId: requiredOption(parsed.args, "--vm") }))
+        emit(yield* client.destroy({ vmId: command.vmId }))
         return
       }
       case "cleanup": {
         emit(yield* client.cleanup({}))
         return
       }
-      default:
-        return yield* Effect.fail(new CliUsageError({ message: `unknown command ${parsed.command}; ${usage}` }))
     }
   }))
 
@@ -184,7 +239,8 @@ const main = Effect.try({
   try: () => parseArguments(process.argv.slice(2)),
   catch: (cause) => cause
 }).pipe(
-  Effect.flatMap(runCommand),
+  Effect.flatMap((parsed) => parseCommand(parsed).pipe(Effect.map((command) => ({ parsed, command })))),
+  Effect.flatMap(({ parsed, command }) => executeCommand(parsed, command)),
   Effect.catch((error) => Effect.sync(() => {
     const payload = { error: errorTag(error), message: errorMessage(error) }
     if (isGuestExecError(error)) {

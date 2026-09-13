@@ -10,8 +10,8 @@
 #   vsock     hosted-only real AF_VSOCK peer-authorization test (runner builds
 #              and runs it; root only loads the loopback transport)
 #   image      build the pinned guest image via scripts/build-guest-image.sh
-#   daemon     boot the real daemon as an owned child, run guest-protocol and
-#              two-VM acceptance, then prove release on native shutdown
+#   daemon     boot the real daemon, run guest-protocol and two-VM acceptance,
+#              then hostile jailed-VM abuse and proven native shutdown
 #   clean      identity-verified fallback teardown; reports uncertainty and
 #              never deletes diagnostic state to fake a green result
 #
@@ -403,7 +403,7 @@ daemon() {
   # Ephemeral admin credential: generated, masked, and never printed. It only
   # reaches the daemon through the config's ${MICROVM_ADMIN_TOKEN} reference.
   local admin_token started finished create_json vm_id vsock destroy_json
-  local daemon_listen_ms protocol_vm_create_ms protocol_accept_ms two_vm_accept_ms
+  local daemon_listen_ms protocol_vm_create_ms protocol_accept_ms two_vm_accept_ms hostile_abuse_ms
   local daemon_pid
   admin_token=$(openssl rand -hex 32)
   printf '::add-mask::%s\n' "$admin_token"
@@ -609,6 +609,20 @@ print(
   finished=$(now_ms)
   two_vm_accept_ms=$((finished - started))
 
+  # Hostile-user exercise runs only after the ordinary acceptance is green.
+  # The script owns and proves cleanup of every sacrificial VM, while this
+  # outer deadline bounds the entire phase and leaves daemon shutdown as a
+  # second cleanup layer. Its log contains scenario labels only, never JSON
+  # create responses, credentials, guest output, or daemon configuration.
+  started=$(now_ms)
+  MICROVM_URL=$URL MICROVM_TOKEN=$admin_token MICROVM_IMAGE=node \
+    MICROVM_RUN_STATE_DIR="$RUN_STATE_DIR" MICROVM_CGROUP_ROOT="$CGROUP_SLICE" \
+    MICROVM_BIN="$ROOT/dist/bin/client.js" \
+    timeout --signal=TERM --kill-after=30s 8m \
+    bash "$ROOT/scripts/abuse-linux.sh" | tee "$EVIDENCE_DIR/abuse-linux.log"
+  finished=$(now_ms)
+  hostile_abuse_ms=$((finished - started))
+
   # Native lifecycle stop, bounded and proven: the daemon's shutdown destroys
   # any remaining VMs; leftovers here are a failure, not something to clean up
   # quietly.
@@ -625,6 +639,7 @@ print(
     echo "protocol VM create (jailer boot + readiness) ms: $protocol_vm_create_ms"
     echo "guest protocol acceptance ms: $protocol_accept_ms"
     echo "two-VM daemon acceptance ms: $two_vm_accept_ms"
+    echo "hostile jailed-VM abuse ms: $hostile_abuse_ms (outer bound: 8m + 30s cleanup grace)"
   } >"$EVIDENCE_DIR/timings.txt"
   echo "daemon acceptance passed"
 }
