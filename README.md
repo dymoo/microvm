@@ -228,7 +228,8 @@ service outlives the control connection that started it.
 
 ```ts
 import { Effect } from "effect"
-import { createServer } from "node:http"
+import { createServer, type Server } from "node:http"
+import type { Socket } from "node:net"
 import { makeMicrovmCluster } from "microvm"
 
 const program = Effect.scoped(Effect.gen(function* () {
@@ -251,24 +252,49 @@ const program = Effect.scoped(Effect.gen(function* () {
   // `connect` or `checkContinue` listener changes the refusal into a silent
   // hang-up or an interim `100 Continue` this adapter never forwards.
   const proxy = yield* sandbox.http()
-  const server = createServer(proxy.handleRequest)
-  server.on("upgrade", proxy.handleUpgrade)
-  server.on("connect", proxy.handleConnect)
-  server.on("checkContinue", proxy.handleCheckContinue)
-  yield* Effect.promise(() => new Promise<void>((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(8_080, "127.0.0.1", resolve)
-  }))
 
-  yield* Effect.promise(() => new Promise<void>((resolve) => {
-    server.close(() => resolve())
-    // Upgraded sockets leave the server's own accounting, so close them too.
-    server.closeAllConnections()
-  }))
+  // The trusted host owns the listener and every socket it accepted. Node
+  // detaches upgraded sockets from the server's own accounting, so
+  // `closeAllConnections()` never closes them and the `close` callback never
+  // fires while one is open. `acquireRelease` runs the same release on
+  // failure or interruption, so neither the listener nor a socket leaks
+  // before the happy path.
+  yield* Effect.acquireRelease(
+    Effect.tryPromise({
+      try: async (): Promise<{ server: Server; sockets: Set<Socket> }> => {
+        const sockets = new Set<Socket>()
+        const server = createServer(proxy.handleRequest)
+        server.on("connection", (socket) => {
+          sockets.add(socket)
+          socket.once("close", () => sockets.delete(socket))
+        })
+        server.on("upgrade", proxy.handleUpgrade)
+        server.on("connect", proxy.handleConnect)
+        server.on("checkContinue", proxy.handleCheckContinue)
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject)
+          server.listen(8_080, "127.0.0.1", resolve)
+        })
+        return { server, sockets }
+      },
+      catch: (cause) => new Error(`preview listener failed: ${String(cause)}`)
+    }),
+    ({ server, sockets }) => Effect.promise(async () => {
+      // Stop accepting, then destroy every accepted socket -- including the
+      // upgraded ones `closeAllConnections()` leaves open -- before awaiting
+      // the close callback.
+      const closed = new Promise<void>((resolve, reject) => {
+        server.close((cause) => (cause === undefined ? resolve() : reject(cause)))
+      })
+      for (const socket of sockets) socket.destroy()
+      await closed
+    })
+  )
 
-  // Teardown is explicit. Leaving the scope closes the scoped clients; it does
-  // not destroy the VM. Destroy blocks new admissions and aborts active
-  // HTTP/SSE/WebSocket leases before it stops the VM.
+  // Destroy is the caller's explicit step, and this example destroys only when
+  // no checkpoint is unexported: a guest-local commit stays ephemeral until a
+  // trusted external export verifies it. Leaving the scope closes the
+  // listener, its sockets, and the scoped clients; it never destroys the VM.
   yield* service.stop()
   return yield* sandbox.destroy()
 }))
