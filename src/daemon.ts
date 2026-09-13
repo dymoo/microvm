@@ -10,6 +10,7 @@ import { createServer as createHttpServer, type Server as NodeServer } from "nod
 import { createServer as createHttpsServer } from "node:https"
 import type { Socket } from "node:net"
 import { join } from "node:path"
+import type { Duplex } from "node:stream"
 import { authLayer, authorizeVm, CredentialStore, requireAdmin } from "./auth.js"
 import {
   DaemonHttpAdmissionError,
@@ -1318,10 +1319,23 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
           if (proxy.isIngressTarget(request.url)) proxy.handleRequest(request, response)
           else rpcHandler(request, response)
         }
-        const upgradeHandler: typeof proxy.handleUpgrade = (request, socket, head) =>
+        // Node detaches upgraded and CONNECT sockets from the server's own
+        // connection accounting, so `closeAllConnections()` can never reclaim
+        // them and `server.close()` would wait for them forever. The daemon owns
+        // them here and destroys them at shutdown, before that drain.
+        const detached = new Set<Duplex>()
+        const trackDetached = (socket: Duplex): void => {
+          detached.add(socket)
+          socket.once("close", () => detached.delete(socket))
+        }
+        const upgradeHandler: typeof proxy.handleUpgrade = (request, socket, head) => {
+          trackDetached(socket)
           proxy.handleUpgrade(request, socket, head)
-        const connectHandler: typeof proxy.handleConnect = (request, socket, head) =>
+        }
+        const connectHandler: typeof proxy.handleConnect = (request, socket, head) => {
+          trackDetached(socket)
           proxy.handleConnect(request, socket, head)
+        }
         const checkContinueHandler: typeof proxy.handleCheckContinue = (request, response) =>
           proxy.handleCheckContinue(request, response)
         const clientErrorHandler = (_cause: Error, socket: Socket): void => {
@@ -1339,6 +1353,8 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
         nodeServer.on("checkContinue", checkContinueHandler)
         nodeServer.on("clientError", clientErrorHandler)
         yield* Scope.addFinalizer(parentScope, Effect.sync(() => {
+          for (const socket of detached) socket.destroy()
+          detached.clear()
           nodeServer.off("request", requestHandler)
           nodeServer.off("upgrade", upgradeHandler)
           nodeServer.off("connect", connectHandler)

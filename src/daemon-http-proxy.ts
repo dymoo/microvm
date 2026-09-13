@@ -770,32 +770,79 @@ export const makeDaemonHttpProxy = (dependencies: DaemonHttpProxyDependencies): 
     void (async () => {
       let lease: DaemonHttpLease | undefined
       let guest: OpenGuestHttpConnection | undefined
+      let upstream: ClientRequest | undefined
+      let timer: NodeJS.Timeout | undefined
+      let settled = false
       let publicCommitted = false
+      let settleExchange: (() => void) | undefined
+      let failExchange: ((cause: unknown) => void) | undefined
+
+      /**
+       * Ends the exchange because it must stop now: an abort, a client that went
+       * away, an upstream failure, or the response-head deadline. The public
+       * socket is detached from the HTTP server, so it is destroyed here rather
+       * than left half-open in the server's connection set, where it would keep
+       * `server.close()` pending forever.
+       */
+      const terminate = (cause?: unknown): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        upstream?.destroy()
+        publicSocket.destroy()
+        if (cause === undefined) settleExchange?.()
+        else failExchange?.(cause)
+      }
+
+      /** Ends the exchange because a committed tunnel finished on its own. */
+      const complete = (): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        upstream?.destroy()
+        settleExchange?.()
+      }
+
       try {
         const validated = validateWebSocketRequest(request)
         const binding = dependencies.verifyHttpIngress(validated.token)
         if (binding === undefined) throw new PublicRequestError(401)
         if (binding.vmId !== validated.vmId || binding.endpoint !== "web") throw new PublicRequestError(404)
         lease = await dependencies.admit({ vmId: validated.vmId, binding, kind: "websocket" })
+
+        // Observe the lease before the guest channel is opened: destroy aborts
+        // it, and an AbortSignal that fires while no listener is installed never
+        // calls one, which would hold the lease until the channel gave up.
+        const aborted = new Promise<undefined>((resolve) => {
+          if (lease!.signal.aborted) {
+            resolve(undefined)
+            return
+          }
+          lease!.signal.addEventListener("abort", () => resolve(undefined), { once: true })
+        })
+        lease.signal.addEventListener("abort", () => terminate(), { once: true })
+
+        const opening = dependencies.openGuest(lease)
+        let opened: OpenGuestHttpConnection | undefined
         try {
-          guest = await dependencies.openGuest(lease)
+          opened = await Promise.race([opening, aborted])
         } catch {
+          if (settled) return
           await lease.poison()
           throw new PublicRequestError(503)
         }
+        if (opened === undefined) {
+          // The exchange is already over; a channel that still arrives is closed
+          // by its owner rather than leaked.
+          void opening.then((connection) => closeQuietly(connection), () => undefined)
+          return
+        }
+        guest = opened
+        if (settled || lease.signal.aborted) return
 
         await new Promise<void>((resolve, reject) => {
-          let settled = false
-          let timer: NodeJS.Timeout | undefined
-          let upstream: ClientRequest
-          const finish = (cause?: unknown): void => {
-            if (settled) return
-            settled = true
-            if (timer !== undefined) clearTimeout(timer)
-            upstream.destroy()
-            if (cause === undefined) resolve()
-            else reject(cause)
-          }
+          settleExchange = resolve
+          failExchange = reject
           upstream = httpRequest({
             agent: new SingleSocketAgent(guest!.socket),
             headers: validated.headers,
@@ -806,17 +853,17 @@ export const makeDaemonHttpProxy = (dependencies: DaemonHttpProxyDependencies): 
             maxHeaderSize: DAEMON_HTTP_LIMITS.maxHeaderBytes,
             setHost: false
           })
-          timer = setTimeout(() => finish(new PublicRequestError(504)), DAEMON_HTTP_LIMITS.responseHeadMs)
+          timer = setTimeout(() => terminate(new PublicRequestError(504)), DAEMON_HTTP_LIMITS.responseHeadMs)
           timer.unref()
-          upstream.once("error", () => finish(new PublicRequestError(502)))
+          upstream.once("error", () => terminate(new PublicRequestError(502)))
           upstream.once("response", (guestResponse) => {
             guestResponse.destroy()
-            finish(new PublicRequestError(502))
+            terminate(new PublicRequestError(502))
           })
           upstream.once("upgrade", (guestResponse, guestSocket, guestHead) => {
             try {
               const pairs = validateGuestUpgrade(guestResponse, validated)
-              if (timer !== undefined) clearTimeout(timer)
+              clearTimeout(timer)
               publicSocket.write(serializeUpgradeResponse(pairs))
               publicCommitted = true
               const toGuest = new WebSocketFrameGuard(true)
@@ -830,21 +877,25 @@ export const makeDaemonHttpProxy = (dependencies: DaemonHttpProxyDependencies): 
                   guestSocket.destroy()
                   publicSocket.destroy()
                 }
-                if (directions === 0 || cause !== undefined && cause !== null) finish()
+                if (directions === 0 || cause !== undefined && cause !== null) {
+                  if (cause === undefined || cause === null) complete()
+                  else terminate()
+                }
               }
               pipeline(publicSocket, toGuest, guestSocket, directionDone)
               pipeline(guestSocket, toPublic, publicSocket, directionDone)
             } catch (cause) {
               guestSocket.destroy()
-              finish(cause)
+              terminate(cause)
             }
           })
-          lease!.signal.addEventListener("abort", () => {
-            publicSocket.destroy()
-            finish()
-          }, { once: true })
-          publicSocket.once("error", () => finish())
-          publicSocket.once("close", () => finish())
+          publicSocket.once("error", () => terminate())
+          publicSocket.once("close", () => terminate())
+          // A half-close before the upgrade is committed is terminal; a
+          // committed tunnel keeps serving until its own close or a destroy.
+          publicSocket.once("end", () => {
+            if (!publicCommitted) terminate()
+          })
           guest!.socket.resume()
           upstream.end()
         })

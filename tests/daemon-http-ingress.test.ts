@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto"
+import { once } from "node:events"
+import { existsSync } from "node:fs"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import {
   createServer,
@@ -160,7 +162,8 @@ interface StartedDaemon {
 const startDaemon = (
   root: string,
   daemonServer: Server,
-  originPort: number
+  originPort: number,
+  overrides: { readonly guestHttp?: Layer.Layer<GuestHttpChannel> } = {}
 ): Effect.Effect<StartedDaemon, unknown> =>
   Effect.gen(function*() {
     let stops = 0
@@ -206,7 +209,7 @@ const startDaemon = (
     yield* daemonLayer(configFor(root), {
       firecracker,
       guestExec,
-      guestHttp,
+      guestHttp: overrides.guestHttp ?? guestHttp,
       guestService,
       prereqs,
       server: daemonServer,
@@ -496,6 +499,169 @@ describe("daemon HTTP registry lifecycle", () => {
         }
       })))
     } finally {
+      await closeServer(origin)
+    }
+  })
+})
+
+/**
+ * A stalled guest upgrade used to keep a detached public socket half-open in the
+ * server's connection set forever, which gated the Node HTTP server's unbounded
+ * close finalizer ahead of VmRegistry shutdown: SIGTERM wedged and a stalled
+ * `openGuest` lost the destroy abort because no listener was installed yet.
+ */
+describe("daemon HTTP ingress lifecycle bounds", () => {
+  const wsKey = Buffer.from("0123456789abcdef").toString("base64")
+  const upgradeRequest = (vmId: string, token: string, target = "/socket"): string =>
+    `GET /http/v1/vms/${vmId}${target} HTTP/1.1\r\n` +
+    "Host: preview.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+    "Sec-WebSocket-Version: 13\r\n" +
+    `Sec-WebSocket-Key: ${wsKey}\r\n` +
+    `Proxy-Authorization: Bearer ${token}\r\n\r\n`
+  const vmDirectory = (root: string, vmId: string): string => join(root, "run", "vms", vmId)
+
+  it("treats a public half-close before commitment as terminal", async () => {
+    const root = await prepareFixture()
+    const guestReached = Promise.withResolvers<void>()
+    const origin = createServer()
+    origin.on("connection", () => guestReached.resolve())
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    let stopCalls: () => number = () => 0
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort)
+        const { created } = yield* createVm(daemon.port)
+        stopCalls = daemon.stopCalls
+        const socket = connect({ host: "127.0.0.1", port: daemon.port })
+        yield* Effect.promise(() => once(socket, "connect"))
+        socket.write(upgradeRequest(created.vm.vmId, created.httpIngressToken))
+        yield* Effect.promise(() => guestReached.promise)
+        const closed = once(socket, "close")
+        socket.end()
+        // Pre-fix the daemon never ended this exchange, so nothing closed it
+        // until the 120s guest response-head deadline.
+        yield* Effect.promise(() => closed)
+        expect(socket.destroyed).toBe(true)
+      })))
+      expect(stopCalls()).toBe(1)
+    } finally {
+      await closeServer(origin)
+    }
+  })
+
+  it("shuts down with a live stalled upgrade and releases the VM exactly once", async () => {
+    const root = await prepareFixture()
+    const guestReached = Promise.withResolvers<void>()
+    const origin = createServer()
+    origin.on("connection", () => guestReached.resolve())
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    let stopCalls: () => number = () => 0
+    let vmId = ""
+    try {
+      const started = Date.now()
+      const socketClosed = Promise.withResolvers<void>()
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort)
+        const { created } = yield* createVm(daemon.port)
+        stopCalls = daemon.stopCalls
+        vmId = created.vm.vmId
+        const socket = connect({ host: "127.0.0.1", port: daemon.port })
+        yield* Effect.promise(() => once(socket, "connect"))
+        socket.once("close", () => socketClosed.resolve())
+        socket.write(upgradeRequest(created.vm.vmId, created.httpIngressToken))
+        yield* Effect.promise(() => guestReached.promise)
+        expect(existsSync(vmDirectory(root, created.vm.vmId))).toBe(true)
+        // Leaving the scope is the SIGTERM-equivalent: Layer.launch finalizers
+        // run, then VmRegistry shutdown destroys the VM.
+      })))
+      // Pre-fix the daemon server's drain blocked on this detached socket for
+      // the whole 120s guest deadline, so shutdown never reached the registry.
+      expect(Date.now() - started).toBeLessThan(15_000)
+      expect(stopCalls()).toBe(1)
+      expect(existsSync(vmDirectory(root, vmId))).toBe(false)
+      await socketClosed.promise
+    } finally {
+      await closeServer(origin)
+    }
+  }, 30_000)
+
+  it("completes destroy while the guest channel open is still pending", async () => {
+    const root = await prepareFixture()
+    const openStarted = Promise.withResolvers<void>()
+    const pendingGuest = Layer.succeed(GuestHttpChannel, GuestHttpChannel.of({
+      open: () => Effect.sync(() => openStarted.resolve()).pipe(Effect.andThen(Effect.never))
+    }))
+    const origin = createServer()
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    let stopCalls: () => number = () => 0
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort, { guestHttp: pendingGuest })
+        const { admin, created } = yield* createVm(daemon.port)
+        stopCalls = daemon.stopCalls
+        const socket = connect({ host: "127.0.0.1", port: daemon.port })
+        yield* Effect.promise(() => once(socket, "connect"))
+        socket.write(upgradeRequest(created.vm.vmId, created.httpIngressToken))
+        yield* Effect.promise(() => openStarted.promise)
+        const destroyStarted = Date.now()
+        const destroyed = yield* admin.destroy({ vmId: created.vm.vmId })
+        // Pre-fix the abort landed inside the openGuest await with no listener
+        // installed, so the lease was never released and destroy failed with
+        // "HTTP connection scopes remained active after VM teardown" after ~10s.
+        expect(Date.now() - destroyStarted).toBeLessThan(7_000)
+        expect(destroyed.destroyed).toBe(true)
+        expect(existsSync(vmDirectory(root, created.vm.vmId))).toBe(false)
+      })))
+      expect(stopCalls()).toBe(1)
+    } finally {
+      await closeServer(origin)
+    }
+  }, 30_000)
+
+  it("closes an active upgraded tunnel when the VM is destroyed", async () => {
+    const root = await prepareFixture()
+    const originSockets = new Set<Socket>()
+    const origin = createServer()
+    origin.on("upgrade", (request, socket) => {
+      // Upgraded sockets leave the server's accounting, so this test reclaims
+      // them itself; closeAllConnections() alone would never close the origin.
+      originSockets.add(socket)
+      socket.once("close", () => originSockets.delete(socket))
+      const key = request.headers["sec-websocket-key"]
+      if (typeof key !== "string") return socket.destroy()
+      const accept = createHash("sha1")
+        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+        .digest("base64")
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+      )
+    })
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    let stopCalls: () => number = () => 0
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort)
+        const { admin, created } = yield* createVm(daemon.port)
+        stopCalls = daemon.stopCalls
+        const socket = connect({ host: "127.0.0.1", port: daemon.port })
+        yield* Effect.promise(() => once(socket, "connect"))
+        socket.write(upgradeRequest(created.vm.vmId, created.httpIngressToken))
+        const upgraded = yield* Effect.promise(() => once(socket, "data"))
+        expect(upgraded[0].toString("latin1")).toContain(" 101 ")
+        const closed = once(socket, "close")
+        const destroyed = yield* admin.destroy({ vmId: created.vm.vmId })
+        expect(destroyed.destroyed).toBe(true)
+        yield* Effect.promise(() => closed)
+        expect(socket.destroyed).toBe(true)
+      })))
+      expect(stopCalls()).toBe(1)
+    } finally {
+      for (const socket of originSockets) socket.destroy()
       await closeServer(origin)
     }
   })
