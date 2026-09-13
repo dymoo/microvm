@@ -411,10 +411,12 @@ describe("guest exec v1 channel", () => {
     expect(state).toEqual({ state: "running", startedAtEpochMs: 42 })
   })
 
-  it("correlates a start response to its encoded identity without a second caller-supplied id", async () => {
+  it("sends start semantics and correlates the response to one encoded identity", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
     const path = join(dir, "v.sock")
     let exchanges = 0
+    const manifestPort = 4_321
+    let receivedStart: Record<string, unknown> | undefined
     const server = createServer((socket) => {
       let buffer = ""
       let connected = false
@@ -430,6 +432,7 @@ describe("guest exec v1 channel", () => {
         }
         const request = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>
         exchanges++
+        if (exchanges === 1) receivedStart = request
         socket.end(`${JSON.stringify({
           version: 1,
           id: exchanges === 1 ? request["id"] : "different-id",
@@ -453,8 +456,8 @@ describe("guest exec v1 channel", () => {
         const request = yield* encodeGuestServiceStartRequest({
           vmId: "mvm-test0001",
           requestId,
-          argv: ["/bin/true"],
-          webPort: 3_000
+          argv: ["/bin/true", "--serve"],
+          webPort: manifestPort
         })
         const service = yield* GuestServiceChannel
         return yield* service.start({
@@ -468,6 +471,15 @@ describe("guest exec v1 channel", () => {
       state: "running",
       startedAtEpochMs: 42
     })
+    expect(receivedStart).toMatchObject({
+      version: 1,
+      id: "encoded-start-id",
+      op: "start",
+      argv: ["/bin/true", "--serve"],
+      port: manifestPort
+    })
+    expect(receivedStart).not.toHaveProperty("cwd")
+    expect(receivedStart).not.toHaveProperty("env")
     const mismatch = await Effect.runPromise(Effect.result(runStart("second-encoded-start-id")))
     expect(Result.isFailure(mismatch) && mismatch.failure).toMatchObject({
       _tag: "GuestTransportFault",
