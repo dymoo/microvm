@@ -1088,7 +1088,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
           return withServiceRecord(request.vmId, (record, webPort) =>
             Effect.gen(function*() {
               const requestId = randomBytes(16).toString("hex")
-              const requestLine = yield* runServiceChannel(
+              const startRequest = yield* runServiceChannel(
                 record,
                 request.vmId,
                 encodeGuestServiceStartRequest({
@@ -1115,8 +1115,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
               const started = yield* runServiceChannel(record, request.vmId, guestService.start({
                 vmId: request.vmId,
                 vsockSocket: record.layout.vsockSocket,
-                requestId,
-                requestLine
+                request: startRequest
               }))
               return yield* serviceStatusResult(request.vmId, started)
             })

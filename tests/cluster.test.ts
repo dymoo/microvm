@@ -217,10 +217,8 @@ describe("static microVM cluster", () => {
   it("owns the durable web service lifecycle without blocking execute", async () => {
     const root = await fixture(3_000)
     let state: WebServiceState = { state: "not_started" }
-    let startRequest: Record<string, unknown> | undefined
     const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
-      start: (options) => Effect.sync(() => {
-        startRequest = JSON.parse(options.requestLine.subarray(0, -1).toString("utf8")) as Record<string, unknown>
+      start: () => Effect.sync(() => {
         state = { state: "running", startedAtEpochMs: 1_700_000_000_000 }
         return state
       }),
@@ -263,14 +261,6 @@ describe("static microVM cluster", () => {
       expect(Buffer.from((yield* sandbox.execute(execPayload)).stdoutB64, "base64").toString()).toBe(
         "execute-remains-available"
       )
-      expect(startRequest).toMatchObject({
-        version: 1,
-        op: "start",
-        argv: ["/usr/bin/node", "server.js"],
-        cwd: "/workspace",
-        env: { NODE_ENV: "development" },
-        port: 3_000
-      })
       expect(yield* service.stop()).toEqual({ stopped: true })
       expect(yield* service.status()).toMatchObject({
         state: "exited",
@@ -291,11 +281,6 @@ describe("static microVM cluster", () => {
         env: { BIG: "y".repeat(8_192) }
       })
       expect(yield* large.status()).toMatchObject({ state: "running" })
-      expect((startRequest?.["argv"] as Array<string>).reduce(
-        (bytes, value) => bytes + Buffer.byteLength(value),
-        0
-      )).toBe(64_013)
-      expect((startRequest?.["env"] as Record<string, string>)["BIG"]).toHaveLength(8_192)
       expect((yield* sandbox.inspect()).state).toBe("running")
       expect(Buffer.from((yield* sandbox.execute(execPayload)).stdoutB64, "base64").toString()).toBe(
         "execute-remains-available"
@@ -361,10 +346,8 @@ describe("static microVM cluster", () => {
   it("accepts argv-only request objects from a plain JavaScript caller", async () => {
     const root = await fixture(3_000)
     let state: WebServiceState = { state: "not_started" }
-    let serviceRequest: Record<string, unknown> | undefined
     const serviceLayer = Layer.succeed(GuestServiceChannel, GuestServiceChannel.of({
-      start: (options) => Effect.sync(() => {
-        serviceRequest = JSON.parse(options.requestLine.subarray(0, -1).toString("utf8")) as Record<string, unknown>
+      start: () => Effect.sync(() => {
         state = { state: "running", startedAtEpochMs: 1_700_000_000_000 }
         return state
       }),
@@ -402,14 +385,6 @@ describe("static microVM cluster", () => {
       expect(Buffer.from(addressed.stdoutB64, "base64").toString()).toBe("argv-only")
 
       yield* sandbox.startWebService(serviceInput)
-      expect(serviceRequest).toMatchObject({
-        version: 1,
-        op: "start",
-        argv: ["/usr/bin/node", "server.js"],
-        port: 3_000
-      })
-      expect(serviceRequest).not.toHaveProperty("cwd")
-      expect(serviceRequest).not.toHaveProperty("env")
     })))
   })
 

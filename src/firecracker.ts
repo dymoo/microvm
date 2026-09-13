@@ -741,18 +741,46 @@ export const GuestHttpChannelLive: Layer.Layer<GuestHttpChannel> = Layer.effect(
   }))
 )
 
-interface GuestServiceCommonOptions {
+interface GuestServiceConnectionOptions {
   readonly vmId: string
   readonly vsockSocket: string
-  readonly requestId: string
   /** Bound on the guest's reply for this exchange. */
   readonly deadlineMs?: number | undefined
 }
 
+interface GuestServiceCommonOptions extends GuestServiceConnectionOptions {
+  readonly requestId: string
+}
+
+const EncodedGuestServiceStartRequestTypeId: unique symbol = Symbol(
+  "microvm/firecracker/EncodedGuestServiceStartRequest"
+)
+const EncodedGuestServiceStartRequestId: unique symbol = Symbol(
+  "microvm/firecracker/EncodedGuestServiceStartRequest/id"
+)
+const EncodedGuestServiceStartRequestLine: unique symbol = Symbol(
+  "microvm/firecracker/EncodedGuestServiceStartRequest/line"
+)
+
+/** @internal Opaque validated start line with an inseparable correlation id. */
+export interface EncodedGuestServiceStartRequest {
+  readonly [EncodedGuestServiceStartRequestTypeId]: typeof EncodedGuestServiceStartRequestTypeId
+}
+
+type EncodedGuestServiceStartRequestState = EncodedGuestServiceStartRequest & {
+  readonly [EncodedGuestServiceStartRequestId]: string
+  readonly [EncodedGuestServiceStartRequestLine]: Buffer
+}
+
+const encodedGuestServiceStartRequestId = (request: EncodedGuestServiceStartRequest): string =>
+  (request as EncodedGuestServiceStartRequestState)[EncodedGuestServiceStartRequestId]
+
+const encodedGuestServiceStartRequestLine = (request: EncodedGuestServiceStartRequest): Buffer =>
+  (request as EncodedGuestServiceStartRequestState)[EncodedGuestServiceStartRequestLine]
+
 export class GuestServiceChannel extends Context.Service<GuestServiceChannel, {
-  readonly start: (options: GuestServiceCommonOptions & {
-    /** Exact validated JSON request plus its terminal newline. */
-    readonly requestLine: Buffer
+  readonly start: (options: GuestServiceConnectionOptions & {
+    readonly request: EncodedGuestServiceStartRequest
   }) => Effect.Effect<WebServiceState, GuestServiceError | GuestTransportFault>
   readonly status: (
     options: GuestServiceCommonOptions
@@ -842,7 +870,7 @@ export const encodeGuestServiceStartRequest = Effect.fn("encodeGuestServiceStart
     readonly cwd?: string | undefined
     readonly env?: Readonly<Record<string, string>> | undefined
     readonly webPort: number
-  }): Effect.fn.Return<Buffer, GuestServiceError> {
+  }): Effect.fn.Return<EncodedGuestServiceStartRequest, GuestServiceError> {
     const request: Record<string, unknown> = {
       version: 1,
       id: options.requestId,
@@ -852,7 +880,12 @@ export const encodeGuestServiceStartRequest = Effect.fn("encodeGuestServiceStart
     }
     if (options.cwd !== undefined) request["cwd"] = options.cwd
     if (options.env !== undefined) request["env"] = options.env
-    return yield* encodeServiceRequest(request, options.vmId)
+    const requestLine = yield* encodeServiceRequest(request, options.vmId)
+    return Object.freeze<EncodedGuestServiceStartRequestState>({
+      [EncodedGuestServiceStartRequestTypeId]: EncodedGuestServiceStartRequestTypeId,
+      [EncodedGuestServiceStartRequestId]: options.requestId,
+      [EncodedGuestServiceStartRequestLine]: requestLine
+    })
   }
 )
 
@@ -959,7 +992,7 @@ export const GuestServiceChannelLive: Layer.Layer<GuestServiceChannel> = Layer.e
   Effect.sync(() => {
     const exchangeLine = Effect.fn("GuestServiceChannel.exchangeLine")(
       function*(
-        options: GuestServiceCommonOptions,
+        options: GuestServiceConnectionOptions,
         requestLine: Buffer
       ): Effect.fn.Return<unknown, GuestTransportFault> {
         return yield* Effect.scoped(
@@ -986,11 +1019,12 @@ export const GuestServiceChannelLive: Layer.Layer<GuestServiceChannel> = Layer.e
     )
 
     const start: GuestServiceChannel["Service"]["start"] = (options) => {
-      return exchangeLine(options, options.requestLine).pipe(
+      const requestId = encodedGuestServiceStartRequestId(options.request)
+      return exchangeLine(options, encodedGuestServiceStartRequestLine(options.request)).pipe(
         Effect.flatMap((parsed) => {
           const started = decodeServiceStarted(parsed)
           if (started._tag === "Success") {
-            if (started.success.id !== options.requestId) {
+            if (started.success.id !== requestId) {
               return Effect.fail(new GuestTransportFault({
                 vmId: options.vmId,
                 reason: "guest service response id mismatch"
@@ -1001,7 +1035,7 @@ export const GuestServiceChannelLive: Layer.Layer<GuestServiceChannel> = Layer.e
               startedAtEpochMs: started.success.startedAtEpochMs
             })
           }
-          return serviceFailure(parsed, options.vmId, options.requestId)
+          return serviceFailure(parsed, options.vmId, requestId)
         })
       )
     }

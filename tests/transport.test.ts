@@ -391,7 +391,7 @@ describe("guest exec v1 channel", () => {
     const state = await Effect.runPromise(
       Effect.gen(function*() {
         const requestId = "large-start"
-        const requestLine = yield* encodeGuestServiceStartRequest({
+        const request = yield* encodeGuestServiceStartRequest({
           vmId: "mvm-test0001",
           requestId,
           argv: ["/usr/bin/node", ...Array.from({ length: 16 }, () => "x".repeat(4_000))],
@@ -402,14 +402,77 @@ describe("guest exec v1 channel", () => {
         return yield* service.start({
           vmId: "mvm-test0001",
           vsockSocket: guest.path,
-          requestId,
-          requestLine
+          request
         })
       }).pipe(Effect.provide(GuestServiceChannelLive))
     )
 
     expect(receivedBytes).toBeGreaterThan(64 * 1024)
     expect(state).toEqual({ state: "running", startedAtEpochMs: 42 })
+  })
+
+  it("correlates a start response to its encoded identity without a second caller-supplied id", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mvm-test-"))
+    const path = join(dir, "v.sock")
+    let exchanges = 0
+    const server = createServer((socket) => {
+      let buffer = ""
+      let connected = false
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8")
+        const newline = buffer.indexOf("\n")
+        if (newline === -1) return
+        if (!connected) {
+          buffer = buffer.slice(newline + 1)
+          connected = true
+          socket.write("OK 1073741824\n")
+          return
+        }
+        const request = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>
+        exchanges++
+        socket.end(`${JSON.stringify({
+          version: 1,
+          id: exchanges === 1 ? request["id"] : "different-id",
+          type: "started",
+          startedAtEpochMs: 42
+        })}\n`)
+      })
+    })
+    server.listen(path)
+    await started(server)
+    const guest = track({
+      path,
+      cleanup: async () => {
+        server.close()
+        await closed(server)
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+    const runStart = (requestId: string) =>
+      Effect.gen(function*() {
+        const request = yield* encodeGuestServiceStartRequest({
+          vmId: "mvm-test0001",
+          requestId,
+          argv: ["/bin/true"],
+          webPort: 3_000
+        })
+        const service = yield* GuestServiceChannel
+        return yield* service.start({
+          vmId: "mvm-test0001",
+          vsockSocket: guest.path,
+          request
+        })
+      }).pipe(Effect.provide(GuestServiceChannelLive))
+
+    await expect(Effect.runPromise(runStart("encoded-start-id"))).resolves.toEqual({
+      state: "running",
+      startedAtEpochMs: 42
+    })
+    const mismatch = await Effect.runPromise(Effect.result(runStart("second-encoded-start-id")))
+    expect(Result.isFailure(mismatch) && mismatch.failure).toMatchObject({
+      _tag: "GuestTransportFault",
+      reason: "guest service response id mismatch"
+    })
   })
 
   it("preserves a well-formed guest INTERNAL response as a service failure", async () => {
@@ -515,7 +578,7 @@ describe("guest exec v1 channel", () => {
     const maximumArgument = "x".repeat(MAX_SERVICE_CONTROL_LINE_BYTES + 1 - baseLineBytes)
     const runStart = (argument: string) =>
       Effect.gen(function*() {
-        const requestLine = yield* encodeGuestServiceStartRequest({
+        const request = yield* encodeGuestServiceStartRequest({
           vmId: "mvm-test0001",
           requestId,
           argv: [argument],
@@ -525,8 +588,7 @@ describe("guest exec v1 channel", () => {
         return yield* service.start({
           vmId: "mvm-test0001",
           vsockSocket: guest.path,
-          requestId,
-          requestLine
+          request
         })
       }).pipe(Effect.provide(GuestServiceChannelLive))
 
@@ -616,7 +678,7 @@ describe("guest exec v1 channel", () => {
     const rejected = await Effect.runPromise(
       Effect.gen(function*() {
         const requestId = "unencodable"
-        const requestLine = yield* encodeGuestServiceStartRequest({
+        const request = yield* encodeGuestServiceStartRequest({
           vmId: "mvm-test0001",
           requestId,
           argv: ["/bin/true"],
@@ -627,8 +689,7 @@ describe("guest exec v1 channel", () => {
         return yield* service.start({
           vmId: "mvm-test0001",
           vsockSocket: join(tmpdir(), "service-must-not-open.sock"),
-          requestId,
-          requestLine
+          request
         })
       }).pipe(Effect.provide(GuestServiceChannelLive), Effect.flip)
     )
