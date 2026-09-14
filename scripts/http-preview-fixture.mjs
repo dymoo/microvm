@@ -30,19 +30,28 @@ const server = http.createServer((request, response) => {
   }
   response.end("guest-http-ok")
 })
-server.on("upgrade", (request, socket) => {
+server.on("upgrade", (request, socket, head) => {
   const key = request.headers["sec-websocket-key"]
   if (request.method !== "GET" || request.headers.upgrade !== "websocket" || typeof key !== "string") return socket.destroy()
   const accept = createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64")
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n")
-  socket.on("data", (frame) => {
-    if (frame.length < 6 || (frame[0] & 15) !== 1 || (frame[1] & 128) === 0) return socket.destroy()
-    const length = frame[1] & 127
-    if (length >= 126 || frame.length < 6 + length) return socket.destroy()
-    const payload = Buffer.alloc(length)
-    for (let index = 0; index < length; index++) payload[index] = frame[6 + index] ^ frame[2 + (index % 4)]
-    socket.write(Buffer.concat([Buffer.from([0x81, length]), payload]))
-  })
+  let pending = Buffer.alloc(0)
+  const feed = (chunk) => {
+    if (socket.destroyed) return
+    pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk])
+    while (pending.length >= 2) {
+      if (pending[0] !== 0x81 || (pending[1] & 128) === 0) return socket.destroy()
+      const length = pending[1] & 127
+      if (length >= 126) return socket.destroy()
+      if (pending.length < 6 + length) return
+      const payload = Buffer.alloc(length)
+      for (let index = 0; index < length; index++) payload[index] = pending[6 + index] ^ pending[2 + (index % 4)]
+      socket.write(Buffer.concat([Buffer.from([0x81, length]), payload]))
+      pending = pending.subarray(6 + length)
+    }
+  }
+  socket.on("data", feed)
+  if (head.length > 0) feed(head)
 })
 server.listen(Number(process.env.PORT), process.env.HOSTNAME)
 `

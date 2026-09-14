@@ -1,8 +1,10 @@
+import { createHash, randomBytes } from "node:crypto"
 import { createServer, request as httpRequest } from "node:http"
 import { connect as openConnection } from "node:net"
 
 const CLOSE_DEADLINE_MS = 2_000
 const PROBE_DEADLINE_MS = 5_000
+const WEBSOCKET_DEADLINE_MS = 30_000
 
 const timedOut = (label, milliseconds) => new Error(`${label} exceeded ${milliseconds}ms`)
 
@@ -122,6 +124,158 @@ export const rawStatus = (
       if (match === null) settle(new Error(`${label} received a malformed response`), undefined, true)
       else settle(undefined, Number(match[1]), true)
     })
+  } catch (error) {
+    settle(error, undefined, true)
+  }
+  return result.promise
+}
+
+/**
+ * Builds one masked client text frame for the echo probe. Frames stay within
+ * the single-byte length form, matching the guest fixture's short-frame
+ * contract.
+ */
+export const websocketFrame = (text) => {
+  const payload = Buffer.from(text)
+  if (payload.length >= 126) {
+    throw new Error("websocket frame payload is unexpectedly large")
+  }
+  const mask = randomBytes(4)
+  const frame = Buffer.alloc(6 + payload.length)
+  frame[0] = 0x81
+  frame[1] = 0x80 | payload.length
+  mask.copy(frame, 2)
+  for (let index = 0; index < payload.length; index++) {
+    frame[6 + index] = payload[index] ^ mask[index % 4]
+  }
+  return frame
+}
+
+/**
+ * Upgrades one raw loopback connection for the echo probe under an absolute
+ * wall-clock deadline. Peer `end`, `close`, and `error` settle the handshake
+ * immediately: the socket inactivity timer stops once the socket closes, so
+ * a peer that dies before the 101 would otherwise leave the handshake
+ * pending until the outer job deadline.
+ */
+export const openWebSocket = (
+  port,
+  path = "/ws",
+  { timeoutMs = WEBSOCKET_DEADLINE_MS, connect = openConnection } = {}
+) => {
+  const result = Promise.withResolvers()
+  const label = `websocket handshake ${path}`
+  const key = randomBytes(16).toString("base64")
+  let socket
+  let bytes = Buffer.alloc(0)
+  let settled = false
+  let deadline
+
+  const onData = (chunk) => {
+    bytes = Buffer.concat([bytes, chunk])
+    const headEnd = bytes.indexOf("\r\n\r\n")
+    if (headEnd === -1) return
+    const head = bytes.subarray(0, headEnd).toString("ascii")
+    const accept = createHash("sha1")
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest("base64")
+    if (
+      !head.startsWith("HTTP/1.1 101 ") ||
+      !head.toLowerCase().includes(`sec-websocket-accept: ${accept}`.toLowerCase())
+    ) {
+      settle(new Error(`websocket upgrade failed: ${head.split("\r\n")[0]}`), undefined, true)
+      return
+    }
+    settle(undefined, socket)
+  }
+  const onError = (error) => settle(error, undefined, true)
+  const onClosed = () => settle(new Error(`${label} connection closed before response`), undefined, true)
+
+  const settle = (error, value, destroy = false) => {
+    if (settled) return
+    settled = true
+    clearTimeout(deadline)
+    socket?.off("data", onData)
+    socket?.off("error", onError)
+    socket?.off("end", onClosed)
+    socket?.off("close", onClosed)
+    if (destroy) socket?.destroy()
+    if (error === undefined) result.resolve(value)
+    else result.reject(error)
+  }
+
+  deadline = setTimeout(
+    () => settle(timedOut(label, timeoutMs), undefined, true),
+    timeoutMs
+  )
+  try {
+    socket = connect({ host: "127.0.0.1", port })
+    socket.once("error", onError)
+    socket.once("end", onClosed)
+    socket.once("close", onClosed)
+    socket.on("data", onData)
+    socket.once("connect", () => {
+      try {
+        socket.write(
+          `GET ${path} HTTP/1.1\r\nHost: trusted.invalid\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${key}\r\n\r\n`
+        )
+      } catch (error) {
+        settle(error, undefined, true)
+      }
+    })
+  } catch (error) {
+    settle(error, undefined, true)
+  }
+  return result.promise
+}
+
+/**
+ * Sends one text frame and resolves with its echoed payload under an
+ * absolute wall-clock deadline. A peer that errors, half-closes, or closes
+ * while the echo is pending rejects immediately and destroys the socket it
+ * was handed; on success the socket keeps no helper listeners, so the caller
+ * can still watch it for teardown.
+ */
+export const echoWebSocket = (socket, text, { timeoutMs = WEBSOCKET_DEADLINE_MS } = {}) => {
+  const result = Promise.withResolvers()
+  const label = "websocket echo"
+  let bytes = Buffer.alloc(0)
+  let settled = false
+  let deadline
+
+  const onData = (chunk) => {
+    bytes = Buffer.concat([bytes, chunk])
+    if (bytes.length < 2) return
+    const length = bytes[1] & 0x7f
+    if (length >= 126 || bytes.length < 2 + length) return
+    settle(undefined, bytes.subarray(2, 2 + length).toString("utf8"))
+  }
+  const onError = (error) => settle(error, undefined, true)
+  const onClosed = () => settle(new Error(`${label} connection closed before echo`), undefined, true)
+
+  const settle = (error, value, destroy = false) => {
+    if (settled) return
+    settled = true
+    clearTimeout(deadline)
+    socket.off("data", onData)
+    socket.off("error", onError)
+    socket.off("end", onClosed)
+    socket.off("close", onClosed)
+    if (destroy) socket.destroy()
+    if (error === undefined) result.resolve(value)
+    else result.reject(error)
+  }
+
+  deadline = setTimeout(
+    () => settle(timedOut(label, timeoutMs), undefined, true),
+    timeoutMs
+  )
+  try {
+    socket.on("data", onData)
+    socket.once("error", onError)
+    socket.once("end", onClosed)
+    socket.once("close", onClosed)
+    socket.write(websocketFrame(text))
   } catch (error) {
     settle(error, undefined, true)
   }

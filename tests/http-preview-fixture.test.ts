@@ -88,6 +88,88 @@ const stopFixture = async (child: ChildProcessWithoutNullStreams): Promise<void>
   await settleWithin(exited, "fixture process exit")
 }
 
+const WEBSOCKET_HANDSHAKE =
+  "GET /ws HTTP/1.1\r\n" +
+  "Host: fixture.invalid\r\n" +
+  "Connection: Upgrade\r\n" +
+  "Upgrade: websocket\r\n" +
+  "Sec-WebSocket-Version: 13\r\n" +
+  `Sec-WebSocket-Key: ${WEBSOCKET_KEY}\r\n\r\n`
+
+const FRAME_MASK = Buffer.from([0x2b, 0x7e, 0x15, 0x16])
+
+const maskedTextFrame = (text: string): Buffer => {
+  const payload = Buffer.from(text, "utf8")
+  if (payload.length >= 126) throw new Error("test frame exceeds the small-frame protocol")
+  const frame = Buffer.alloc(6 + payload.length)
+  frame[0] = 0x81
+  frame[1] = 0x80 | payload.length
+  FRAME_MASK.copy(frame, 2)
+  for (let index = 0; index < payload.length; index++) {
+    frame[6 + index] = payload[index] ^ FRAME_MASK[index % 4]
+  }
+  return frame
+}
+
+const openUpgradedSocket = async (port: number, prefix?: Buffer): Promise<{ socket: Socket; rest: Buffer }> => {
+  const socket = await connectToFixture(port)
+  socket.write(prefix === undefined ? WEBSOCKET_HANDSHAKE : Buffer.concat([Buffer.from(WEBSOCKET_HANDSHAKE), prefix]))
+  const header = await settleWithin(readThrough(socket, Buffer.from("\r\n\r\n")), "fixture WebSocket response")
+  const headerEnd = header.indexOf("\r\n\r\n")
+  if (headerEnd < 0) throw new Error("fixture WebSocket response lacked a header terminator")
+  const lines = header.subarray(0, headerEnd).toString("ascii").split("\r\n")
+  const expectedAccept = createHash("sha1")
+    .update(`${WEBSOCKET_KEY}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+    .digest("base64")
+  if (lines[0] !== "HTTP/1.1 101 Switching Protocols") throw new Error(`fixture upgrade failed: ${lines[0]}`)
+  if (!lines.slice(1).map((line) => line.toLowerCase()).includes(`sec-websocket-accept: ${expectedAccept}`.toLowerCase())) {
+    throw new Error("fixture upgrade accept key mismatch")
+  }
+  return { socket, rest: header.subarray(headerEnd + 4) }
+}
+
+const readEchoes = (socket: Socket, initial: Buffer, count: number): Promise<string[]> =>
+  settleWithin(new Promise<string[]>((resolve, reject) => {
+    let bytes = initial
+    const payloads: string[] = []
+    const cleanup = () => {
+      socket.off("data", onData)
+      socket.off("error", onError)
+      socket.off("end", onEnd)
+      socket.off("close", onClose)
+    }
+    const finish = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+    const consume = () => {
+      while (bytes.length >= 2) {
+        const length = bytes[1] & 0x7f
+        if (length >= 126 || bytes.length < 2 + length) return
+        if (bytes[0] !== 0x81) return finish(new Error("fixture echoed an unsupported frame"))
+        if ((bytes[1] & 0x80) !== 0) return finish(new Error("fixture echoed a masked frame"))
+        payloads.push(bytes.subarray(2, 2 + length).toString("utf8"))
+        bytes = bytes.subarray(2 + length)
+        if (payloads.length === count) {
+          cleanup()
+          resolve(payloads)
+        }
+      }
+    }
+    const onData = (chunk: Buffer) => {
+      bytes = Buffer.concat([bytes, chunk])
+      consume()
+    }
+    const onError = (error: Error) => finish(error)
+    const onEnd = () => finish(new Error("fixture stream ended before echo"))
+    const onClose = () => finish(new Error("fixture closed the connection before echo"))
+    socket.on("data", onData)
+    socket.once("error", onError)
+    socket.once("end", onEnd)
+    socket.once("close", onClose)
+    consume()
+  }), "fixture websocket echo")
+
 describe("HTTP preview guest fixture", () => {
   it("emits a valid CRLF WebSocket 101 and newline-framed SSE event", async () => {
     const port = await reservePort()
@@ -101,14 +183,7 @@ describe("HTTP preview guest fixture", () => {
 
     try {
       websocket = await connectToFixture(port)
-      websocket.write(
-        "GET /ws HTTP/1.1\r\n" +
-        "Host: fixture.invalid\r\n" +
-        "Connection: Upgrade\r\n" +
-        "Upgrade: websocket\r\n" +
-        "Sec-WebSocket-Version: 13\r\n" +
-        `Sec-WebSocket-Key: ${WEBSOCKET_KEY}\r\n\r\n`
-      )
+      websocket.write(WEBSOCKET_HANDSHAKE)
       const header = await settleWithin(
         readThrough(websocket, Buffer.from("\r\n\r\n")),
         "fixture WebSocket response"
@@ -135,6 +210,53 @@ describe("HTTP preview guest fixture", () => {
       websocket?.destroy()
       sseResponse?.destroy()
       sseRequest?.destroy()
+      await stopFixture(child)
+    }
+  })
+
+  it("echoes a masked text frame split after its six-byte header", async () => {
+    const port = await reservePort()
+    const child = spawn(process.execPath, ["-e", guestProtocolService], {
+      env: { ...process.env, HOSTNAME: "127.0.0.1", PORT: String(port) },
+      stdio: ["pipe", "pipe", "pipe"]
+    })
+    let websocket: Socket | undefined
+    try {
+      const frame = maskedTextFrame("split-header-echo")
+      const { socket, rest } = await openUpgradedSocket(port, frame.subarray(0, 6))
+      websocket = socket
+      // Sending the header half inside the upgrade segment and holding the
+      // payload half until the first actual server data (the 101 response)
+      // makes the split causal: the fixture has already consumed the head
+      // bytes before the payload can exist on the wire.
+      websocket.write(frame.subarray(6))
+      const echoes = await readEchoes(websocket, rest, 1)
+      expect(echoes).toEqual(["split-header-echo"])
+    } finally {
+      websocket?.destroy()
+      await stopFixture(child)
+    }
+  })
+
+  it("echoes coalesced frames from the upgrade head in order", async () => {
+    const port = await reservePort()
+    const child = spawn(process.execPath, ["-e", guestProtocolService], {
+      env: { ...process.env, HOSTNAME: "127.0.0.1", PORT: String(port) },
+      stdio: ["pipe", "pipe", "pipe"]
+    })
+    let websocket: Socket | undefined
+    try {
+      const combined = Buffer.concat([
+        maskedTextFrame("one"),
+        maskedTextFrame("two"),
+        maskedTextFrame("three")
+      ])
+      const { socket, rest } = await openUpgradedSocket(port, combined)
+      websocket = socket
+      const echoes = await readEchoes(websocket, rest, 3)
+      expect(echoes).toEqual(["one", "two", "three"])
+    } finally {
+      websocket?.destroy()
       await stopFixture(child)
     }
   })

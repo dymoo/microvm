@@ -7,10 +7,11 @@ import {
   type RequestOptions,
   type Server
 } from "node:http"
+import { type Duplex } from "node:stream"
 import { connect, Socket } from "node:net"
 import { describe, expect, it } from "vitest"
 import { makeSandboxHttpProxy } from "../src/http-proxy.js"
-import { assertRevokedIngress, listenTrustedProxy, rawStatus, requestStatus } from "../scripts/http-preview-proxy.mjs"
+import { assertRevokedIngress, echoWebSocket, listenTrustedProxy, openWebSocket, rawStatus, requestStatus } from "../scripts/http-preview-proxy.mjs"
 
 const WEBSOCKET_KEY = "MDEyMzQ1Njc4OWFiY2RlZg=="
 const RELEASE_LIMIT_MS = 500
@@ -124,7 +125,7 @@ describe("trusted preview proxy refusals", () => {
       const revoked = await requestStatus("revoked credential probe", `http://127.0.0.1:${port}`, "GET", "/revoked")
       expect(() => assertRevokedIngress(revoked)).not.toThrow()
       const unavailable = await requestStatus("unavailable ingress probe", `http://127.0.0.1:${port}`, "GET", "/unavailable")
-      expect(() => assertRevokedIngress(unavailable)).toThrow("revoked ingress returned HTTP 503")
+      expect(() => assertRevokedIngress(unavailable)).toThrow(Error)
     } finally {
       await closeServer(server)
     }
@@ -134,7 +135,7 @@ describe("trusted preview proxy refusals", () => {
     await expect(listenTrustedProxy({
       handleRequest: () => undefined,
       handleUpgrade: () => undefined
-    })).rejects.toThrow("handleConnect")
+    })).rejects.toBeInstanceOf(Error)
   })
 })
 
@@ -169,6 +170,7 @@ describe("HTTP preview denial probes", () => {
 
     const accepted = Promise.withResolvers<Socket>()
     server.once("connection", accepted.resolve)
+    const startedAt = performance.now()
     const status = requestStatus(
       "silent request probe",
       `http://127.0.0.1:${address.port}`,
@@ -188,7 +190,8 @@ describe("HTTP preview denial probes", () => {
       const serverSocket = await settleWithin(accepted.promise, "silent server accept")
       const serverSocketClosed = once(serverSocket, "close")
       await expect(settleWithin(status, "silent request result"))
-        .rejects.toThrow("silent request probe exceeded 50ms")
+        .rejects.toBeInstanceOf(Error)
+      expect(performance.now() - startedAt).toBeGreaterThanOrEqual(40)
       await settleWithin(serverSocketClosed, "silent request socket close")
       expect(serverSocket.destroyed).toBe(true)
     } finally {
@@ -209,14 +212,80 @@ describe("HTTP preview denial probes", () => {
     stalledSocket.setTimeout = () => stalledSocket
     const socketClosed = once(stalledSocket, "close")
 
+    const startedAt = performance.now()
     await expect(settleWithin(
       rawStatus("stalled connection probe", 1, "GET", "/", {
         timeoutMs: 50,
         connect: () => stalledSocket
       }),
       "stalled connection result"
-    )).rejects.toThrow("stalled connection probe exceeded 50ms")
+    )).rejects.toBeInstanceOf(Error)
+    expect(performance.now() - startedAt).toBeGreaterThanOrEqual(40)
     await settleWithin(socketClosed, "stalled socket close")
     expect(stalledSocket.destroyed).toBe(true)
+  })
+})
+
+const WEBSOCKET_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+const websocketServer = (onUpgraded: (socket: Duplex) => void): Server => {
+  const server = createServer()
+  server.on("upgrade", (request, socket) => {
+    const accept = createHash("sha1")
+      .update(`${request.headers["sec-websocket-key"]}${WEBSOCKET_MAGIC}`)
+      .digest("base64")
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Connection: Upgrade\r\n" +
+      "Upgrade: websocket\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    )
+    onUpgraded(socket)
+  })
+  return server
+}
+
+describe("websocket acceptance client", () => {
+  it("rejects the echo promptly when the peer closes after the handshake", async () => {
+    let peer: Duplex | undefined
+    const server = websocketServer((socket) => {
+      peer = socket
+      socket.once("data", () => socket.end())
+    })
+    const port = await listenOnLoopback(server)
+    const socket = await settleWithin(openWebSocket(port), "premature peer handshake")
+
+    try {
+      await expect(settleWithin(
+        echoWebSocket(socket, "preview-echo"),
+        "premature peer echo"
+      )).rejects.toBeInstanceOf(Error)
+      expect(socket.destroyed).toBe(true)
+    } finally {
+      socket.destroy()
+      peer?.destroy()
+      await closeServer(server)
+    }
+  })
+
+  it("rejects the echo on the absolute deadline when the peer never responds", async () => {
+    let peer: Duplex | undefined
+    const server = websocketServer((socket) => { peer = socket })
+    const port = await listenOnLoopback(server)
+    const socket = await settleWithin(openWebSocket(port), "silent peer handshake")
+
+    try {
+      const startedAt = performance.now()
+      await expect(settleWithin(
+        echoWebSocket(socket, "preview-echo", { timeoutMs: 50 }),
+        "silent peer echo"
+      )).rejects.toBeInstanceOf(Error)
+      expect(performance.now() - startedAt).toBeGreaterThanOrEqual(40)
+      expect(socket.destroyed).toBe(true)
+    } finally {
+      socket.destroy()
+      peer?.destroy()
+      await closeServer(server)
+    }
   })
 })

@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 
-import { randomBytes, createHash } from "node:crypto"
 import { once } from "node:events"
 import { writeSync } from "node:fs"
 import { request as httpRequest } from "node:http"
-import { connect } from "node:net"
 import { Effect, Exit, Result } from "effect"
 import { makeMicrovmClient, makeMicrovmCluster } from "../dist/index.js"
-import { assertRevokedIngress, listenTrustedProxy, rawStatus, requestStatus } from "./http-preview-proxy.mjs"
+import { assertRevokedIngress, echoWebSocket, listenTrustedProxy, openWebSocket, rawStatus, requestStatus } from "./http-preview-proxy.mjs"
 import { guestProtocolService } from "./http-preview-fixture.mjs"
 
 let currentOperation = "initialization"
@@ -89,7 +87,6 @@ const DEADLINES = {
   rpcCreateMs: 300_000,
   cleanupMs: 30_000,
   requestMs: 30_000,
-  websocketMs: 30_000,
   streamMs: 60_000
 }
 
@@ -189,73 +186,6 @@ const requestJson = (origin, target, headers) => new Promise((resolve, reject) =
   request.end()
 })
 
-
-const websocketFrame = (text) => {
-  const payload = Buffer.from(text)
-  assert(payload.length < 126, "acceptance websocket payload is unexpectedly large")
-  const mask = randomBytes(4)
-  const frame = Buffer.alloc(6 + payload.length)
-  frame[0] = 0x81
-  frame[1] = 0x80 | payload.length
-  mask.copy(frame, 2)
-  for (let index = 0; index < payload.length; index++) frame[6 + index] = payload[index] ^ mask[index % 4]
-  return frame
-}
-
-const openWebSocket = (port, path = "/ws") => new Promise((resolve, reject) => {
-  const socket = connect({ host: "127.0.0.1", port })
-  const key = randomBytes(16).toString("base64")
-  let bytes = Buffer.alloc(0)
-  const fail = (error) => {
-    socket.destroy()
-    reject(error)
-  }
-  socket.setTimeout(DEADLINES.websocketMs, () => fail(expired(`websocket handshake ${path}`, DEADLINES.websocketMs)))
-  socket.once("error", fail)
-  socket.once("connect", () => socket.write(
-    `GET ${path} HTTP/1.1\r\nHost: trusted.invalid\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${key}\r\n\r\n`
-  ))
-  socket.on("data", function handshake(chunk) {
-    bytes = Buffer.concat([bytes, chunk])
-    const end = bytes.indexOf("\r\n\r\n")
-    if (end === -1) return
-    socket.off("data", handshake)
-    socket.off("error", fail)
-    const head = bytes.subarray(0, end).toString("ascii")
-    const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64")
-    if (!head.startsWith("HTTP/1.1 101 ") || !head.toLowerCase().includes(`sec-websocket-accept: ${accept}`.toLowerCase())) {
-      fail(new Error(`websocket upgrade failed: ${head.split("\r\n")[0]}`))
-      return
-    }
-    socket.setTimeout(0)
-    resolve(socket)
-  })
-})
-
-const echoWebSocket = (socket, text) => new Promise((resolve, reject) => {
-  let bytes = Buffer.alloc(0)
-  const fail = (error) => {
-    socket.off("data", onData)
-    reject(error)
-  }
-  const onData = (chunk) => {
-    bytes = Buffer.concat([bytes, chunk])
-    if (bytes.length < 2) return
-    const length = bytes[1] & 0x7f
-    if (length >= 126 || bytes.length < 2 + length) return
-    socket.off("data", onData)
-    socket.off("error", fail)
-    socket.setTimeout(0)
-    resolve(bytes.subarray(2, 2 + length).toString("utf8"))
-  }
-  socket.setTimeout(DEADLINES.websocketMs, () => {
-    fail(expired("websocket echo", DEADLINES.websocketMs))
-    socket.destroy()
-  })
-  socket.once("error", fail)
-  socket.on("data", onData)
-  socket.write(websocketFrame(text))
-})
 
 const closeWithin = async (promise, milliseconds, label) => {
   await Promise.race([
