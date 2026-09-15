@@ -252,6 +252,29 @@ describe("workerd HTTP ingress", () => {
     expect(globalFetch).not.toHaveBeenCalled()
   })
 
+  it("preserves a binding fetch's encoded response body and content coding", async () => {
+    const compressed = Uint8Array.from([0x1f, 0x8b, 0x08, 0x00])
+    const upstream = (async () =>
+      new Response(compressed, {
+        headers: {
+          "content-encoding": "gzip",
+          "content-length": String(compressed.byteLength)
+        }
+      })) as typeof globalThis.fetch
+    const ingress = makeSandboxHttpIngress({
+      url: "http://127.0.0.1:39601",
+      vmId: VM_ID,
+      httpIngressToken: "mvi_workerd_token",
+      fetch: upstream
+    })
+
+    const response = await ingress.handle(new Request("http://internal.test/"))
+
+    expect(response.headers.get("content-encoding")).toBe("gzip")
+    expect(response.headers.get("content-length")).toBeNull()
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(compressed)
+  })
+
   it("throws ClientConfigurationError when the binding fetch is absent", () => {
     expect(() =>
       makeSandboxHttpIngress({

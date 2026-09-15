@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { gzipSync } from "node:zlib"
 import { once } from "node:events"
 import { existsSync } from "node:fs"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -13,9 +14,12 @@ import {
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { Readable } from "node:stream"
+import { pipeline } from "node:stream/promises"
 import { Effect, Layer } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { makeMicrovmClient } from "../src/client-raw.js"
+import { makeSandboxHttpIngress } from "../src/index.js"
 import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import { INGRESS_IDLE_MS, ingressIdleGuard } from "../src/daemon-http-proxy.js"
@@ -311,6 +315,82 @@ describe("daemon HTTP ingress", () => {
         expect(tooMany.status).toBe(502)
       })))
     } finally {
+      await closeServer(origin)
+    }
+  })
+
+
+  it("requests identity on the Node hop and refuses an unexpected coded response", async () => {
+    const root = await prepareFixture()
+    const compressed = gzipSync("Ready to build.")
+    const observedAcceptEncoding: Array<string | undefined> = []
+    const origin = createServer((request, response) => {
+      observedAcceptEncoding.push(request.headers["accept-encoding"])
+      if (request.url === "/not-modified") {
+        response.writeHead(304, { "content-encoding": "gzip" })
+        response.end()
+        return
+      }
+      if (request.url === "/forced" || request.headers["accept-encoding"] !== "identity") {
+        response.writeHead(200, {
+          "content-encoding": "gzip",
+          "content-length": compressed.byteLength,
+          "content-type": "text/html; charset=utf-8"
+        })
+        response.end(compressed)
+        return
+      }
+      response.end("Ready to build.")
+    })
+    const originPort = await listen(origin)
+    const daemonServer = createServer()
+    const bridges: Array<Server> = []
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+        const daemon = yield* startDaemon(root, daemonServer, originPort)
+        const { created } = yield* createVm(daemon.port)
+        const ingress = makeSandboxHttpIngress({
+          url: `http://127.0.0.1:${daemon.port}`,
+          vmId: created.vm.vmId,
+          httpIngressToken: created.httpIngressToken
+        })
+        // Same Node bridge used by the hosted acceptance: the outer Fetch
+        // advertises compression, but the daemon hop must remain identity.
+        const bridge = createServer(async (incoming, outgoing) => {
+          const headers = new Headers()
+          for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+            headers.append(incoming.rawHeaders[index]!, incoming.rawHeaders[index + 1]!)
+          }
+          const response = await ingress.handle(new Request(
+            `http://preview.test${incoming.url ?? "/"}`,
+            { method: incoming.method, headers }
+          ))
+          outgoing.writeHead(response.status, Object.fromEntries(response.headers.entries()))
+          if (response.body === null) outgoing.end()
+          else await pipeline(Readable.fromWeb(response.body), outgoing)
+        })
+        bridges.push(bridge)
+        const bridgePort = yield* Effect.promise(() => listen(bridge))
+        const ready = yield* Effect.promise(() => fetch(`http://127.0.0.1:${bridgePort}/`, {
+          signal: AbortSignal.timeout(2_000)
+        }))
+        expect(ready.status).toBe(200)
+        expect(yield* Effect.promise(() => ready.text())).toBe("Ready to build.")
+
+        const forced = yield* Effect.promise(() => fetch(`http://127.0.0.1:${bridgePort}/forced`, {
+          signal: AbortSignal.timeout(2_000)
+        }))
+        expect(forced.status).toBe(502)
+
+        const notModified = yield* Effect.promise(() =>
+          fetch(`http://127.0.0.1:${bridgePort}/not-modified`, {
+            signal: AbortSignal.timeout(2_000)
+          }))
+        expect(notModified.status).toBe(502)
+        expect(observedAcceptEncoding).toEqual(["identity", "identity", "identity"])
+      })))
+    } finally {
+      while (bridges.length > 0) await closeServer(bridges.pop()!)
       await closeServer(origin)
     }
   })

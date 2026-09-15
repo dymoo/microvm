@@ -4,6 +4,28 @@ import {
   type SandboxHttpIngressOptions as SharedHttpIngressOptions
 } from "./http-ingress.js"
 
+/**
+ * Node Fetch transparently decodes coded response bodies while retaining
+ * their wire headers. Request identity on this private hop and reject a guest
+ * that ignores it; workerd binding fetches intentionally keep encoded
+ * pass-through semantics instead.
+ */
+const identityNodeFetch = (fetch: typeof globalThis.fetch): typeof globalThis.fetch =>
+  async (input, init) => {
+    const headers = new Headers(init?.headers)
+    headers.set("accept-encoding", "identity")
+    const response = await fetch(input, { ...init, headers })
+    const encoding = response.headers.get("content-encoding")
+    if (
+      encoding !== null &&
+      encoding.split(",").some((item) => item.trim().toLowerCase() !== "identity")
+    ) {
+      if (response.body !== null) void response.body.cancel().catch(() => undefined)
+      throw new TypeError("Node ingress received a coded response after requesting identity")
+    }
+    return response
+  }
+
 export {
   SANDBOX_SYSTEM_PROMPT,
   TOOL_GUIDANCE,
@@ -47,7 +69,7 @@ export const makeSandboxHttpIngress = (
   const { fetch: configuredFetch, ...sharedOptions } = options
   return makeSharedHttpIngress({
     ...sharedOptions,
-    fetch: configuredFetch ?? globalThis.fetch
+    fetch: identityNodeFetch(configuredFetch ?? globalThis.fetch)
   })
 }
 
