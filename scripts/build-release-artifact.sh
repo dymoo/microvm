@@ -118,7 +118,7 @@ mkdir -p "$PAYLOAD"
 
 # Materialize production dependencies for the target host. Nothing is resolved
 # on the host during deployment; the lockfile was frozen before this script.
-pnpm --silent deploy --prod --legacy --os=linux --cpu=x64 --libc=glibc "$PAYLOAD/package"
+pnpm --filter microvm deploy --prod --legacy --os=linux --cpu=x64 --libc=glibc "$PAYLOAD/package"
 [[ -x $PAYLOAD/package/dist/bin/daemon.js && -x $PAYLOAD/package/dist/bin/client.js ]] \
   || die "pnpm deploy omitted built daemon/client entrypoints"
 SDK_STAGE=$WORK/sdk
