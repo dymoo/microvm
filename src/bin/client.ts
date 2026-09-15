@@ -147,8 +147,22 @@ const exitCodeForError = (error: unknown): number => {
 
 /** One parsed command before any client exists. */
 type CliCommand =
-  | { readonly _tag: "create"; readonly image: string; readonly imageDigest: string; readonly options: ReadonlyArray<string> }
-  | { readonly _tag: "exec"; readonly vmId: string; readonly argv: ReadonlyArray<string>; readonly options: ReadonlyArray<string> }
+  | {
+      readonly _tag: "create"
+      readonly image: string
+      readonly imageDigest: string
+      readonly cpus: number | undefined
+      readonly memMib: number | undefined
+      readonly ttlSeconds: number | undefined
+    }
+  | {
+      readonly _tag: "exec"
+      readonly vmId: string
+      readonly argv: ReadonlyArray<string>
+      readonly cwd: string | undefined
+      readonly timeoutMs: number | undefined
+      readonly maxOutputBytes: number | undefined
+    }
   | { readonly _tag: "status"; readonly vmId: string }
   | { readonly _tag: "list" }
   | { readonly _tag: "destroy"; readonly vmId: string }
@@ -168,7 +182,9 @@ const buildCommand = (parsed: ParsedArguments): CliCommand => {
         _tag: "create",
         image: requiredOption(parsed.args, "--image"),
         imageDigest: requiredOption(parsed.args, "--image-digest"),
-        options: parsed.args
+        cpus: integerOption(parsed.args, "--cpus"),
+        memMib: integerOption(parsed.args, "--mem-mib"),
+        ttlSeconds: integerOption(parsed.args, "--ttl-s")
       }
     case "exec": {
       const delimiter = parsed.args.indexOf("--")
@@ -180,7 +196,9 @@ const buildCommand = (parsed: ParsedArguments): CliCommand => {
         _tag: "exec",
         vmId: requiredOption(options, "--vm"),
         argv: parsed.args.slice(delimiter + 1),
-        options
+        cwd: option(options, "--cwd"),
+        timeoutMs: integerOption(options, "--timeout-ms"),
+        maxOutputBytes: integerOption(options, "--max-output-bytes")
       }
     }
     case "status":
@@ -235,10 +253,10 @@ const executeCommand = (parsed: ParsedArguments, command: CliCommand) =>
       if (command._tag === "exec") {
         const result = yield* client.execute({
           argv: command.argv,
-          cwd: option(command.options, "--cwd"),
+          cwd: command.cwd,
           env: undefined,
-          timeoutMs: integerOption(command.options, "--timeout-ms"),
-          maxOutputBytes: integerOption(command.options, "--max-output-bytes")
+          timeoutMs: command.timeoutMs,
+          maxOutputBytes: command.maxOutputBytes
         })
         const decoded = decodeExecResult(result)
         emit(decoded)
@@ -275,9 +293,9 @@ const executeCommand = (parsed: ParsedArguments, command: CliCommand) =>
         const created = yield* client.create({
           image: command.image,
           imageDigest: command.imageDigest,
-          cpus: integerOption(command.options, "--cpus"),
-          memMib: integerOption(command.options, "--mem-mib"),
-          ttlSeconds: integerOption(command.options, "--ttl-s")
+          cpus: command.cpus,
+          memMib: command.memMib,
+          ttlSeconds: command.ttlSeconds
         })
         emit({ ...created.vm, sandboxToken: created.sandboxToken, httpIngressToken: created.httpIngressToken })
         return

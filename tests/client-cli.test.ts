@@ -85,7 +85,7 @@ const runCli = (url: string, args: ReadonlyArray<string>) =>
   })
 
 describe("microvm CLI credential and argv boundaries", () => {
-  it("uses sandbox authorization for list/destroy and preserves exec argv after -- verbatim", async () => {
+  it("uses sandbox authorization, preserves guest argv, and rejects invalid options before I/O", async () => {
     const { url, calls } = await startRpcMock()
 
     const listed = await runCli(url, ["list", "--json"])
@@ -100,6 +100,15 @@ describe("microvm CLI credential and argv boundaries", () => {
     const executed = await runCli(url, ["exec", "--vm", vmId, "--json", "--", ...guestArgv])
     expect(executed).toEqual(expect.objectContaining({ code: 0, stderr: "" }))
 
+
+    const invalidTimeout = await runCli(url, [
+      "exec", "--vm", vmId, "--timeout-ms", "0", "--json", "--", "/usr/bin/true"
+    ])
+    expect(invalidTimeout).toEqual(expect.objectContaining({ code: 1, stderr: "" }))
+    expect(JSON.parse(invalidTimeout.stdout)).toEqual({
+      error: "CliUsageError",
+      message: "--timeout-ms must be a positive integer"
+    })
     expect(calls.map((call) => call.tag)).toEqual(["list", "destroy", "execute"])
     expect(calls[2]?.payload).toEqual(expect.objectContaining({ vmId, argv: guestArgv }))
     for (const call of calls) {
