@@ -5,7 +5,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Deferred, Effect, Fiber, Layer, Result } from "effect"
 import { describe, expect, it } from "vitest"
-import { makeMicrovmClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import { Firecracker, GuestExecChannel, VmTeardownFault } from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
@@ -24,8 +25,8 @@ const createPayload = {
 const configFor = (root: string, maxVms = 3) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
   advertisedUrl: "http://127.0.0.1:1",
+  acceptingAtStartup: false,
   tls: undefined,
-  auth: { adminTokens: [adminToken] },
   firecracker: {
     firecrackerBinary: "/usr/bin/false",
     flockBinary: undefined,
@@ -140,6 +141,7 @@ describe("daemon RPC integration", () => {
         }))
         const server = createServer()
         yield* daemonLayer(configFor(root), {
+          credentials: CredentialStore.layer([adminToken]),
           firecracker, guestExec: guest, prereqs, server, unsafeSkipKernelLockForTests: true
         }).pipe(
           Layer.launch,
@@ -164,9 +166,9 @@ describe("daemon RPC integration", () => {
         expect(Result.isFailure(invalidResult) && invalidResult.failure._tag).toBe("Unauthenticated")
 
         const admin = yield* makeMicrovmClient({ url, token: adminToken })
+        yield* admin.setAdmission({ accepting: true })
         const first = yield* admin.create(createPayload)
         const second = yield* admin.create(createPayload)
-        expect(first.vm.owningHost).toBe("http://127.0.0.1:1")
 
         const sandbox = yield* makeMicrovmClient({ url, token: first.sandboxToken })
         expect((yield* sandbox.inspect({ vmId: first.vm.vmId })).vmId).toBe(first.vm.vmId)
@@ -258,6 +260,7 @@ describe("daemon RPC integration", () => {
         }))
         const server = createServer()
         yield* daemonLayer(config, {
+          credentials: CredentialStore.layer([adminToken]),
           firecracker, guestExec: guest, prereqs, server, unsafeSkipKernelLockForTests: true
         }).pipe(
           Layer.launch,
@@ -265,6 +268,7 @@ describe("daemon RPC integration", () => {
         )
         const listenerPort = yield* waitForListener(server)
         const admin = yield* makeMicrovmClient({ url: `http://127.0.0.1:${listenerPort}`, token: adminToken })
+        yield* admin.setAdmission({ accepting: true })
         const failed = yield* Effect.result(admin.create(createPayload))
         expect(Result.isFailure(failed) && failed.failure._tag).toBe("BootFailed")
         const exhausted = yield* Effect.result(admin.create(createPayload))

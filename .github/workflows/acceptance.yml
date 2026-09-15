@@ -1,6 +1,6 @@
 # Real Linux/KVM acceptance on a standard GitHub-hosted runner.
 #
-# Dispatch-only. Fails closed: a missing KVM device, cgroup v2 controller, or
+# Manually dispatchable and reusable. A missing KVM device, cgroup v2 controller, or
 # pinned-artifact mismatch is a hard failure, never a skip. Every Firecracker
 # boot happens through the daemon's mandatory jailer path (no direct boot
 # anywhere in these scripts).
@@ -22,7 +22,25 @@
 name: hosted-linux-acceptance
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Optional exact 40-hex commit (defaults to the dispatched commit)
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact 40-hex commit to qualify
+        required: true
+        type: string
+    outputs:
+      source_sha:
+        description: Commit actually exercised
+        value: ${{ jobs.acceptance.outputs.source_sha }}
+      evidence_digest:
+        description: SHA-256 digest reported by upload-artifact
+        value: "sha256:${{ jobs.acceptance.outputs.evidence_digest }}"
 
 permissions:
   contents: read
@@ -31,6 +49,9 @@ jobs:
   acceptance:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      source_sha: ${{ steps.verify-source.outputs.source_sha }}
+      evidence_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}
     env:
       MICROVM_CI_EVIDENCE_DIR: /tmp/microvm-acceptance-evidence
       FIRECRACKER_URL: https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz
@@ -46,20 +67,42 @@ jobs:
       KEYRING_URL: https://snapshot.debian.org/archive/debian/20260911T202741Z/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb
       KEYRING_SHA256: 9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac
     steps:
-      - name: Check out repository
+      - name: Check out exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 1
           persist-credentials: false
 
-      - name: Install pnpm
+      - name: Verify exact source identity
+        id: verify-source
+        env:
+          REQUESTED_SHA: ${{ inputs.source_sha || github.sha }}
+        run: |
+          [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "source_sha must be an exact 40-character lowercase commit" >&2
+            exit 2
+          }
+          actual=$(git rev-parse HEAD)
+          [[ "$actual" == "$REQUESTED_SHA" ]] || {
+            echo "checkout resolved $actual instead of $REQUESTED_SHA" >&2
+            exit 1
+          }
+          [[ -z $(git status --porcelain) ]] || {
+            echo "acceptance checkout is not clean" >&2
+            exit 1
+          }
+          printf 'source_sha=%s\n' "$actual" >>"$GITHUB_OUTPUT"
+
+      - name: Install pnpm 10.34.5
         uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
         with:
-          version: 10
+          version: 10.34.5
 
-      - name: Use Node.js 24
+      - name: Use Node.js 24.20.0
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.20.0
 
       # Current stable go1.27.1 (official go.dev/dl observed 2026-09-12);
       # the guest's go.mod keeps its 1.25.0 language version. The module is
@@ -152,9 +195,11 @@ jobs:
       # Nonsecret evidence only: versions, checksums, manifests, logs, timings,
       # and abuse scenario labels. No tokens, guest output, rootfs, or config.
       - name: Upload acceptance evidence
+        id: upload-evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hosted-acceptance-evidence
           path: /tmp/microvm-acceptance-evidence/
           if-no-files-found: error
+          retention-days: 30

@@ -2,9 +2,14 @@
 import { NodeRuntime } from "@effect/platform-node"
 import { Effect, Schema } from "effect"
 import { constants } from "node:os"
-import { decodeExecResult, makeMicrovmClient } from "../client.js"
-import { GuestExecError } from "../protocol.js"
-import type { CreateRequest, ExecuteRequest } from "../protocol.js"
+import {
+  ClientConfigurationError,
+  decodeExecResult,
+  makeAdminClient,
+  makeSandboxScopedClient
+} from "../client.js"
+import { makeMicrovmClient } from "../client-raw.js"
+import { GuestExecError, VmId } from "../protocol.js"
 
 interface ParsedArguments {
   readonly command: string
@@ -20,39 +25,55 @@ class CliUsageError extends Schema.TaggedError<CliUsageError>()("CliUsageError",
 
 const isGuestExecError = Schema.is(GuestExecError)
 
-const usage = "usage: microvm [--url URL] [--token TOKEN] <create|exec|status|list|destroy|cleanup> [options] [--json]"
+const usage = "usage: microvm [--url URL] [--token TOKEN] <create|exec|status|list|destroy|info|set-admission> [options] [--json]"
 
 const parseArguments = (argv: ReadonlyArray<string>): ParsedArguments => {
   let url = process.env["MICROVM_URL"] ?? ""
   let token = process.env["MICROVM_TOKEN"] ?? ""
   let json = false
+  let wantsHelp = false
   const remaining: Array<string> = []
-  let guestArguments = false
-  for (let index = 0; index < argv.length; index++) {
-    const argument = argv[index]
-    if (argument === undefined) continue
-    if (argument === "--") {
-      guestArguments = true
-      remaining.push(argument)
-      continue
+  let index = 0
+  while (index < argv.length) {
+    const current = argv[index]
+    if (current === undefined) break
+    if (current === "--") {
+      remaining.push(...argv.slice(index))
+      break
     }
-    if (!guestArguments && argument === "--json") {
-      json = true
-      continue
-    }
-    if (!guestArguments && (argument === "--url" || argument === "--token")) {
+    if (current === "--url") {
       const value = argv[index + 1]
-      if (value === undefined) throw new CliUsageError({ message: `${argument} requires a value` })
-      if (argument === "--url") url = value
-      else token = value
-      index++
+      if (value === undefined) throw new CliUsageError({ message: "--url requires a value" })
+      url = value
+      index += 2
       continue
     }
-    remaining.push(argument)
+    if (current === "--token") {
+      const value = argv[index + 1]
+      if (value === undefined) throw new CliUsageError({ message: "--token requires a value" })
+      token = value
+      index += 2
+      continue
+    }
+    if (current === "--json") {
+      json = true
+      index += 1
+      continue
+    }
+    if (current === "--help" || current === "-h") {
+      wantsHelp = true
+      index += 1
+      continue
+    }
+    remaining.push(current)
+    index += 1
   }
   const command = remaining.shift()
-  if (command === undefined || url.length === 0 || token.length === 0) {
-    throw new CliUsageError({ message: `${usage}; MICROVM_URL and MICROVM_TOKEN are required` })
+  if (wantsHelp) {
+    return { command: "help", args: remaining, url, token, json }
+  }
+  if (command === undefined) {
+    throw new CliUsageError({ message: `a command is required; ${usage}` })
   }
   return { command, args: remaining, url, token, json }
 }
@@ -112,6 +133,7 @@ const exitCodeForError = (error: unknown): number => {
     case "VmNotFound":
       return 3
     case "CapacityExceeded":
+    case "AdmissionClosed":
       return 4
     case "HostPrereqFailed":
     case "BootFailed":
@@ -123,14 +145,16 @@ const exitCodeForError = (error: unknown): number => {
   }
 }
 
-/** One parsed command, with its fully typed request, before any client exists. */
+/** One parsed command before any client exists. */
 type CliCommand =
-  | { readonly _tag: "create"; readonly request: CreateRequest }
-  | { readonly _tag: "exec"; readonly request: ExecuteRequest }
+  | { readonly _tag: "create"; readonly image: string; readonly imageDigest: string; readonly options: ReadonlyArray<string> }
+  | { readonly _tag: "exec"; readonly vmId: string; readonly argv: ReadonlyArray<string>; readonly options: ReadonlyArray<string> }
   | { readonly _tag: "status"; readonly vmId: string }
   | { readonly _tag: "list" }
   | { readonly _tag: "destroy"; readonly vmId: string }
-  | { readonly _tag: "cleanup" }
+  | { readonly _tag: "info" }
+  | { readonly _tag: "set-admission"; readonly accepting: boolean }
+  | { readonly _tag: "help" }
 
 /**
  * Builds the typed command from its options. Throws `CliUsageError` for a
@@ -142,13 +166,9 @@ const buildCommand = (parsed: ParsedArguments): CliCommand => {
     case "create":
       return {
         _tag: "create",
-        request: {
-          image: requiredOption(parsed.args, "--image"),
-          imageDigest: requiredOption(parsed.args, "--image-digest"),
-          cpus: integerOption(parsed.args, "--cpus"),
-          memMib: integerOption(parsed.args, "--mem-mib"),
-          ttlSeconds: integerOption(parsed.args, "--ttl-s")
-        }
+        image: requiredOption(parsed.args, "--image"),
+        imageDigest: requiredOption(parsed.args, "--image-digest"),
+        options: parsed.args
       }
     case "exec": {
       const delimiter = parsed.args.indexOf("--")
@@ -158,14 +178,9 @@ const buildCommand = (parsed: ParsedArguments): CliCommand => {
       const options = parsed.args.slice(0, delimiter)
       return {
         _tag: "exec",
-        request: {
-          vmId: requiredOption(options, "--vm"),
-          argv: parsed.args.slice(delimiter + 1),
-          cwd: option(options, "--cwd"),
-          env: undefined,
-          timeoutMs: integerOption(options, "--timeout-ms"),
-          maxOutputBytes: integerOption(options, "--max-output-bytes")
-        }
+        vmId: requiredOption(options, "--vm"),
+        argv: parsed.args.slice(delimiter + 1),
+        options
       }
     }
     case "status":
@@ -174,8 +189,18 @@ const buildCommand = (parsed: ParsedArguments): CliCommand => {
       return { _tag: "list" }
     case "destroy":
       return { _tag: "destroy", vmId: requiredOption(parsed.args, "--vm") }
-    case "cleanup":
-      return { _tag: "cleanup" }
+    case "info":
+      return { _tag: "info" }
+    case "help":
+      return { _tag: "help" }
+    case "set-admission": {
+      const yes = parsed.args.includes("--yes")
+      const no = parsed.args.includes("--no")
+      if (yes === no) {
+        throw new CliUsageError({ message: "set-admission requires exactly one of --yes or --no" })
+      }
+      return { _tag: "set-admission", accepting: yes }
+    }
     default:
       throw new CliUsageError({ message: `unknown command ${parsed.command}; ${usage}` })
   }
@@ -195,18 +220,26 @@ const parseCommand = (parsed: ParsedArguments): Effect.Effect<CliCommand, CliUsa
       return cause instanceof CliUsageError ? Effect.fail(cause) : Effect.die(cause)
     }
   })
-
 const executeCommand = (parsed: ParsedArguments, command: CliCommand) =>
   Effect.scoped(Effect.gen(function*() {
-    const client = yield* makeMicrovmClient({ url: parsed.url, token: parsed.token })
-    switch (command._tag) {
-      case "create": {
-        const result = yield* client.create(command.request)
-        emit({ ...result.vm, sandboxToken: result.sandboxToken })
-        return
-      }
-      case "exec": {
-        const result = yield* client.execute(command.request)
+    if (command._tag === "help") {
+      process.stdout.write(`${usage}\n`)
+      return
+    }
+    if (command._tag === "exec" || command._tag === "status") {
+      const client = yield* makeSandboxScopedClient({
+        url: parsed.url,
+        token: parsed.token,
+        vmId: command.vmId
+      })
+      if (command._tag === "exec") {
+        const result = yield* client.execute({
+          argv: command.argv,
+          cwd: option(command.options, "--cwd"),
+          env: undefined,
+          timeoutMs: integerOption(command.options, "--timeout-ms"),
+          maxOutputBytes: integerOption(command.options, "--max-output-bytes")
+        })
         const decoded = decodeExecResult(result)
         emit(decoded)
         if (decoded.signal !== undefined) {
@@ -217,20 +250,44 @@ const executeCommand = (parsed: ParsedArguments, command: CliCommand) =>
         }
         return
       }
-      case "status": {
-        emit(yield* client.inspect({ vmId: command.vmId }))
-        return
+      emit(yield* client.inspect())
+      return
+    }
+    if (command._tag === "list" || command._tag === "destroy") {
+      if (command._tag === "destroy" && !Schema.is(VmId)(command.vmId)) {
+        return yield* Effect.fail(new CliUsageError({
+          message: `--vm does not match the wire pattern: ${command.vmId}`
+        }))
       }
-      case "list": {
+      // list/destroy intentionally accept either an admin token or the
+      // addressed VM's sandbox token. Do not run the admin-only info probe.
+      const client = yield* makeMicrovmClient({ url: parsed.url, token: parsed.token })
+      if (command._tag === "list") {
         emit(yield* client.list({}))
-        return
-      }
-      case "destroy": {
+      } else {
         emit(yield* client.destroy({ vmId: command.vmId }))
+      }
+      return
+    }
+    const client = yield* makeAdminClient({ url: parsed.url, token: parsed.token })
+    switch (command._tag) {
+      case "create": {
+        const created = yield* client.create({
+          image: command.image,
+          imageDigest: command.imageDigest,
+          cpus: integerOption(command.options, "--cpus"),
+          memMib: integerOption(command.options, "--mem-mib"),
+          ttlSeconds: integerOption(command.options, "--ttl-s")
+        })
+        emit({ ...created.vm, sandboxToken: created.sandboxToken, httpIngressToken: created.httpIngressToken })
         return
       }
-      case "cleanup": {
-        emit(yield* client.cleanup({}))
+      case "info": {
+        emit(yield* client.info())
+        return
+      }
+      case "set-admission": {
+        emit(yield* client.setAdmission(command.accepting))
         return
       }
     }

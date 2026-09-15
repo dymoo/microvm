@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-import { once } from "node:events"
 import { writeSync } from "node:fs"
-import { request as httpRequest } from "node:http"
+import { createServer } from "node:http"
+import { Readable } from "node:stream"
+import { pipeline } from "node:stream/promises"
 import { Effect, Exit, Result } from "effect"
-import { makeMicrovmClient, makeMicrovmCluster } from "../dist/index.js"
-import { assertRevokedIngress, echoWebSocket, listenTrustedProxy, openWebSocket, rawStatus, requestStatus } from "./http-preview-proxy.mjs"
+import { makeAdminClient, makeSandboxHttpIngress } from "../dist/index.js"
 import { guestProtocolService } from "./http-preview-fixture.mjs"
 
 let currentOperation = "initialization"
@@ -133,10 +133,6 @@ const armVmCleanup = (label, destroy) => Effect.acquireRelease(
   }
 )
 
-const listenProxy = (proxy) => Effect.acquireRelease(
-  Effect.promise(() => listenTrustedProxy(proxy)),
-  (handle) => Effect.promise(handle.close)
-)
 
 const waitForResponse = async (url, predicate, timeoutMs = DEADLINES.readyMs) => {
   const deadline = Date.now() + timeoutMs
@@ -155,36 +151,21 @@ const waitForResponse = async (url, predicate, timeoutMs = DEADLINES.readyMs) =>
   throw new Error(`timed out waiting for ${url}: ${last}`)
 }
 
+const requestJson = async (origin, target, headers) => {
+  const response = await fetchBounded(`header reflection ${target}`, `${origin}${target}`, { headers })
+  if (response.status !== 200) {
+    await response.body?.cancel()
+    throw new Error(`header reflection returned HTTP ${response.status}`)
+  }
+  return bounded(`header reflection body ${target}`, DEADLINES.requestMs, response.json())
+}
 
-const requestJson = (origin, target, headers) => new Promise((resolve, reject) => {
-  const label = `header reflection ${target}`
-  const url = new URL(origin)
-  const request = httpRequest({
-    host: url.hostname,
-    port: Number(url.port),
-    method: "GET",
-    path: target,
-    headers,
-    agent: false
-  }, (response) => {
-    const chunks = []
-    response.on("data", (chunk) => chunks.push(chunk))
-    response.once("end", () => {
-      if (response.statusCode !== 200) {
-        reject(new Error(`header reflection returned HTTP ${response.statusCode}`))
-        return
-      }
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")))
-      } catch (error) {
-        reject(error)
-      }
-    })
-  })
-  request.setTimeout(DEADLINES.requestMs, () => request.destroy(expired(label, DEADLINES.requestMs)))
-  request.once("error", reject)
-  request.end()
-})
+const requestStatus = async (label, origin, method, target, headers = {}) => {
+  const response = await fetchBounded(label, new URL(target, origin), { method, headers })
+  const status = response.status
+  await response.body?.cancel()
+  return status
+}
 
 
 const closeWithin = async (promise, milliseconds, label) => {
@@ -194,28 +175,118 @@ const closeWithin = async (promise, milliseconds, label) => {
   ])
 }
 
+/**
+ * Test-local Node bridge for the Fetch-native ingress API. It only translates
+ * Node HTTP streams to Request/Response; routing, credentials, and admission
+ * remain entirely inside makeSandboxHttpIngress and the daemon.
+ */
+const listenIngressBridge = async (ingress) => {
+  const sockets = new Set()
+  let origin = ""
+  const server = createServer(async (incoming, outgoing) => {
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    incoming.once("aborted", abort)
+    outgoing.once("close", () => {
+      if (!outgoing.writableEnded) abort()
+    })
+    try {
+      const method = incoming.method ?? "GET"
+      const headers = new Headers()
+      for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+        headers.append(incoming.rawHeaders[index], incoming.rawHeaders[index + 1])
+      }
+      const body = method === "GET" || method === "HEAD"
+        ? undefined
+        : Readable.toWeb(incoming)
+      const response = await ingress.handle(new Request(new URL(incoming.url ?? "/", origin), {
+        method,
+        headers,
+        signal: controller.signal,
+        ...(body === undefined ? {} : { body, duplex: "half" })
+      }))
+      outgoing.writeHead(
+        response.status,
+        response.statusText,
+        Object.fromEntries(response.headers.entries())
+      )
+      if (response.body === null) {
+        outgoing.end()
+      } else {
+        await pipeline(Readable.fromWeb(response.body), outgoing)
+      }
+    } catch {
+      if (!outgoing.headersSent) {
+        outgoing.writeHead(500, { "content-type": "text/plain; charset=utf-8" })
+        outgoing.end("500 Bridge Failure\n")
+      } else {
+        outgoing.destroy()
+      }
+    }
+  })
+  server.on("connection", (socket) => {
+    sockets.add(socket)
+    socket.once("close", () => sockets.delete(socket))
+  })
+  await new Promise((resolve, reject) => {
+    const failed = (error) => {
+      server.off("listening", listening)
+      reject(error)
+    }
+    const listening = () => {
+      server.off("error", failed)
+      resolve()
+    }
+    server.once("error", failed)
+    server.listen(0, "127.0.0.1", listening)
+  })
+  const address = server.address()
+  if (address === null || typeof address === "string") {
+    throw new Error("ingress bridge has no TCP port")
+  }
+  origin = `http://127.0.0.1:${address.port}`
+  return {
+    port: address.port,
+    origin,
+    close: async () => {
+      const closed = new Promise((resolve, reject) => {
+        server.close((error) => error === undefined ? resolve() : reject(error))
+      })
+      for (const socket of sockets) socket.destroy()
+      await closeWithin(closed, 2_000, "ingress bridge")
+    }
+  }
+}
+
+const listenIngress = (ingress) => Effect.acquireRelease(
+  Effect.promise(() => listenIngressBridge(ingress)),
+  (bridge) => Effect.promise(bridge.close)
+)
+
 const program = Effect.scoped(Effect.gen(function*() {
   step("program started")
-  const cluster = yield* makeMicrovmCluster({ endpoints: [{ url: daemonUrl, token: adminToken }] })
-  const adminClient = yield* makeMicrovmClient({ url: daemonUrl, token: adminToken })
+  const adminClient = yield* makeAdminClient({ url: daemonUrl, token: adminToken })
   step("clients initialized")
 
   const next = yield* boundedRpc(
-    "cluster create (next preview)",
-    cluster.create(createInput(2, 2048, 900)),
+    "daemon create (next preview)",
+    adminClient.create(createInput(2, 2048, 900)),
     DEADLINES.rpcCreateMs
   )
-  const nextCleanup = yield* armVmCleanup("Next VM", () => next.destroy())
+  const nextCleanup = yield* armVmCleanup(
+    "Next VM",
+    () => adminClient.destroy(next.vm.vmId)
+  )
   step("Next preview VM created")
   try {
-    const initialized = yield* boundedRpc("exec microvm-next-init", next.execute({
+    const initialized = yield* boundedRpc("exec microvm-next-init", next.sandbox.execute({
       argv: ["/usr/local/bin/microvm-next-init"]
     }))
     assert(initialized.exitCode === 0, "Next workspace initialization failed")
     step("Next workspace initialized")
     const forbiddenEnvironment = yield* Effect.result(boundedRpc(
       "startWebService with reserved PORT",
-      next.startWebService({
+      next.sandbox.startWebService({
         argv: ["/usr/local/bin/pnpm", "dev"],
         cwd: "/workspace",
         env: { PORT: "3999" }
@@ -224,18 +295,23 @@ const program = Effect.scoped(Effect.gen(function*() {
     assert(Result.isFailure(forbiddenEnvironment), "web service accepted caller-controlled PORT")
 
     step("caller-controlled PORT rejected")
-    const nextService = yield* boundedRpc("startWebService pnpm dev", next.startWebService({
+    yield* boundedRpc("startWebService pnpm dev", next.sandbox.startWebService({
       argv: ["/usr/local/bin/pnpm", "dev"],
       cwd: "/workspace"
     }))
-    const nextProxy = yield* next.http()
-    const nextPublic = yield* listenProxy(nextProxy)
-    step("Next service and trusted proxy started")
+    assert(next.httpIngressToken !== undefined, "Next image did not mint an HTTP ingress capability")
+    const nextIngress = makeSandboxHttpIngress({
+      url: daemonUrl,
+      vmId: next.vm.vmId,
+      httpIngressToken: next.httpIngressToken
+    })
+    const nextPublic = yield* listenIngress(nextIngress)
+    step("Next service and Fetch ingress started")
     const initial = yield* Effect.promise(() => waitForResponse(
       `${nextPublic.origin}/`,
       (response, body) => response.status === 200 && body.includes("Ready to build.")
     ))
-    step("Next page served through the trusted proxy")
+    step("Next page served through Fetch ingress")
     const assetPath = /(?:src|href)="(\/_next\/[^"?]+(?:\?[^" ]*)?)"/.exec(initial.body)?.[1]
     assert(assetPath !== undefined, "Next page did not reference a _next asset")
     const asset = yield* Effect.promise(() => fetchBounded("Next asset", `${nextPublic.origin}${assetPath}`))
@@ -243,7 +319,7 @@ const program = Effect.scoped(Effect.gen(function*() {
     yield* Effect.promise(() => bounded("Next asset body", DEADLINES.requestMs, asset.arrayBuffer()))
 
     step("Next asset served")
-    const mutated = yield* boundedRpc("exec workspace mutation", next.execute({
+    const mutated = yield* boundedRpc("exec workspace mutation", next.sandbox.execute({
       argv: [
         "/usr/bin/python3",
         "-c",
@@ -252,7 +328,7 @@ const program = Effect.scoped(Effect.gen(function*() {
     }))
     assert(mutated.exitCode === 0, "concurrent exec could not mutate the running Next workspace")
     step("concurrent exec mutated the running workspace")
-    const status = yield* boundedRpc("next service status", nextService.status())
+    const status = yield* boundedRpc("next service status", next.sandbox.webServiceStatus())
     assert(status.state === "running", "Next service did not survive concurrent exec")
     yield* Effect.promise(() => waitForResponse(
       `${nextPublic.origin}/`,
@@ -260,17 +336,20 @@ const program = Effect.scoped(Effect.gen(function*() {
     ))
 
     step("Next service survived concurrent exec")
-    const network = yield* boundedRpc("exec external-network probe", next.execute({
+    const network = yield* boundedRpc("exec external-network probe", next.sandbox.execute({
       argv: ["/usr/bin/python3", "-c", "import socket;s=socket.socket();s.settimeout(.5);s.connect(('1.1.1.1',53))"]
     }))
     assert(network.exitCode !== 0, "preview-enabled guest unexpectedly reached an external network")
     assert(
-      (yield* boundedRpc("next service stop", nextService.stop())).stopped === true,
+      (yield* boundedRpc("next service stop", next.sandbox.stopWebService())).stopped === true,
       "Next service stop was not confirmed"
     )
     step("network isolation and Next service stop verified")
   } finally {
-    const nextDestroy = yield* Effect.exit(boundedRpc("destroy next preview VM", next.destroy()))
+    const nextDestroy = yield* Effect.exit(boundedRpc(
+      "destroy next preview VM",
+      adminClient.destroy(next.vm.vmId)
+    ))
     if (Exit.isSuccess(nextDestroy) && nextDestroy.value.destroyed === true) {
       nextCleanup.armed = false
     } else {
@@ -280,22 +359,30 @@ const program = Effect.scoped(Effect.gen(function*() {
 
   step("Next preview phase completed")
   const protocol = yield* boundedRpc(
-    "cluster create (protocol service)",
-    cluster.create(createInput(1, 512, 900)),
+    "daemon create (protocol service)",
+    adminClient.create(createInput(1, 512, 900)),
     DEADLINES.rpcCreateMs
   )
-  const protocolCleanup = yield* armVmCleanup("protocol VM", () => protocol.destroy())
-  const protocolService = yield* boundedRpc("startWebService guest protocol service", protocol.startWebService({
+  const protocolCleanup = yield* armVmCleanup(
+    "protocol VM",
+    () => adminClient.destroy(protocol.vm.vmId)
+  )
+  yield* boundedRpc("startWebService guest protocol service", protocol.sandbox.startWebService({
     argv: ["/usr/bin/node", "-e", guestProtocolService]
   }))
-  const protocolProxy = yield* protocol.http()
-  const publicServer = yield* listenProxy(protocolProxy)
+  assert(protocol.httpIngressToken !== undefined, "protocol image did not mint an HTTP ingress capability")
+  const protocolIngress = makeSandboxHttpIngress({
+    url: daemonUrl,
+    vmId: protocol.vm.vmId,
+    httpIngressToken: protocol.httpIngressToken
+  })
+  const publicServer = yield* listenIngress(protocolIngress)
   yield* Effect.promise(() => waitForResponse(
     `${publicServer.origin}/`,
     (response, body) => response.status === 200 && body === "guest-http-ok"
   ))
 
-  step("protocol service and trusted proxy ready")
+  step("protocol service and Fetch ingress ready")
   operationStarted("missing capability request")
   const missing = yield* Effect.promise(() => requestStatus(
     currentOperation,
@@ -323,8 +410,10 @@ const program = Effect.scoped(Effect.gen(function*() {
     adminClient.create(createInput(1, 256, 300)),
     DEADLINES.rpcCreateMs
   )
-  const donorCleanup = yield* armVmCleanup("token donor VM", () =>
-    adminClient.destroy({ vmId: tokenDonor.vm.vmId })
+  assert(tokenDonor.httpIngressToken !== undefined, "token donor did not mint an HTTP ingress capability")
+  const donorCleanup = yield* armVmCleanup(
+    "token donor VM",
+    () => adminClient.destroy(tokenDonor.vm.vmId)
   )
   operationSucceeded()
   try {
@@ -343,7 +432,7 @@ const program = Effect.scoped(Effect.gen(function*() {
     operationStarted("token donor destruction")
     const donorDestroy = yield* Effect.exit(boundedRpc(
       currentOperation,
-      adminClient.destroy({ vmId: tokenDonor.vm.vmId })
+      adminClient.destroy(tokenDonor.vm.vmId)
     ))
     if (Exit.isSuccess(donorDestroy) && donorDestroy.value.destroyed === true) {
       donorCleanup.armed = false
@@ -354,40 +443,8 @@ const program = Effect.scoped(Effect.gen(function*() {
     currentOperation = interruptedOperation
   }
 
-  operationStarted("CONNECT method probe")
-  assert(
-    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "CONNECT", "example.invalid:443"))) === 405,
-    "CONNECT was not rejected"
-  )
-  operationSucceeded()
 
-  operationStarted("TRACE method probe")
-  assert(
-    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "TRACE", "/"))) === 405,
-    "TRACE was not rejected"
-  )
-  operationSucceeded()
-
-  operationStarted("absolute-form target probe")
-  assert(
-    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "GET", "http://example.invalid/"))) === 400,
-    "absolute-form target was not rejected"
-  )
-  operationSucceeded()
-
-  // `Expect: 100-continue` is delivered to the server's `checkContinue` event.
-  // The probe reads the first status line, so an interim `100 Continue` would
-  // fail here exactly as a wrongly continued body would in a browser.
-  operationStarted("Expect 100-continue probe")
-  assert(
-    (yield* Effect.promise(() => rawStatus(currentOperation, publicServer.port, "POST", "/", {
-      headers: { expect: "100-continue", "content-length": "5" }
-    }))) === 400,
-    "Expect: 100-continue was not refused without an interim 100"
-  )
-  operationSucceeded()
-
-  step("capability separation and method/target rejection verified")
+  step("capability separation verified")
   const headers = yield* Effect.promise(() => requestJson(
     publicServer.origin,
     "/headers",
@@ -397,14 +454,16 @@ const program = Effect.scoped(Effect.gen(function*() {
   assert(headers.proxyAuthorization === null, "Proxy-Authorization reached the guest")
 
   step("authorization separation verified")
-  operationStarted("WebSocket open")
-  const websocket = yield* Effect.promise(() => openWebSocket(publicServer.port))
-  operationSucceeded()
-  operationStarted("WebSocket echo")
-  assert((yield* Effect.promise(() => echoWebSocket(websocket, "preview-echo"))) === "preview-echo", "websocket echo failed")
+  operationStarted("WebSocket refusal")
+  const websocketRefusal = yield* Effect.promise(() => protocolIngress.handle(new Request(
+    `${publicServer.origin}/ws`,
+    { headers: { connection: "Upgrade", upgrade: "websocket" } }
+  )))
+  assert(websocketRefusal.status === 426, `WebSocket ingress returned HTTP ${websocketRefusal.status}`)
+  yield* Effect.promise(() => websocketRefusal.body?.cancel())
   operationSucceeded()
 
-  step("websocket echo verified")
+  step("Fetch ingress WebSocket refusal verified")
   const heldSse = []
   for (let index = 0; index < 8; index++) {
     const response = yield* Effect.promise(() => fetchBounded(`SSE slot ${index}`, `${publicServer.origin}/sse`))
@@ -430,7 +489,7 @@ const program = Effect.scoped(Effect.gen(function*() {
     await bounded("large response cancel", DEADLINES.streamMs, reader.cancel())
   })
   assert(
-    (yield* boundedRpc("protocol service status after slow reader", protocolService.status())).state === "running",
+    (yield* boundedRpc("protocol service status after slow reader", protocol.sandbox.webServiceStatus())).state === "running",
     "slow-reader cancellation killed the web service"
   )
 
@@ -444,25 +503,22 @@ const program = Effect.scoped(Effect.gen(function*() {
       while (!(await activeReader.read()).done) {}
     } catch {}
   })()
-  const websocketClosed = once(websocket, "close")
-  const destroyed = yield* boundedRpc("destroy protocol VM", protocol.destroy())
+  const destroyed = yield* boundedRpc("destroy protocol VM", adminClient.destroy(protocol.vm.vmId))
   assert(destroyed.destroyed === true, "protocol VM destroy was not confirmed")
   protocolCleanup.armed = false
   yield* Effect.promise(() => closeWithin(sseClosed, 2_000, "active SSE"))
-  yield* Effect.promise(() => closeWithin(websocketClosed, 2_000, "active websocket"))
-  assert(websocket.destroyed, "active websocket client socket remained open after VM destroy")
 
-  step("destroy closed active SSE and websocket streams")
+  step("destroy closed the active SSE stream")
   const revoked = yield* Effect.promise(() => fetchBounded("revoked ingress", `${publicServer.origin}/`))
-  assertRevokedIngress(revoked.status)
+  assert(revoked.status === 401, `revoked ingress returned HTTP ${revoked.status}`)
   step("revoked ingress refused")
   assert(
-    Result.isFailure(yield* Effect.result(boundedRpc("service status after destroy", protocolService.status()))),
+    Result.isFailure(yield* Effect.result(boundedRpc("service status after destroy", protocol.sandbox.webServiceStatus()))),
     "destroyed VM retained service-control authority"
   )
   step("protocol VM service control revoked")
 }))
 
 await Effect.runPromise(program)
-step("all scoped trusted proxies released")
+step("all scoped HTTP ingress bridges released")
 console.log("HTTP preview acceptance passed")

@@ -4,7 +4,7 @@
  */
 import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
-import { CredentialStore, authorizeVm, clientAuthLayer, requireAdmin } from "../src/auth.js"
+import { CredentialStore, authorizeVm, requireAdmin } from "../src/auth.js"
 import { Forbidden, SandboxContext } from "../src/protocol.js"
 
 const withStore = (adminTokens: string[]) => CredentialStore.layer(adminTokens)
@@ -147,16 +147,5 @@ describe("handler authorization", () => {
   it("authorizeVm allows a sandbox token only for its own VM", async () => {
     await expect(runAs({ kind: "sandbox", vmId: "mvm-abc12345" }, authorizeVm("mvm-abc12345"))).resolves.toBeUndefined()
     await expect(runAs({ kind: "sandbox", vmId: "mvm-abc12345" }, authorizeVm("mvm-zzz99999"))).rejects.toBeInstanceOf(Forbidden)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Client auth middleware attaches bearer headers (wiring sanity)
-// ---------------------------------------------------------------------------
-
-describe("client auth layer", () => {
-  it("builds a layer without throwing and is reusable per token", () => {
-    expect(() => clientAuthLayer("mvs_secret")).not.toThrow()
-    expect(() => clientAuthLayer("other")).not.toThrow()
   })
 })

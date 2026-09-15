@@ -33,21 +33,22 @@ const errorMessage = (error: unknown): string => {
 
 const main = Effect.gen(function*() {
   const path = yield* configPath(process.argv.slice(2))
-  const config = yield* loadDaemonConfig(path)
+  const loaded = yield* loadDaemonConfig(path)
   const capabilities = yield* HostPrereqs.pipe(
     Effect.flatMap((service) => service.verifyAll()),
-    Effect.provide(HostPrereqs.layer(config.firecracker))
+    Effect.provide(HostPrereqs.layer(loaded.config.firecracker))
   )
   yield* Effect.logInfo("microVM daemon prerequisites verified", {
-    host: config.listen.host,
-    port: config.listen.port,
-    tls: config.tls !== undefined,
+    host: loaded.config.listen.host,
+    port: loaded.config.listen.port,
+    tls: loaded.config.tls !== undefined,
+    acceptingAtStartup: loaded.config.acceptingAtStartup,
     arch: capabilities.arch,
-    maxVms: config.limits.maxVms,
-    imagesDir: config.firecracker.imagesDir,
-    runStateDir: config.firecracker.runStateDir
+    maxVms: loaded.config.limits.maxVms,
+    imagesDir: loaded.config.firecracker.imagesDir,
+    runStateDir: loaded.config.firecracker.runStateDir
   })
-  return yield* Layer.launch(daemonLayer(config))
+  return yield* Layer.launch(daemonLayer(loaded.config, { credentials: loaded.credentials }))
 })
 
 NodeRuntime.runMain(main.pipe(

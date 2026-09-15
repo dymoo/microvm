@@ -12,6 +12,16 @@ import { Context, Schema } from "effect"
 import { Rpc, RpcGroup, RpcMiddleware } from "effect/unstable/rpc"
 
 // ---------------------------------------------------------------------------
+// Package / protocol version
+// ---------------------------------------------------------------------------
+
+/**
+ * Single version of the package and its wire protocol. `info` reports it and
+ * every admin client validates it against its own constant before first use.
+ */
+export const MICROVM_VERSION = "0.3.0"
+
+// ---------------------------------------------------------------------------
 // Guest fixed-purpose vsock ports. These are mirrored by the Go guest and are
 // never selected by callers.
 // ---------------------------------------------------------------------------
@@ -38,7 +48,6 @@ export const MAX_OUTPUT_BYTES_PER_STREAM = 8_388_608
 export const MAX_JSONL_LINE_BYTES = 8_388_608
 /** Hard maximum UTF-8 JSON payload size for one service-control line, excluding newline. */
 export const MAX_SERVICE_CONTROL_LINE_BYTES = 256 * 1024
-
 // Request bounds the daemon enforces before opening a vsock connection.
 export const MAX_ARGV_ENTRIES = 64
 export const MAX_ARG_BYTES = 4096
@@ -52,11 +61,11 @@ export const MAX_CWD_BYTES = 4096
 // ---------------------------------------------------------------------------
 // HTTP preview ingress bounds.
 //
-// These numbers are policy, not validation: the public Node adapter
-// (`src/http-proxy.ts`) and the daemon data plane (`src/daemon-http-proxy.ts`)
-// each enforce them with their own independent parsing, so a mistake in one hop
-// is caught by the other rather than shared. Only the numbers live here, so the
-// two hops cannot drift apart silently.
+// These numbers are policy, not validation: the request-scoped ingress
+// adapter (`src/http-ingress.ts`) and the daemon data plane
+// (`src/daemon-http-proxy.ts`) each enforce them with their own independent
+// parsing, so a mistake in one hop is caught by the other rather than shared.
+// Only the numbers live here, so the two hops cannot drift apart silently.
 // ---------------------------------------------------------------------------
 
 export const HTTP_PREVIEW_LIMITS = {
@@ -80,6 +89,12 @@ export const HTTP_PREVIEW_LIMITS = {
   frameBufferBytes: 64 * 1024
 } as const
 
+/**
+ * Wire route of the daemon's HTTP data plane. Both the client-side ingress
+ * adapter and the daemon data plane address VMs through this exact prefix.
+ */
+export const DAEMON_HTTP_ROUTE_PREFIX = "/http/v1/vms/"
+
 // ---------------------------------------------------------------------------
 // Shared primitive schemas
 // ---------------------------------------------------------------------------
@@ -99,6 +114,7 @@ export const ImageDigest = Schema.String.check(Schema.isPattern(/^sha256:[0-9a-f
 export type ImageDigest = typeof ImageDigest.Type
 
 const positiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
+const nonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const boundedArg = Schema.String.check(Schema.isMaxLength(MAX_ARG_BYTES))
 const boundedArgv = Schema.Array(boundedArg).check(
   Schema.isMinLength(1),
@@ -108,15 +124,12 @@ const boundedCwd = Schema.String.check(Schema.isMaxLength(MAX_CWD_BYTES))
 const boundedEnvKey = Schema.String.check(Schema.isMaxLength(MAX_ENV_KEY_BYTES))
 const boundedEnvValue = Schema.String.check(Schema.isMaxLength(MAX_ENV_VALUE_BYTES))
 
-
 // ---------------------------------------------------------------------------
 // Domain results
 // ---------------------------------------------------------------------------
 
 export class VmInfo extends Schema.Class<VmInfo>("VmInfo")({
   vmId: VmId,
-  /** The cluster endpoint (host) currently owning this VM. */
-  owningHost: Schema.String,
   state: Schema.Literals(["running", "poisoned", "terminated"]),
   image: ImageName,
   imageDigest: ImageDigest,
@@ -190,25 +203,30 @@ export class ImageNotAllowed extends Schema.TaggedError<ImageNotAllowed>()("Imag
 }) {}
 
 /**
- * Teardown could not be proven complete during destroy/cleanup: the VM may
- * still have live processes or residue. Callers must retry destroy and must
- * not treat the VM as released.
+ * Teardown could not be proven complete during destroy: the VM may still
+ * have live processes or residue. Callers must retry destroy and must not
+ * treat the VM as released.
  */
 export class DestroyUncertain extends Schema.TaggedError<DestroyUncertain>()("DestroyUncertain", {
   vmId: VmId,
   phase: Schema.Literals(["signal", "cgroup", "http"]),
   reason: Schema.String
 }) {}
-/** The image has no immutable `web` HTTP endpoint. */
-export class HttpNotConfigured extends Schema.TaggedError<HttpNotConfigured>()("HttpNotConfigured", {
-  vmId: VmId
+
+/**
+ * Authenticated create refused because the daemon is not admitting new VMs.
+ * This is an admission state, never an authorization failure: the caller's
+ * credential was verified before the gate was evaluated.
+ */
+export class AdmissionClosed extends Schema.TaggedError<AdmissionClosed>()("AdmissionClosed", {
+  message: Schema.String
 }) {}
 
 /**
  * Semantic failure of the single durable web-service lifecycle. Transport,
  * authentication, VM lookup and poison errors remain distinct.
  */
-export class ClusterServiceError extends Schema.TaggedError<ClusterServiceError>()("ClusterServiceError", {
+export class ServiceError extends Schema.TaggedError<ServiceError>()("ServiceError", {
   vmId: VmId,
   code: Schema.Literals([
     "INVALID_REQUEST",
@@ -218,6 +236,25 @@ export class ClusterServiceError extends Schema.TaggedError<ClusterServiceError>
     "INTERNAL"
   ]),
   message: Schema.String
+}) {}
+
+/** The admission switch reported by the admin-only setAdmission RPC. */
+export class AdmissionState extends Schema.Class<AdmissionState>("AdmissionState")({
+  accepting: Schema.Boolean
+}) {}
+
+/** Admin-only daemon self-description served by the info RPC. */
+export class DaemonInfo extends Schema.Class<DaemonInfo>("DaemonInfo")({
+  /** Exact package/protocol version of this daemon build. */
+  version: Schema.String,
+  /** Whether the daemon currently accepts new VM creations. */
+  accepting: Schema.Boolean,
+  /**
+   * Every VM slot currently held: running, poisoned, and terminating records
+   * plus admitted in-flight reservations (quarantines keep theirs), so a
+   * drain cannot report zero while a boot is still active.
+   */
+  liveVms: nonNegativeInt
 }) {}
 
 // ---------------------------------------------------------------------------
@@ -236,18 +273,20 @@ export class SandboxContext extends Context.Service<SandboxContext, {
 /**
  * RPC middleware authenticating every request, providing the verified
  * credential to handlers via {@link SandboxContext}. Unauthenticated requests
- * fail with `Unauthenticated`.
+ * fail with `Unauthenticated`. Clients present the credential as an
+ * `authorization` request header on each call; there is no client-side
+ * middleware requirement.
  */
 export class Auth extends RpcMiddleware.Service<Auth, {
   provides: SandboxContext
-}>()("microvm/auth/Auth", { error: Unauthenticated, requiredForClient: true }) {}
-
+}>()("microvm/auth/Auth", { error: Unauthenticated }) {}
 
 // ---------------------------------------------------------------------------
 // Request bounding (daemon-side, before any guest I/O)
 // ---------------------------------------------------------------------------
 
-const byteLength = (value: string): number => Buffer.byteLength(value, "utf8")
+const textEncoder = new TextEncoder()
+const byteLength = (value: string): number => textEncoder.encode(value).byteLength
 
 /**
  * Validates exec request bounds that the RPC schema cannot express. Returns a
@@ -320,8 +359,9 @@ export const webServiceStartRejection = (
 }
 
 /**
- * Public request accepted by a VM-bound SandboxHandle. The low-level RPC adds
- * the already-bound VM id; callers cannot select an HTTP target or port.
+ * Public request accepted by a VM-bound SandboxScopedClient. The scoped
+ * client adds the already-bound VM id; callers cannot select an HTTP target
+ * or port.
  */
 export class StartWebServiceRequest extends Schema.Class<StartWebServiceRequest>("StartWebServiceRequest")({
   argv: boundedArgv,
@@ -364,19 +404,15 @@ export class DestroyResult extends Schema.Class<DestroyResult>("DestroyResult")(
   destroyed: Schema.Boolean
 }) {}
 
-export class CleanupResult extends Schema.Class<CleanupResult>("CleanupResult")({
-  destroyed: Schema.Array(VmId),
-  failed: Schema.Array(Schema.Struct({ vmId: VmId, reason: Schema.String }))
-}) {}
 
 export class ListResult extends Schema.Class<ListResult>("ListResult")({
   vms: Schema.Array(VmInfo)
 }) {}
 
 /**
- * Microvm cluster RPC surface. One deep seam for every consumer. Every RPC
- * carries the auth middleware: the server rejects unauthenticated calls
- * before handlers run, and handlers additionally enforce admin/sandbox
+ * Microvm RPC surface. One deep seam for every consumer. Every RPC carries
+ * the auth middleware: the server rejects unauthenticated calls before
+ * handlers run, and handlers additionally enforce admin/sandbox
  * authorization via {@link SandboxContext}.
  */
 export class MicrovmRpc extends RpcGroup.make(
@@ -394,11 +430,24 @@ export class MicrovmRpc extends RpcGroup.make(
     error: Schema.Union([
       ImageNotAllowed,
       CapacityExceeded,
+      AdmissionClosed,
       HostPrereqFailed,
       BootFailed,
       Unauthenticated,
       Forbidden
     ])
+  }).middleware(Auth),
+  // Admin-only admission switch: applies immediately, in memory only.
+  Rpc.make("setAdmission", {
+    payload: Schema.Struct({ accepting: Schema.Boolean }),
+    success: AdmissionState,
+    error: Schema.Union([Unauthenticated, Forbidden])
+  }).middleware(Auth),
+  // Admin-only daemon self-description.
+  Rpc.make("info", {
+    payload: Schema.Struct({}),
+    success: DaemonInfo,
+    error: Schema.Union([Unauthenticated, Forbidden])
   }).middleware(Auth),
   // Admin or the VM's own sandbox credential.
   Rpc.make("execute", {
@@ -445,7 +494,7 @@ export class MicrovmRpc extends RpcGroup.make(
     error: Schema.Union([
       VmNotFound,
       VmPoisoned,
-      ClusterServiceError,
+      ServiceError,
       Unauthenticated,
       Forbidden
     ])
@@ -456,7 +505,7 @@ export class MicrovmRpc extends RpcGroup.make(
     error: Schema.Union([
       VmNotFound,
       VmPoisoned,
-      ClusterServiceError,
+      ServiceError,
       Unauthenticated,
       Forbidden
     ])
@@ -467,16 +516,10 @@ export class MicrovmRpc extends RpcGroup.make(
     error: Schema.Union([
       VmNotFound,
       VmPoisoned,
-      ClusterServiceError,
+      ServiceError,
       Unauthenticated,
       Forbidden
     ])
-  }).middleware(Auth),
-  // Admin-only: reap expired/poisoned VMs and orphans.
-  Rpc.make("cleanup", {
-    payload: Schema.Struct({}),
-    success: CleanupResult,
-    error: Schema.Union([DestroyUncertain, Unauthenticated, Forbidden])
   }).middleware(Auth)
 ) {}
 
@@ -488,7 +531,10 @@ export type ExecuteRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag
 export type InspectRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "inspect" }>>
 export type DestroyRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "destroy" }>>
 export type ListRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "list" }>>
-export type CleanupRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "cleanup" }>>
+export type SetAdmissionRequest = Rpc.Payload<
+  Extract<MicrovmRequest, { readonly _tag: "setAdmission" }>
+>
+export type InfoRequest = Rpc.Payload<Extract<MicrovmRequest, { readonly _tag: "info" }>>
 export type StartWebServiceRpcRequest = Rpc.Payload<
   Extract<MicrovmRequest, { readonly _tag: "startWebService" }>
 >

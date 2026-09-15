@@ -63,11 +63,12 @@ import {
   type VmLayout
 } from "./host.js"
 import {
+  AdmissionClosed,
+  AdmissionState,
   BootFailed,
   CapacityExceeded,
-  CleanupResult,
-  ClusterServiceError,
   CreateResult,
+  DaemonInfo,
   DestroyUncertain,
   DestroyResult,
   ExecResult,
@@ -76,8 +77,10 @@ import {
   HostPrereqFailed,
   ImageNotAllowed,
   ListResult,
+  MICROVM_VERSION,
   MicrovmRpc,
   SandboxContext,
+  ServiceError,
   StopWebServiceResult,
   VmInfo,
   VmNotFound,
@@ -97,11 +100,22 @@ const nonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const port = nonNegativeInt.check(Schema.isLessThanOrEqualTo(65_535))
 const positiveRange = Schema.Tuple([positiveInt, positiveInt])
 
+/**
+ * Operational daemon configuration. Admin credentials are deliberately NOT
+ * part of this type: they are hashed into the digest-only CredentialStore at
+ * parse time and never retained in long-lived config objects or closures.
+ */
 export class DaemonConfig extends Schema.Class<DaemonConfig>("DaemonConfig")({
   listen: Schema.Struct({ host: Schema.String, port }),
   advertisedUrl: Schema.String,
   tls: Schema.optional(Schema.Struct({ cert: Schema.String, key: Schema.String, ca: Schema.String })),
-  auth: Schema.Struct({ adminTokens: Schema.Array(Schema.String) }),
+  /**
+   * Fail-closed admission gate: the only accepted value is the literal
+   * `false`. Every process start is admission-closed; opening is performed
+   * exclusively by the authenticated `setAdmission` RPC, and the marker must
+   * be present and literally false or the daemon refuses to construct.
+   */
+  acceptingAtStartup: Schema.Literal(false),
   firecracker: Schema.Struct({
     firecrackerBinary: Schema.String,
     flockBinary: Schema.optional(Schema.String),
@@ -130,6 +144,17 @@ export class DaemonConfig extends Schema.Class<DaemonConfig>("DaemonConfig")({
     maxTtlSeconds: positiveInt
   })
 }) {}
+
+/**
+ * A parsed daemon configuration file: the operational config plus the
+ * digest-only credential store built from the file's plaintext tokens. The
+ * plaintext tokens themselves are referenced only for the duration of the
+ * digest and are never exposed to callers.
+ */
+export interface LoadedDaemonConfig {
+  readonly config: DaemonConfig
+  readonly credentials: Layer.Layer<CredentialStore>
+}
 
 export class DaemonConfigError extends Schema.TaggedError<DaemonConfigError>()("DaemonConfigError", {
   reason: Schema.String
@@ -178,9 +203,6 @@ const validateConfig = (config: DaemonConfig): DaemonConfig => {
     throw new Error("TLS is required when listening on a non-loopback address")
   }
   secureOrigin(config.advertisedUrl)
-  if (config.auth.adminTokens.length === 0 || config.auth.adminTokens.some((token) => token.length < 16)) {
-    throw new Error("auth.adminTokens must contain at least one token of 16 or more characters")
-  }
   if (config.tls !== undefined &&
     (config.tls.cert.length === 0 || config.tls.key.length === 0 || config.tls.ca.length === 0)) {
     throw new Error("tls.cert, tls.key, and tls.ca must all be non-empty")
@@ -205,14 +227,48 @@ const validateConfig = (config: DaemonConfig): DaemonConfig => {
   return config
 }
 
-export const loadDaemonConfig = (path: string): Effect.Effect<DaemonConfig, DaemonConfigError> =>
+/**
+ * Parses and validates a daemon configuration file. Fails closed: a missing
+ * or non-false `acceptingAtStartup`, or unusable admin tokens, prevents
+ * daemon construction entirely. Plaintext tokens are hashed here and only
+ * the digest-only credential store escapes.
+ */
+export const loadDaemonConfig = (path: string): Effect.Effect<LoadedDaemonConfig, DaemonConfigError> =>
   Effect.tryPromise({
     try: async () => {
       const raw = await readFile(path, "utf8")
-      const parsed: unknown = JSON.parse(raw)
-      return validateConfig(Schema.decodeUnknownSync(DaemonConfig)(expandEnvironment(parsed)))
+      const parsed: unknown = expandEnvironment(JSON.parse(raw))
+      if (!Predicate.isObject(parsed)) {
+        throw new Error("daemon configuration must be a JSON object")
+      }
+      if (!("acceptingAtStartup" in parsed)) {
+        throw new Error("acceptingAtStartup must be present in the daemon configuration and literally false")
+      }
+      if (parsed.acceptingAtStartup !== false) {
+        throw new Error("acceptingAtStartup must be literally false: every start is admission-closed; open with the setAdmission RPC")
+      }
+      const auth = "auth" in parsed ? parsed.auth : undefined
+      const adminTokens = Predicate.isObject(auth) && "adminTokens" in auth
+        ? (auth as { adminTokens?: unknown }).adminTokens
+        : undefined
+      if (!Array.isArray(adminTokens) ||
+        adminTokens.length === 0 ||
+        adminTokens.some((token) => typeof token !== "string" || token.length < 16)) {
+        throw new Error("auth.adminTokens must contain at least one token of 16 or more characters")
+      }
+      const tokens: ReadonlyArray<string> = adminTokens as ReadonlyArray<string>
+      const operational: Record<string, unknown> = { ...parsed }
+      delete operational.auth
+      return {
+        config: validateConfig(Schema.decodeUnknownSync(DaemonConfig)(operational)),
+        credentials: CredentialStore.layer(tokens)
+      }
     },
-    catch: () => new DaemonConfigError({ reason: `daemon configuration is unreadable or invalid: ${path}` })
+    catch: (cause) => new DaemonConfigError({
+      reason: cause instanceof Error && cause.message.length > 0
+        ? `daemon configuration is invalid: ${cause.message} (${path})`
+        : `daemon configuration is unreadable or invalid: ${path}`
+    })
   })
 
 interface Allocation {
@@ -265,7 +321,10 @@ export class VmRegistry extends Context.Service<VmRegistry, {
   readonly create: (
     request: CreateRequest,
     credential: Credential
-  ) => Effect.Effect<CreateResult, Forbidden | ImageNotAllowed | CapacityExceeded | HostPrereqFailed | BootFailed>
+  ) => Effect.Effect<
+    CreateResult,
+    AdmissionClosed | Forbidden | ImageNotAllowed | CapacityExceeded | HostPrereqFailed | BootFailed
+  >
   readonly execute: (
     request: ExecuteRequest,
     credential: Credential
@@ -279,21 +338,27 @@ export class VmRegistry extends Context.Service<VmRegistry, {
   readonly startWebService: (
     request: StartWebServiceRpcRequest,
     credential: Credential
-  ) => Effect.Effect<WebServiceStatus, Forbidden | VmNotFound | VmPoisoned | ClusterServiceError>
+  ) => Effect.Effect<WebServiceStatus, Forbidden | VmNotFound | VmPoisoned | ServiceError>
   readonly webServiceStatus: (
     vmId: VmId,
     credential: Credential
-  ) => Effect.Effect<WebServiceStatus, Forbidden | VmNotFound | VmPoisoned | ClusterServiceError>
+  ) => Effect.Effect<WebServiceStatus, Forbidden | VmNotFound | VmPoisoned | ServiceError>
   readonly stopWebService: (
     vmId: VmId,
     credential: Credential
-  ) => Effect.Effect<StopWebServiceResult, Forbidden | VmNotFound | VmPoisoned | ClusterServiceError>
+  ) => Effect.Effect<StopWebServiceResult, Forbidden | VmNotFound | VmPoisoned | ServiceError>
   readonly acquireHttp: (
     vmId: string,
     binding: DaemonHttpIngressBinding,
     kind: DaemonHttpAdmissionKind
   ) => Effect.Effect<DaemonHttpLease, DaemonHttpAdmissionError>
-  readonly cleanup: (credential: Credential) => Effect.Effect<CleanupResult, Forbidden | DestroyUncertain>
+  /** Switches the daemon-wide admission gate; admin-only, in memory only. */
+  readonly setAdmission: (
+    accepting: boolean,
+    credential: Credential
+  ) => Effect.Effect<AdmissionState, Forbidden>
+  /** Exact build/version, admission state, and live VM count; admin-only. */
+  readonly info: (credential: Credential) => Effect.Effect<DaemonInfo, Forbidden>
   readonly lockLost: Effect.Effect<never, DaemonRuntimeError>
 }>()("microvm/daemon/VmRegistry") {
   static readonly layer = (
@@ -610,22 +675,41 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
     const reservations = new Set<string>()
     const bootCancels = new Set<() => Effect.Effect<void>>()
     const mutex = yield* Semaphore.make(1)
-    const capacity = yield* Semaphore.make(config.limits.maxVms)
+    // Admission is in memory only and every process start is closed: the
+    // config marker must be literal false, and opening is performed
+    // exclusively by the authenticated setAdmission RPC. A restart adopts
+    // no prior state and no prior VM.
+    let accepting = false
+    type AdmitOutcome =
+      | { readonly _tag: "closed" }
+      | { readonly _tag: "full" }
+      | { readonly _tag: "admitted"; readonly vmId: VmId }
 
-    const withCredential = <A, E>(credential: Credential, effect: Effect.Effect<A, E, SandboxContext>) =>
-      Effect.provideService(effect, SandboxContext, SandboxContext.of({ credential }))
-
-    const allocateVmId = mutex.withPermit(Effect.sync((): VmId => {
+    /**
+     * One atomic admission decision under the registry mutex: the gate, the
+     * capacity ceiling, and the vmId reservation are decided together. The
+     * reservation IS the slot accounting — quarantines keep theirs, records
+     * hold theirs after commit — so `liveVms = records + reservations`
+     * includes booting and quarantined work exactly once.
+     */
+    const admit = mutex.withPermit(Effect.gen(function*() {
+      if (!accepting) return { _tag: "closed" } as const
+      if (records.size + reservations.size >= config.limits.maxVms) {
+        return { _tag: "full" } as const
+      }
       for (let attempt = 0; attempt < 128; attempt++) {
         const suffix = BigInt(`0x${randomBytes(10).toString("hex")}`).toString(36)
         const vmId = `mvm-${suffix}` as VmId
         if (!records.has(vmId) && !reservations.has(vmId)) {
           reservations.add(vmId)
-          return vmId
+          return { _tag: "admitted", vmId } as const
         }
       }
-      throw new Error("unable to allocate a collision-free VM id")
+      return { _tag: "full" } as const
     }))
+
+    const withCredential = <A, E>(credential: Credential, effect: Effect.Effect<A, E, SandboxContext>) =>
+      Effect.provideService(effect, SandboxContext, SandboxContext.of({ credential }))
 
     const cleanupPartial = (
       quarantine: Quarantine
@@ -656,9 +740,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         credentials.forgetVm(record.info.vmId)
         releaseAllocation(record)
         return true
-      })).pipe(
-        Effect.flatMap((removed) => removed ? capacity.release(1).pipe(Effect.as(true)) : Effect.succeed(false))
-      )
+      }))
 
     const markPoisoned = (record: VmRecord): Effect.Effect<void> =>
       mutex.withPermit(Effect.sync(() => {
@@ -826,32 +908,32 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
           releaseAllocation(quarantine.allocation)
           return true
         }))
-        if (removed) yield* capacity.release(1)
         return removed
       })
 
     const createAuthorized = (request: CreateRequest) =>
       Effect.gen(function*() {
-        const image = yield* images.resolve(request.image, request.imageDigest)
-        if (image.manifest.arch !== capabilities.arch) {
-          return yield* Effect.fail(new ImageNotAllowed({ image: request.image }))
+        // Admission, the capacity ceiling, and the vmId reservation are one
+        // atomic section: once an admin closes admission, a create that has
+        // not yet been admitted fails AdmissionClosed, and an admitted
+        // create holds its reservation atomically against the close.
+        const gate = yield* admit
+        if (gate._tag === "closed") {
+          return yield* Effect.fail(new AdmissionClosed({
+            message: "daemon is not accepting new microVMs"
+          }))
         }
-        const hasCapacity = yield* capacity.takeIfAvailable(1)
-        if (!hasCapacity) {
+        if (gate._tag === "full") {
           return yield* Effect.fail(new CapacityExceeded({ message: "maximum running VM capacity reached" }))
         }
-        let vmId: VmId | undefined
+        const vmId: VmId = gate.vmId
         let allocation: Allocation | undefined
         let handle: VmHandle | undefined
         let tokenMinted = false
         let committed = false
 
         const cleanupFailedCreate = Effect.gen(function*() {
-          if (tokenMinted && vmId !== undefined) credentials.forgetVm(vmId)
-          if (vmId === undefined) {
-            yield* capacity.release(1)
-            return
-          }
+          if (tokenMinted) credentials.forgetVm(vmId)
           const quarantine: Quarantine = {
             vmId,
             layout: vmLayout(config.firecracker, vmId),
@@ -860,19 +942,21 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
           }
           const cleanup = yield* Effect.result(cleanupPartial(quarantine))
           if (Result.isFailure(cleanup)) {
-            yield* mutex.withPermit(Effect.sync(() => quarantines.set(vmId!, quarantine)))
+            yield* mutex.withPermit(Effect.sync(() => quarantines.set(vmId, quarantine)))
             return yield* Effect.fail(new BootFailed({
               vmId,
               reason: `failed create was quarantined because cleanup was uncertain: ${cleanup.failure.reason}`
             }))
           }
           releaseAllocation(allocation)
-          yield* mutex.withPermit(Effect.sync(() => reservations.delete(vmId!)))
-          yield* capacity.release(1)
+          yield* mutex.withPermit(Effect.sync(() => reservations.delete(vmId)))
         })
 
         return yield* Effect.gen(function*() {
-          vmId = yield* allocateVmId
+          const image = yield* images.resolve(request.image, request.imageDigest)
+          if (image.manifest.arch !== capabilities.arch) {
+            return yield* Effect.fail(new ImageNotAllowed({ image: request.image }))
+          }
           allocation = yield* Effect.try({
             try: () => {
               const { uid, gid } = jailerUids.allocate()
@@ -903,7 +987,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             gid: allocation.gid
           }, image).pipe(
             Effect.mapError((cause) => new BootFailed({
-              vmId: vmId!,
+              vmId,
               reason: cause.reason !== undefined && cause.reason.trim().length > 0
                 ? cause.reason
                 : cause._tag
@@ -931,10 +1015,9 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             createdAtEpochMs,
             expiresAtEpochMs,
             poisoned: false
-          }).pipe(Effect.mapError((cause) => new BootFailed({ vmId: vmId!, reason: cause.reason })))
+          }).pipe(Effect.mapError((cause) => new BootFailed({ vmId, reason: cause.reason })))
           const info = new VmInfo({
             vmId,
-            owningHost: secureOrigin(config.advertisedUrl).origin,
             state: "running",
             image: request.image,
             imageDigest: handle.imageDigest,
@@ -957,9 +1040,11 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             serviceSemaphore: Semaphore.makeUnsafe(1),
             httpScopes: new Set()
           }
+          // The commit moves the id reservation into a record under the same
+          // mutex that admitted it.
           yield* mutex.withPermit(Effect.sync(() => {
-            reservations.delete(vmId!)
-            records.set(vmId!, record)
+            reservations.delete(vmId)
+            records.set(vmId, record)
           }))
           committed = true
           yield* handle.exited.pipe(
@@ -1044,10 +1129,10 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
       record: VmRecord,
       vmId: VmId,
       operation: Effect.Effect<A, GuestServiceError | GuestTransportFault>
-    ): Effect.Effect<A, ClusterServiceError | VmPoisoned> =>
+    ): Effect.Effect<A, ServiceError | VmPoisoned> =>
       operation.pipe(
         Effect.catchTag("GuestServiceError", (fault: GuestServiceError) =>
-          Effect.fail(new ClusterServiceError({
+          Effect.fail(new ServiceError({
             vmId,
             code: fault.code,
             message: fault.message
@@ -1061,9 +1146,9 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
     const serviceStatusResult = (
       vmId: VmId,
       status: WebServiceState
-    ): Effect.Effect<WebServiceStatus, ClusterServiceError> => {
+    ): Effect.Effect<WebServiceStatus, ServiceError> => {
       if (status.state === "not_started") {
-        return Effect.fail(new ClusterServiceError({
+        return Effect.fail(new ServiceError({
           vmId,
           code: "NOT_RUNNING",
           message: "web service has not been started"
@@ -1086,7 +1171,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
     const withServiceRecord = <A, E>(
       vmId: VmId,
       use: (record: VmRecord, webPort: number) => Effect.Effect<A, E>
-    ): Effect.Effect<A, E | VmNotFound | VmPoisoned | ClusterServiceError> =>
+    ): Effect.Effect<A, E | VmNotFound | VmPoisoned | ServiceError> =>
       Effect.gen(function*() {
         const record = yield* getRecord(vmId)
         return yield* record.serviceSemaphore.withPermit(Effect.gen(function*() {
@@ -1101,7 +1186,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
             return yield* Effect.fail(new VmPoisoned({ vmId, message: "VM lifetime expired" }))
           }
           if (record.webPort === undefined) {
-            return yield* Effect.fail(new ClusterServiceError({
+            return yield* Effect.fail(new ServiceError({
               vmId,
               code: "INVALID_REQUEST",
               message: "image has no web service endpoint"
@@ -1116,7 +1201,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         Effect.andThen(Effect.suspend(() => {
           const rejection = webServiceStartRejection(request.argv, request.cwd, request.env)
           if (rejection !== undefined) {
-            return Effect.fail(new ClusterServiceError({
+            return Effect.fail(new ServiceError({
               vmId: request.vmId,
               code: "INVALID_REQUEST",
               message: rejection
@@ -1143,7 +1228,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
                 requestId: randomBytes(16).toString("hex")
               }))
               if (status.state === "running") {
-                return yield* Effect.fail(new ClusterServiceError({
+                return yield* Effect.fail(new ServiceError({
                   vmId: request.vmId,
                   code: "ALREADY_RUNNING",
                   message: "web service is already running"
@@ -1212,34 +1297,42 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
         })
       }))
 
-    const cleanupRecords = (): Effect.Effect<CleanupResult> =>
-      Effect.gen(function*() {
-        const now = Date.now()
-        const candidates = yield* mutex.withPermit(Effect.sync(() =>
-          Array.from(records.values()).filter((record) =>
-            record.poisoned || (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= now)
-          )
-        ))
-        const quarantined = yield* mutex.withPermit(Effect.sync(() => Array.from(quarantines.values())))
-        const destroyed: Array<VmId> = []
-        const failed: Array<{ readonly vmId: VmId; readonly reason: string }> = []
-        for (const record of candidates) {
-          const outcome = yield* Effect.result(destroyRecord(record))
-          if (Result.isSuccess(outcome)) {
-            if (outcome.success.destroyed) destroyed.push(record.info.vmId)
-          } else failed.push({ vmId: record.info.vmId, reason: outcome.failure.reason })
-        }
-        for (const quarantine of quarantined) {
-          const outcome = yield* Effect.result(cleanupQuarantine(quarantine))
-          if (Result.isSuccess(outcome)) {
-            if (outcome.success) destroyed.push(quarantine.vmId)
-          } else failed.push({ vmId: quarantine.vmId, reason: outcome.failure.reason })
-        }
-        return new CleanupResult({ destroyed, failed })
-      })
+    /** Periodic internal reaper: reclaims poisoned, expired, and quarantined VMs. */
+    const reapExpiredVms = Effect.gen(function*() {
+      const now = Date.now()
+      const candidates = yield* mutex.withPermit(Effect.sync(() =>
+        Array.from(records.values()).filter((record) =>
+          record.poisoned || (record.info.expiresAtEpochMs !== undefined && record.info.expiresAtEpochMs <= now)
+        )
+      ))
+      const quarantined = yield* mutex.withPermit(Effect.sync(() => Array.from(quarantines.values())))
+      for (const record of candidates) {
+        yield* Effect.result(destroyRecord(record))
+      }
+      for (const quarantine of quarantined) {
+        yield* Effect.result(cleanupQuarantine(quarantine))
+      }
+    })
 
-    const cleanup = (credential: Credential) =>
-      withCredential(credential, requireAdmin).pipe(Effect.andThen(cleanupRecords()))
+    const setAdmission = (accept: boolean, credential: Credential) =>
+      withCredential(credential, requireAdmin).pipe(
+        Effect.andThen(mutex.withPermit(Effect.sync(() => {
+          accepting = accept
+          return new AdmissionState({ accepting })
+        })))
+      )
+
+    const info = (credential: Credential) =>
+      withCredential(credential, requireAdmin).pipe(
+        Effect.andThen(mutex.withPermit(Effect.sync(() => new DaemonInfo({
+          version: MICROVM_VERSION,
+          accepting,
+          // Admitted in-flight reservations count too (quarantines keep
+          // theirs), so a drain cannot report zero VMs while a boot is
+          // still active.
+          liveVms: records.size + reservations.size
+        }))))
+      )
 
     const shutdown = Effect.gen(function*() {
       for (const cancel of Array.from(bootCancels)) yield* cancel()
@@ -1265,7 +1358,7 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
     yield* Scope.addFinalizer(daemonScope, shutdown)
     yield* Effect.forever(
       Effect.sleep(1_000).pipe(
-        Effect.andThen(cleanupRecords()),
+        Effect.andThen(reapExpiredVms),
         Effect.catchCause((cause) => Effect.logError("VM reaper failed", cause))
       )
     ).pipe(Effect.forkIn(daemonScope))
@@ -1280,7 +1373,8 @@ const makeVmRegistry = (config: DaemonConfig, unsafeSkipKernelLockForTests: bool
       webServiceStatus,
       stopWebService,
       acquireHttp,
-      cleanup,
+      setAdmission,
+      info,
       lockLost: kernelLock.lost
     })
   })
@@ -1291,24 +1385,27 @@ export interface DaemonLayerOptions {
   readonly guestHttp?: Layer.Layer<GuestHttpChannel>
   readonly guestService?: Layer.Layer<GuestServiceChannel>
   readonly prereqs?: Layer.Layer<HostPrereqs>
+  /** Digest-only credential store; built at config-parse time from plaintext tokens. */
+  readonly credentials: Layer.Layer<CredentialStore>
   readonly server?: NodeServer
   /** Test-only seam; rejected unless NODE_ENV is exactly "test". */
   readonly unsafeSkipKernelLockForTests?: boolean | undefined
 }
 
-export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) => {
+export const daemonLayer = (config: DaemonConfig, options: DaemonLayerOptions) => {
   const infrastructure = Layer.mergeAll(
-    CredentialStore.layer(config.auth.adminTokens),
-    options?.prereqs ?? HostPrereqs.layer(config.firecracker),
+    options.credentials,
+    options.prereqs ?? HostPrereqs.layer(config.firecracker),
     ImageAllowlist.layer(config.firecracker.imagesDir),
     CidAllocator.layer(config.firecracker),
     JailerUidAllocator.layer(config.firecracker),
-    options?.firecracker ?? FirecrackerLive(config.firecracker),
-    options?.guestExec ?? GuestExecChannelLive,
-    options?.guestHttp ?? GuestHttpChannelLive,
-    options?.guestService ?? GuestServiceChannelLive
+    options.firecracker ?? FirecrackerLive(config.firecracker),
+    options.guestExec ?? GuestExecChannelLive,
+    options.guestHttp ?? GuestHttpChannelLive,
+    options.guestService ?? GuestServiceChannelLive
   )
-  const registry = VmRegistry.layer(config, options?.unsafeSkipKernelLockForTests).pipe(Layer.provide(infrastructure))
+  const registry = VmRegistry.layer(config, options.unsafeSkipKernelLockForTests === true)
+    .pipe(Layer.provide(infrastructure))
   const handlers = MicrovmRpc.toLayer(Effect.gen(function*() {
     const service = yield* VmRegistry
     const authenticated = <A, E>(run: (credential: Credential) => Effect.Effect<A, E>) =>
@@ -1322,7 +1419,8 @@ export const daemonLayer = (config: DaemonConfig, options?: DaemonLayerOptions) 
       startWebService: (request) => authenticated((credential) => service.startWebService(request, credential)),
       webServiceStatus: ({ vmId }) => authenticated((credential) => service.webServiceStatus(vmId, credential)),
       stopWebService: ({ vmId }) => authenticated((credential) => service.stopWebService(vmId, credential)),
-      cleanup: () => authenticated(service.cleanup)
+      setAdmission: ({ accepting }) => authenticated((credential) => service.setAdmission(accepting, credential)),
+      info: () => authenticated(service.info)
     }
   })).pipe(Layer.provide(registry))
   const authentication = authLayer.pipe(Layer.provide(infrastructure))

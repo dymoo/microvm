@@ -9,7 +9,9 @@ import { generateText, simulateReadableStream, stepCountIs, streamText } from "a
 import { MockLanguageModelV4 } from "ai/test"
 import { describe, expect, it } from "vitest"
 import { createSandboxTools, SANDBOX_SYSTEM_PROMPT, TOOL_GUIDANCE } from "../src/ai.js"
-import { makeMicrovmClient } from "../src/client.js"
+import { makeSandboxScopedClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import {
   Firecracker,
@@ -55,8 +57,8 @@ const requiredGuidance = [
 const configFor = (root: string) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
   advertisedUrl: "http://127.0.0.1:1",
+  acceptingAtStartup: false,
   tls: undefined,
-  auth: { adminTokens: [adminToken] },
   firecracker: {
     firecrackerBinary: "/usr/bin/false",
     flockBinary: undefined,
@@ -140,11 +142,12 @@ describe("Vercel AI SDK sandbox tools", () => {
       }]
     })
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const client = yield* makeMicrovmClient({
+      const client = yield* makeSandboxScopedClient({
         url: "http://127.0.0.1:1",
-        token: "unused-guidance-smoke-token"
+        token: "mvs_unused_guidance_smoke_token000000",
+        vmId: "mvm-guidance"
       })
-      const tools = createSandboxTools({ client, vmId: "mvm-guidance" })
+      const tools = createSandboxTools({ client })
       yield* Effect.promise(() => generateText({
         model,
         system: `${SANDBOX_SYSTEM_PROMPT}\n\n${TOOL_GUIDANCE}`,
@@ -201,6 +204,7 @@ describe("Vercel AI SDK sandbox tools", () => {
         }))
         const server = createServer()
         yield* daemonLayer(configFor(root), {
+          credentials: CredentialStore.layer([adminToken]),
           firecracker, guestExec: guest, prereqs, server, unsafeSkipKernelLockForTests: true
         }).pipe(
           Layer.launch,
@@ -208,9 +212,10 @@ describe("Vercel AI SDK sandbox tools", () => {
         )
         const url = `http://127.0.0.1:${yield* waitForListener(server)}`
         const admin = yield* makeMicrovmClient({ url, token: adminToken })
+        yield* admin.setAdmission({ accepting: true })
         const created = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
-        const sandbox = yield* makeMicrovmClient({ url, token: created.sandboxToken })
-        const tools = createSandboxTools({ client: sandbox, vmId: created.vm.vmId, workdir: "/workspace" })
+        const sandbox = yield* makeSandboxScopedClient({ url, token: created.sandboxToken, vmId: created.vm.vmId })
+        const tools = createSandboxTools({ client: sandbox, workdir: "/workspace" })
 
         const generatedModel = new MockLanguageModelV4({
           doGenerate: [

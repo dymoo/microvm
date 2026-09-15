@@ -1,3 +1,9 @@
+import {
+  makeSandboxHttpIngress as makeSharedHttpIngress,
+  type SandboxHttpIngress,
+  type SandboxHttpIngressOptions as SharedHttpIngressOptions
+} from "./http-ingress.js"
+
 export {
   SANDBOX_SYSTEM_PROMPT,
   TOOL_GUIDANCE,
@@ -7,61 +13,62 @@ export type { SandboxToolLimits, SandboxToolsOptions } from "./ai.js"
 
 export {
   ClientConfigurationError,
-  SandboxBindingError,
   decodeExecResult,
-  makeMicrovm,
-  makeMicrovmClient
+  makeAdminClient,
+  makeSandboxScopedClient
 } from "./client.js"
 export type {
+  AdminClient,
+  AdminConstructionError,
+  CreateOutcome,
   DecodedExecResult,
-  Microvm,
-  MicrovmClient,
-  MicrovmClientOptions,
+  SandboxAdmissionError,
   SandboxCreateError,
   SandboxCreateInput,
   SandboxDestroyError,
   SandboxExecuteError,
   SandboxExecuteInput,
-  SandboxHandle,
+  SandboxInfoError,
   SandboxInspectError,
+  SandboxScopedClient,
   SandboxServiceOperationError,
-  SandboxStartWebServiceInput,
-  WebServiceHandle
+  SandboxStartWebServiceInput
 } from "./client.js"
+export type { NodeMicrovmClientOptions } from "./client.js"
+
+/** Node ingress options; only this runtime-specific root permits ambient fetch. */
+export interface SandboxHttpIngressOptions extends Omit<SharedHttpIngressOptions, "fetch"> {
+  readonly fetch?: typeof globalThis.fetch | undefined
+}
+
+export const makeSandboxHttpIngress = (
+  options: SandboxHttpIngressOptions
+): SandboxHttpIngress => {
+  const { fetch: configuredFetch, ...sharedOptions } = options
+  return makeSharedHttpIngress({
+    ...sharedOptions,
+    fetch: configuredFetch ?? globalThis.fetch
+  })
+}
+
+export type { SandboxHttpIngress }
 
 export {
-  ClusterEndpointUnavailable,
-  ClusterRoutingError,
-  makeMicrovmCluster
-} from "./cluster.js"
-export type {
-  ClusterCreateError,
-  ClusterDestroyError,
-  ClusterEndpoint,
-  ClusterExecuteError,
-  ClusterInspectError,
-  ClusterListError,
-  MicrovmCluster,
-  MicrovmClusterOptions
-} from "./cluster.js"
-
-export type { SandboxHttpProxy } from "./http-proxy.js"
-
-export {
+  MICROVM_VERSION,
+  AdmissionClosed,
+  AdmissionState,
   BootFailed,
   CapacityExceeded,
-  CleanupResult,
-  ClusterServiceError,
   CreateResult,
+  DaemonInfo,
   DestroyResult,
   DestroyUncertain,
   ExecResult,
   Forbidden,
-  HttpNotConfigured,
-  ImageDigest,
-  ImageNotAllowed,
   HostPrereqFailed,
+  ImageDigest,
   ImageName,
+  ImageNotAllowed,
   ListResult,
   MicrovmRpc,
   StartWebServiceRequest,
@@ -74,12 +81,13 @@ export {
   WebServiceStatus
 } from "./protocol.js"
 export type {
-  CleanupRequest,
   CreateRequest,
   DestroyRequest,
   ExecuteRequest,
+  InfoRequest,
   InspectRequest,
   ListRequest,
+  SetAdmissionRequest,
   StartWebServiceRpcRequest,
   StopWebServiceRequest,
   WebServiceStatusRequest

@@ -15,7 +15,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { makeMicrovmClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import { INGRESS_IDLE_MS, ingressIdleGuard } from "../src/daemon-http-proxy.js"
 import {
@@ -35,8 +36,8 @@ const roots: Array<string> = []
 const configFor = (root: string) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
   advertisedUrl: "http://127.0.0.1:1",
+  acceptingAtStartup: false,
   tls: undefined,
-  auth: { adminTokens: [adminToken] },
   firecracker: {
     firecrackerBinary: "/usr/bin/false",
     flockBinary: undefined,
@@ -212,6 +213,7 @@ const startDaemon = (
       stop: () => Effect.succeed({ stopped: false })
     }))
     yield* daemonLayer(configFor(root), {
+          credentials: CredentialStore.layer([adminToken]),
       firecracker,
       guestExec,
       guestHttp: overrides.guestHttp ?? guestHttp,
@@ -229,6 +231,7 @@ const createVm = (port: number) =>
       url: `http://127.0.0.1:${port}`,
       token: adminToken
     })
+    yield* admin.setAdmission({ accepting: true })
     const created = yield* admin.create({
       image: "node",
       imageDigest: fixtureImageDigest,

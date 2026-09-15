@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Layer } from "effect"
 import { describe, expect, it } from "vitest"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import { Firecracker, GuestExecChannel } from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
@@ -14,8 +15,8 @@ const canExerciseFlock = process.platform === "linux" && existsSync("/usr/bin/fl
 const configFor = (root: string) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
   advertisedUrl: "http://127.0.0.1:1",
+  acceptingAtStartup: false,
   tls: undefined,
-  auth: { adminTokens: ["lock-test-admin-token"] },
   firecracker: {
     firecrackerBinary: "/usr/bin/false",
     flockBinary: "/usr/bin/flock",
@@ -60,7 +61,10 @@ const guest = Layer.succeed(GuestExecChannel, GuestExecChannel.of({
 }))
 
 const start = (config: DaemonConfig, server: Server) =>
-  daemonLayer(config, { server, prereqs, firecracker, guestExec: guest }).pipe(
+  daemonLayer(config, {
+    credentials: CredentialStore.layer(["lock-test-admin-token"]),
+    server, prereqs, firecracker, guestExec: guest
+  }).pipe(
     Layer.launch,
     Effect.forkScoped
   )

@@ -217,10 +217,11 @@ set -e
 assert_json 'import json,sys; v=json.load(sys.stdin); assert len(v["stdout"].encode()) == 1024 and v["outputTruncated"] is True and v["timedOut"] is False' "$TRUNCATED_JSON"
 
 set +e
-MICROVM_TOKEN=$VM1_TOKEN "$MICROVM_BIN" cleanup --json >/dev/null 2>&1
-CLEANUP_STATUS=$?
+ADMISSION_OUTPUT=$(MICROVM_TOKEN=$VM1_TOKEN "$MICROVM_BIN" set-admission --yes --json 2>&1)
+ADMISSION_STATUS=$?
 set -e
-[[ $CLEANUP_STATUS -eq 2 ]] || { echo "sandbox token was allowed to run admin cleanup" >&2; exit 1; }
+[[ $ADMISSION_STATUS -eq 2 ]] || { echo "sandbox token was allowed to change daemon admission" >&2; exit 1; }
+assert_json 'import json,sys; assert json.load(sys.stdin)["error"] == "Forbidden"' "$ADMISSION_OUTPUT"
 
 STATUS1_JSON=$(MICROVM_TOKEN=$VM1_TOKEN "$MICROVM_BIN" status --vm "$VM1_ID" --json)
 STATUS2_JSON=$(MICROVM_TOKEN=$VM2_TOKEN "$MICROVM_BIN" status --vm "$VM2_ID" --json)

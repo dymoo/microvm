@@ -2,7 +2,7 @@ import { tool, type Tool, type ToolSet } from "ai"
 import { Effect } from "effect"
 import { posix } from "node:path"
 import { z } from "zod"
-import { decodeExecResult, type DecodedExecResult, type MicrovmClient } from "./client.js"
+import { decodeExecResult, type DecodedExecResult, type SandboxScopedClient } from "./client.js"
 import { STANDARD_NODE_GUEST_WEB_PORT } from "./protocol.js"
 
 const HARD_TIMEOUT_MS = 120_000
@@ -18,8 +18,8 @@ export interface SandboxToolLimits {
 }
 
 export interface SandboxToolsOptions {
-  readonly client: MicrovmClient
-  readonly vmId: string
+  /** The one VM-bound sandbox client these tools drive; never an admin client. */
+  readonly client: SandboxScopedClient
   readonly workdir?: string | undefined
   readonly limits?: SandboxToolLimits | undefined
 }
@@ -116,7 +116,6 @@ export const createSandboxTools = (options: SandboxToolsOptions): SandboxTools =
     env?: Readonly<Record<string, string>>
   ) => runInterruptibly(
     options.client.execute({
-      vmId: options.vmId,
       argv,
       cwd: workdir,
       env,

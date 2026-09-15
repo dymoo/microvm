@@ -123,7 +123,6 @@ describe("durable web-service wire schemas", () => {
   it("represents the create ingress capability only when configured", () => {
     const baseVm = {
       vmId: "mvm-abc12345",
-      owningHost: "local",
       state: "running" as const,
       image: "node",
       imageDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",

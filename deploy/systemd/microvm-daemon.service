@@ -1,0 +1,35 @@
+[Unit]
+Description=microvm Firecracker daemon
+Documentation=https://github.com/dymoo/microvm/blob/main/docs/operations.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# The daemon deliberately requires real root privilege: it verifies /dev/kvm,
+# creates and controls cgroup-v2 VM subtrees, prepares jailer chroots, then the
+# jailer drops each VMM to its configured unprivileged UID/GID.
+User=root
+Group=root
+WorkingDirectory=/opt/microvm/current/package
+EnvironmentFile=/etc/microvm/microvm.env
+ExecStart=/usr/bin/node /opt/microvm/current/package/dist/bin/daemon.js --config /etc/microvm/config.json
+
+# SIGTERM is delivered to the daemon first so its scoped shutdown can destroy
+# every VM and prove cgroup/run-state release. Only after that bounded grace may
+# systemd kill remaining children in the service cgroup.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30s
+SendSIGKILL=yes
+
+# Every process restart starts with admission closed. An operator or the
+# verified deploy script must explicitly open it after health checks.
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

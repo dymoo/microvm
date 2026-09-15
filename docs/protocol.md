@@ -143,11 +143,12 @@ connection. A connection refusal is `503 Service Unavailable`; an origin head
 timeout is `504 Gateway Timeout`; an invalid origin response is `502 Bad
 Gateway`. None poisons the VM.
 
-The host daemon route is `/http/v1/vms/<vm-id><raw-suffix>`. It authenticates
-one VM-bound HTTP-ingress capability in `Proxy-Authorization: Bearer ...`
-before acquiring a VM or opening vsock. Admin and sandbox-control tokens are
-not ingress tokens. The external Node adapter owns capability injection, and
-neither the token nor the daemon route is exposed through `SandboxHttpProxy`.
+The host daemon route is `/http/v1/vms/<vm-id><raw-suffix>`
+(`DAEMON_HTTP_ROUTE_PREFIX`). It authenticates one VM-bound HTTP-ingress
+capability in `Proxy-Authorization: Bearer ...` before acquiring a VM or
+opening vsock. Admin and sandbox-control tokens are not ingress tokens. The
+trusted fronting hop owns capability injection, and neither the token nor
+the daemon route is exposed through a public preview surface.
 
 Request and response handling is semantic, not a raw byte tunnel:
 
@@ -163,22 +164,21 @@ Request and response handling is semantic, not a raw byte tunnel:
   response-head time are bounded; bodies remain streaming and backpressured;
 - SSE flushes immediately and occupies one of eight per-VM long-lived slots.
 
-A trusted Node host MUST wire the adapter to all four server events, because
-Node routes them independently and a partial wiring fails silently:
+A trusted fronting hop (request-scoped Node/operational code, or the
+approved Cloudflare Durable Object) MUST implement every refusal on its own
+hop; a fronting host that cannot implement an event must refuse it
+explicitly rather than silently dropping the behavior:
 
-| Event | Handler | Refusal |
-| --- | --- | --- |
-| `request` | `handleRequest` | proxied, or a bounded local rejection |
-| `upgrade` | `handleUpgrade` | `426`/`400`/`502`, or the validated WebSocket tunnel |
-| `connect` | `handleConnect` | `405` written on the detached socket, which is then drained, dropped, and closed; `head` is never read |
-| `checkContinue` | `handleCheckContinue` | the same admission as `request`, with `Connection: close` and no interim `100 Continue` |
+| Exchange | Required fronting behavior |
+| --- | --- |
+| ordinary request | sanitize, then proxy, or a bounded local rejection |
+| upgrade intent | `426`/`400`/`502`, or the validated WebSocket tunnel where the transport supports one |
+| `CONNECT` | `405` written on the detached socket, which is then drained, dropped, and closed; `head` is never read |
+| `Expect: 100-continue` | refused with `400` on the caller's raw headers, before any admission or guest I/O, with `Connection: close` and no interim `100 Continue` |
 
-With no `connect` listener Node closes a CONNECT socket without any response,
-and with no `checkContinue` listener it writes an interim `100 Continue` before
-emitting `request` — inviting a body this adapter never forwards. Neither
-callback can open, return, or dial anything: the adapter exposes exactly one
-VM-bound HTTP surface, so a CONNECT or an unanswered expectation only ever
-terminates.
+An unhandled `CONNECT` or an unanswered expectation only ever terminates:
+neither can open, return, or dial anything, so a fronting hop exposes
+exactly one VM-bound HTTP surface.
 
 A WebSocket request is admitted only after a valid RFC 6455 version/key and a
 valid guest `101` accept/subprotocol response. Extensions are disabled.
@@ -204,8 +204,8 @@ buffered to police it. A refused upgrade that failed after guest I/O — a guest
 that answered `200`, reset the socket, sent an invalid `101`, or never answered
 within the 120 s response-head deadline — is rendered to the caller as a bounded
 `502`/`504` with `Connection: close`, and that socket is destroyed at a fixed
-bound. Direct-daemon upgrades must be HTTP/1.1, matching the public adapter and
-the guest proxy.
+bound. Direct-daemon upgrades must be HTTP/1.1, matching the fronting
+adapter and the guest proxy.
 
 ## Durable web-service control v1
 
@@ -216,7 +216,7 @@ connection, so it continues running after a successful `start` response.
 Each JSON payload is at most **262144 UTF-8 bytes** (256 KiB), excluding its
 single trailing newline. The host serializes and sizes the exact request line
 before opening the channel. An unencodable or oversized start is
-`ClusterServiceError` code `INVALID_REQUEST`; it performs no guest I/O and does
+`ServiceError` code `INVALID_REQUEST`; it performs no guest I/O and does
 not poison the VM. The host receive bound is the same 256 KiB.
 `MAX_SERVICE_CONTROL_LINE_BYTES` is the exported host authority;
 `MaximumServiceRequestBytes` is its Go guest mirror.
@@ -252,6 +252,6 @@ operations return bounded `INVALID_REQUEST`; start conflicts return
 remains a typed service-operation failure and does not poison the VM. Only
 uncertain service-channel framing or I/O faults poison it.
 
-The cluster facade preserves non-semantic failure tags such as `VmNotFound`,
-`Forbidden`, `VmPoisoned`, and `RpcClientError`; it does not collapse them into
-`ClusterServiceError(INTERNAL)`.
+The typed RPC surface preserves non-semantic failure tags such as
+`VmNotFound`, `Forbidden`, `VmPoisoned`, and `RpcClientError`; it does not
+collapse them into `ServiceError(INTERNAL)`.

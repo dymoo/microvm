@@ -1,15 +1,16 @@
 /**
  * Credential implementation for the auth seam declared in protocol.ts:
- * token storage/verification, server middleware layer, handler-side
- * authorization helpers, and the client-side header middleware.
+ * token storage/verification, server middleware layer, and handler-side
+ * authorization helpers.
  *
- * Tokens travel as `Authorization: Bearer <token>` and are stored only as
- * SHA-256 hex digests. Admin digests get a constant-time comparison; sandbox
- * lookup keys the map by the 256-bit digest of the (never-stored) token.
+ * Tokens travel as bearer credentials inside each RPC request envelope and
+ * are stored only as SHA-256 hex digests. Admin digests get a constant-time
+ * comparison; sandbox lookup keys the map by the 256-bit digest of the
+ * (never-stored) token.
  */
 import { Context, Effect, Layer } from "effect"
 import { Headers } from "effect/unstable/http"
-import { RpcClient, RpcMiddleware } from "effect/unstable/rpc"
+import { RpcMiddleware } from "effect/unstable/rpc"
 import { Buffer } from "node:buffer"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { Auth, Forbidden, SandboxContext, Unauthenticated } from "./protocol.js"
@@ -51,9 +52,15 @@ export class CredentialStore extends Context.Service<CredentialStore, {
   /** Drops every control- and data-plane credential bound to a VM. */
   readonly forgetVm: (vmId: string) => void
 }>()("microvm/auth/CredentialStore") {
-  static readonly layer = (adminTokens: ReadonlyArray<string>): Layer.Layer<CredentialStore> =>
-    Layer.effect(CredentialStore)(Effect.sync(() => {
-      const admin = new Set(Array.from(new Set(adminTokens), (token) => Buffer.from(sha256Hex(token), "utf8")))
+  /**
+   * Builds the digest-only store. Admin tokens are hashed eagerly, before
+   * any closure captures them, so plaintext never outlives this call.
+   */
+  static readonly layer = (adminTokens: ReadonlyArray<string>): Layer.Layer<CredentialStore> => {
+    const admin = new Set(
+      Array.from(new Set(adminTokens), (token) => Buffer.from(sha256Hex(token), "utf8"))
+    )
+    return Layer.effect(CredentialStore)(Effect.sync(() => {
       const sandbox = new Map<string, string>()
       const httpIngress = new Map<string, HttpIngressCredential>()
 
@@ -110,6 +117,7 @@ export class CredentialStore extends Context.Service<CredentialStore, {
         }
       })
     }))
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,14 +169,14 @@ export const authorizeVm = (vmId: string) =>
   })
 
 // ---------------------------------------------------------------------------
-// Client-side auth middleware
+// Raw client-side auth middleware
 // ---------------------------------------------------------------------------
 
 /**
- * Client layer stamping `Authorization: Bearer <token>` directly onto each
- * outgoing request envelope. Set on the request itself (not via a fiber
- * reference) so the header is captured deterministically at request-encode
- * time regardless of middleware scheduling.
+ * Client middleware stamping the bearer credential onto each outgoing RPC
+ * envelope. Used by the internal raw seam (`src/client-raw.ts`, repository
+ * tests only); the request-scoped admin/sandbox views present per-call
+ * headers instead.
  */
 export const clientAuthLayer = (token: string) =>
   RpcMiddleware.layerClient(Auth, ({ request, next }) =>

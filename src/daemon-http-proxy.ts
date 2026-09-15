@@ -12,9 +12,7 @@ import {
 } from "node:http"
 import { isIP, type Socket } from "node:net"
 import { Duplex, Transform, pipeline, type TransformCallback } from "node:stream"
-import { HTTP_PREVIEW_LIMITS } from "./protocol.js"
-
-export const DAEMON_HTTP_ROUTE_PREFIX = "/http/v1/vms/"
+import { DAEMON_HTTP_ROUTE_PREFIX, HTTP_PREVIEW_LIMITS } from "./protocol.js"
 
 /**
  * The one idle policy of the ingress data plane: an ordinary response, an SSE

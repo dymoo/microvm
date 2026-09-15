@@ -18,7 +18,9 @@ import { generateText, stepCountIs } from "ai"
 import { MockLanguageModelV4 } from "ai/test"
 import { afterEach, describe, expect, it } from "vitest"
 import { createSandboxTools } from "../src/ai.js"
-import { makeMicrovmClient } from "../src/client.js"
+import { makeSandboxScopedClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import { Firecracker, GuestExecChannel } from "../src/firecracker.js"
 import { HostPrereqs } from "../src/host.js"
@@ -36,8 +38,8 @@ const roots: Array<string> = []
 const configFor = (root: string) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
   advertisedUrl: "http://127.0.0.1:1",
+  acceptingAtStartup: false,
   tls: undefined,
-  auth: { adminTokens: [adminToken] },
   firecracker: {
     firecrackerBinary: "/usr/bin/false",
     flockBinary: undefined,
@@ -102,6 +104,14 @@ const waitForListener = (server: Server) =>
     return address.port
   })
 
+
+/** Starts admission-closed; opens the gate for the harness before tests run. */
+const openAdmission = (port: number) =>
+  Effect.gen(function*() {
+    const admin = yield* makeMicrovmClient({ url: `http://127.0.0.1:${port}`, token: adminToken })
+    yield* admin.setAdmission({ accepting: true })
+  })
+
 interface GuestCall {
   readonly vmId: string
   readonly argv: ReadonlyArray<string>
@@ -112,6 +122,7 @@ const startHarness = (root: string) =>
     const guestCalls: Array<GuestCall> = []
     const server = createServer()
     yield* daemonLayer(configFor(root), {
+          credentials: CredentialStore.layer([adminToken]),
       firecracker: Layer.succeed(Firecracker, Firecracker.of({
         boot: (spec) => Effect.promise(async () => {
           await mkdir(spec.layout.vmDir, { recursive: true })
@@ -144,6 +155,7 @@ const startHarness = (root: string) =>
       Effect.forkScoped
     )
     const port = yield* waitForListener(server)
+    yield* openAdmission(port)
     return { url: `http://127.0.0.1:${port}`, guestCalls }
   })
 
@@ -172,8 +184,8 @@ describe("sandbox tool abuse", () => {
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
       const bound = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
       const other = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
-      const sandbox = yield* makeMicrovmClient({ url: harness.url, token: bound.sandboxToken })
-      const tools = createSandboxTools({ client: sandbox, vmId: bound.vm.vmId, workdir: workspace })
+      const sandbox = yield* makeSandboxScopedClient({ url: harness.url, token: bound.sandboxToken, vmId: bound.vm.vmId })
+      const tools = createSandboxTools({ client: sandbox, workdir: workspace })
 
       const model = new MockLanguageModelV4({
         doGenerate: [hostileTurn([
@@ -222,8 +234,8 @@ describe("sandbox tool abuse", () => {
       const harness = yield* startHarness(root)
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
       const created = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
-      const sandbox = yield* makeMicrovmClient({ url: harness.url, token: created.sandboxToken })
-      const tools = createSandboxTools({ client: sandbox, vmId: created.vm.vmId, workdir: workspace })
+      const sandbox = yield* makeSandboxScopedClient({ url: harness.url, token: created.sandboxToken, vmId: created.vm.vmId })
+      const tools = createSandboxTools({ client: sandbox, workdir: workspace })
 
       const model = new MockLanguageModelV4({
         doGenerate: [hostileTurn([
@@ -262,8 +274,8 @@ describe("sandbox tool abuse", () => {
       const harness = yield* startHarness(root)
       const admin = yield* makeMicrovmClient({ url: harness.url, token: adminToken })
       const created = yield* admin.create({ image: "node", imageDigest: fixtureImageDigest, cpus: undefined, memMib: undefined, ttlSeconds: undefined })
-      const sandbox = yield* makeMicrovmClient({ url: harness.url, token: created.sandboxToken })
-      const tools = createSandboxTools({ client: sandbox, vmId: created.vm.vmId, workdir: workspace })
+      const sandbox = yield* makeSandboxScopedClient({ url: harness.url, token: created.sandboxToken, vmId: created.vm.vmId })
+      const tools = createSandboxTools({ client: sandbox, workdir: workspace })
       const vmId = created.vm.vmId
 
       const controller = new AbortController()

@@ -11,7 +11,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Fiber, Layer, Result, Schema } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
-import { makeMicrovmClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import { Firecracker, FirecrackerLive } from "../src/firecracker.js"
 import {
@@ -100,7 +101,6 @@ describe("ImageDigest wire schema", () => {
 
     const vm = {
       vmId: "mvm-abc12345",
-      owningHost: "local",
       state: "running" as const,
       image: "node",
       cpus: 1,
@@ -332,8 +332,8 @@ describe("daemon stores measured identity", () => {
   const configFor = (root: string, maxVms: number) => new DaemonConfig({
     listen: { host: "127.0.0.1", port: 0 },
     advertisedUrl: "http://127.0.0.1:1",
+    acceptingAtStartup: false,
     tls: undefined,
-    auth: { adminTokens: [adminToken] },
     firecracker: {
       firecrackerBinary: "/usr/bin/false",
       flockBinary: undefined,
@@ -392,6 +392,14 @@ describe("daemon stores measured identity", () => {
       return address.port
     })
 
+
+/** Starts admission-closed; opens the gate for the harness before tests run. */
+const openAdmission = (port: number) =>
+  Effect.gen(function*() {
+    const admin = yield* makeMicrovmClient({ url: `http://127.0.0.1:${port}`, token: adminToken })
+    yield* admin.setAdmission({ accepting: true })
+  })
+
   const startHarness = (root: string, maxVms = 2) =>
     Effect.gen(function*() {
       let boots = 0
@@ -410,6 +418,7 @@ describe("daemon stores measured identity", () => {
         })
       }))
       yield* daemonLayer(configFor(root, maxVms), {
+          credentials: CredentialStore.layer([adminToken]),
         firecracker,
         prereqs,
         server,
@@ -419,6 +428,7 @@ describe("daemon stores measured identity", () => {
         Effect.forkScoped
       )
       const port = yield* waitForListener(server)
+      yield* openAdmission(port)
       return { url: `http://127.0.0.1:${port}`, bootCount: () => boots }
     })
 

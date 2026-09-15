@@ -13,7 +13,7 @@
 import { createServer, type Server } from "node:http"
 import { Effect, Exit } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
-import { makeMicrovmClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
 import type { VmId } from "../src/protocol.js"
 
 const createPayload = {

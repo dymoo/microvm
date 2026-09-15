@@ -443,7 +443,7 @@ daemon() {
 
   # Ephemeral admin credential: generated, masked, and never printed. It only
   # reaches the daemon through the config's ${MICROVM_ADMIN_TOKEN} reference.
-  local admin_token started finished create_json vm_id vsock destroy_json
+  local admin_token started finished create_json vm_id vsock destroy_json info_json admission_json
   local daemon_listen_ms protocol_vm_create_ms protocol_accept_ms http_preview_ms two_vm_accept_ms hostile_abuse_ms
   local daemon_pid image_digest
   image_digest=$(manifest_image_digest "$IMAGES_DIR/node.json")
@@ -457,6 +457,7 @@ daemon() {
 {
   "listen": { "host": "127.0.0.1", "port": $PORT },
   "advertisedUrl": "$URL",
+  "acceptingAtStartup": false,
   "auth": { "adminTokens": ["\${MICROVM_ADMIN_TOKEN}"] },
   "firecracker": {
     "firecrackerBinary": "$FIRECRACKER_INSTALL",
@@ -623,6 +624,29 @@ print(
   finished=$(now_ms)
   daemon_listen_ms=$((finished - started))
 
+  # A newly started daemon must prove the configured closed gate before any
+  # scenario is allowed to create a VM. Only the authenticated admin credential
+  # may open admission, and the observable info state is checked afterward.
+  capture_client_json info_json "initial admission info" info --json
+  python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+assert isinstance(payload["version"], str) and payload["version"]
+assert payload["accepting"] is False
+assert payload["liveVms"] == 0
+' <<<"$info_json"
+  capture_client_json admission_json "open admission" set-admission --yes --json
+  python3 -c 'import json,sys; assert json.load(sys.stdin) == {"accepting": True}' <<<"$admission_json"
+  unset admission_json
+  capture_client_json info_json "opened admission info" info --json
+  python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+assert payload["accepting"] is True
+assert payload["liveVms"] == 0
+' <<<"$info_json"
+  unset info_json
+
   # Guest exec v1 protocol acceptance against a VM the daemon booted through
   # the jailer. The vsock UDS lives inside the per-VM jailer chroot; see
   # vmLayout in src/host.ts — this only resolves the documented path.
@@ -644,10 +668,10 @@ print(
   python3 -c 'import json,sys; assert json.load(sys.stdin)["destroyed"] is True' <<<"$destroy_json"
   vm_id=
 
-  # End-to-end HTTP-only preview acceptance. This uses the public Node handler
-  # from a trusted loopback webserver, starts the prepared Next service through
-  # durable service control, and covers HTTP assets, SSE, WebSocket, capability
-  # separation/revocation, concurrent exec, pressure cancellation, and no NIC.
+  # End-to-end Fetch-native preview acceptance. A test-local loopback bridge
+  # adapts Node HTTP to Request/Response while the public ingress adapter owns
+  # routing and credentials. It covers HTTP assets, SSE, explicit WebSocket
+  # refusal, capability revocation, concurrent exec, cancellation, and no NIC.
   # The script bounds every operation internally; this outer deadline is the
   # second layer, so a stall is reported here rather than at the job cap.
   started=$(now_ms)

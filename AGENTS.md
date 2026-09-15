@@ -35,11 +35,12 @@ v4 idioms proven in this codebase (copy these, do not guess):
 ## Source map
 
 - `src/protocol.ts` — the wire: RPC contracts, the auth seam (`Credential`,
-  `SandboxContext`, `Auth`), guest exec v1 constants, and request bounds.
-  Single source of truth for everything that crosses the wire.
-- `src/auth.ts` — credential store (SHA-256 digests, constant-time admin
+  `SandboxContext`, `Auth`), guest exec v1 constants, package/protocol version,
+  daemon HTTP route, and request/ingress bounds. Single source of truth for
+  everything that crosses the wire.
+- `src/auth.ts` — credential store (eager SHA-256 digests, constant-time admin
   comparison), server auth middleware layer, handler-side `requireAdmin` /
-  `authorizeVm`, client header middleware.
+  `authorizeVm`, and internal raw-seam client header middleware.
 - `src/host.ts` — host prerequisite enforcement (KVM access, cgroup v2,
   trusted operator paths), image allowlist, jailer chroot layout, credential-free
   diagnostic VM state evidence, and CID/UID allocators.
@@ -56,16 +57,19 @@ v4 idioms proven in this codebase (copy these, do not guess):
 - `src/daemon.ts` — daemon assembly: config, kernel-held single-daemon lock,
   VM registry (quotas, reservations, TTL reaper, recovery), RPC handlers, and
   bounded HTTP/TLS serving.
-- `src/client.ts` — scoped RPC client and direct single-daemon sandbox creation.
-- `src/sandbox-binding.ts` — private shared handle binding, rollback, and
-  `http()`/`startWebService` handles.
-- `src/cluster.ts` — bounded health polling, static multi-daemon placement,
-  and capacity-only create failover.
-- `src/http-proxy.ts` — the trusted Node reverse-proxy hop: binds one VM's
-  ingress capability and exposes `request`, `upgrade`, `connect`, and
-  `checkContinue` handlers that can reach only the image's fixed HTTP target.
-- `src/ai.ts` — Vercel AI SDK tools bound to one already-created sandbox VM;
-  never receives cluster credentials.
+- `src/client-core.ts` — runtime-neutral request-scoped client core: admin and
+  sandbox interfaces, unstamped RPC construction, per-call bearer presentation,
+  daemon-version validation, and exec result decoding.
+- `src/client.ts` — public scoped-only Node clients (`makeAdminClient`,
+  `makeSandboxScopedClient`) over CA-aware Node HTTP transport.
+- `src/client-raw.ts` — internal repository-test-only raw RPC constructor; not
+  package-exported.
+- `src/client-workerd.ts` — public scoped-only workerd clients and HTTP ingress
+  over a required caller-supplied binding `fetch`; no `globalThis.fetch` fallback.
+- `src/http-ingress.ts` — runtime-neutral, request-scoped Fetch ingress adapter:
+  fixed daemon routing, header sanitization, streaming bounds, and deadlines.
+- `src/ai.ts` — Vercel AI SDK tools bound to one `SandboxScopedClient`; never
+  receives admin credentials.
 - `src/bin/` — `microvm-daemon` and `microvm` CLI entrypoints.
 
 `guest/**` contains the Go guest runner, HTTP bridge, and PID 1; `scripts/**`
@@ -85,7 +89,7 @@ HTTP preview, and durable web-service contracts exactly as specified in
 5. Missing KVM device access, cgroup v2, or jailer => daemon fails closed (no
    degraded mode).
 6. Sandbox-scoped credentials authorize only their own VM; AI tools never see
-   cluster credentials.
+   admin credentials.
 7. TLS is required for any non-loopback daemon connection.
 8. An exec is reported successful only after the guest confirms the whole
    process group/cgroup is dead or exited; any uncertain transport failure
@@ -110,13 +114,13 @@ HTTP preview, and durable web-service contracts exactly as specified in
 ## Agent skills
 
 ### Issue tracker
-Issues and specs use GitHub Issues for `dymoo/microvm`.
-See `docs/agents/issue-tracker.md`.
+
+Issues and specs live in GitHub Issues for `dymoo/microvm`; pull requests are not a triage request surface. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
-Use the five canonical triage labels without overrides.
-See `docs/agents/triage-labels.md`.
+
+The five canonical triage roles map to same-named GitHub labels. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
-Single-context layout: root `CONTEXT.md` and `docs/adr/`.
-See `docs/agents/domain.md`.
+
+Use a single-context layout with root `CONTEXT.md` and `docs/adr/` when present. See `docs/agents/domain.md`.

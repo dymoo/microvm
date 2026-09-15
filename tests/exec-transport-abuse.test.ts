@@ -21,7 +21,8 @@ import { createServer as createUnixServer, type Server as UnixServer, type Socke
 import { dirname, join } from "node:path"
 import { Effect, Layer, Result } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
-import { makeMicrovmClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import { Firecracker, GuestExecChannelLive } from "../src/firecracker.js"
 import { HostPrereqs, vmLayout } from "../src/host.js"
@@ -65,8 +66,8 @@ const fixture = async (): Promise<string> => {
 const configFor = (root: string, maxVms: number) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
   advertisedUrl: "http://127.0.0.1:1",
+  acceptingAtStartup: false,
   tls: undefined,
-  auth: { adminTokens: [adminToken] },
   firecracker: {
     firecrackerBinary: "/usr/bin/false",
     flockBinary: undefined,
@@ -110,6 +111,14 @@ const waitForListener = (server: Server) =>
     const address = server.address()
     if (address === null || typeof address === "string") throw new Error("test listener has no TCP port")
     return address.port
+  })
+
+
+/** Starts admission-closed; opens the gate for the harness before tests run. */
+const openAdmission = (port: number) =>
+  Effect.gen(function*() {
+    const admin = yield* makeMicrovmClient({ url: `http://127.0.0.1:${port}`, token: adminToken })
+    yield* admin.setAdmission({ accepting: true })
   })
 
 interface GuestRequest {
@@ -193,6 +202,7 @@ const startDaemon = (root: string) =>
     const server = createServer()
     const config = configFor(root, 1)
     yield* daemonLayer(config, {
+          credentials: CredentialStore.layer([adminToken]),
       firecracker: Layer.succeed(Firecracker, Firecracker.of({
         boot: (spec) => Effect.promise(async () => {
           await mkdir(spec.layout.vmDir, { recursive: true })
@@ -208,6 +218,7 @@ const startDaemon = (root: string) =>
       Effect.forkScoped
     )
     const port = yield* waitForListener(server)
+    yield* openAdmission(port)
     return { url: `http://127.0.0.1:${port}`, config }
   })
 

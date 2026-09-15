@@ -358,8 +358,8 @@ create_vm VICTIM_ID VICTIM_TOKEN 1 512
 capture_cli "$ATTACKER_TOKEN" create --image "$MICROVM_IMAGE" --image-digest "$IMAGE_DIGEST" --cpus 1 --mem-mib 512 --ttl-s 60 --json
 expect_error "sandbox credential cannot create VMs" 2 Forbidden
 
-capture_cli "$ATTACKER_TOKEN" cleanup --json
-expect_error "sandbox credential cannot invoke admin cleanup" 2 Forbidden
+capture_cli "$ATTACKER_TOKEN" set-admission --no --json
+expect_error "sandbox credential cannot change daemon admission" 2 Forbidden
 
 capture_cli "$ATTACKER_TOKEN" status --vm "$VICTIM_ID" --json
 expect_error "sandbox credential cannot inspect another VM" 2 Forbidden
@@ -797,18 +797,19 @@ CLEAN_ID=
 unset CLEAN_TOKEN
 pass "fresh clean VM destroy leaves no VM/cgroup/process residue"
 
-capture_cli "$ADMIN_TOKEN" cleanup --json
-(( CLI_STATUS == 0 )) || die "admin cleanup failed after abuse"
-assert_json "admin cleanup after abuse" '
-import json, sys
-payload = json.load(sys.stdin)
-assert payload["destroyed"] == [] and payload["failed"] == []
-' "$CLI_OUTPUT"
-pass "post-abuse admin cleanup is healthy and has nothing to reap"
-
-capture_cli "$ADMIN_TOKEN" list --json
-(( CLI_STATUS == 0 )) || die "final admin list failed"
-assert_json "final admin list" 'import json,sys; assert json.load(sys.stdin)["vms"] == []' "$CLI_OUTPUT"
+inventory_empty=false
+for _ in {1..50}; do
+  capture_cli "$ADMIN_TOKEN" list --json
+  (( CLI_STATUS == 0 )) || die "bounded final admin list failed"
+  if python3 -c 'import json,sys; assert json.load(sys.stdin)["vms"] == []' <<<"$CLI_OUTPUT"; then
+    inventory_empty=true
+    break
+  fi
+  sleep 0.1
+done
+[[ $inventory_empty == true ]] \
+  || die "daemon inventory did not reach zero after exact known-VM destruction"
+pass "bounded daemon inventory reached zero after exact known-VM destruction"
 
 for vm_id in "${ALL_VM_IDS[@]}"; do
   references=${VM_PROCESS_REFS[$vm_id]-}

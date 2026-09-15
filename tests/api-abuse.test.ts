@@ -20,7 +20,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Exit, Layer, Result } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
-import { makeMicrovmClient, type MicrovmClient } from "../src/client.js"
+import { makeMicrovmClient } from "../src/client-raw.js"
+import type { MicrovmClient } from "../src/client-core.js"
+import { CredentialStore } from "../src/auth.js"
 import { DaemonConfig, daemonLayer } from "../src/daemon.js"
 import {
   Firecracker,
@@ -49,8 +51,8 @@ const servers: Array<Server> = []
 const configFor = (root: string, maxVms: number) => new DaemonConfig({
   listen: { host: "127.0.0.1", port: 0 },
   advertisedUrl: "http://127.0.0.1:1",
+  acceptingAtStartup: false,
   tls: undefined,
-  auth: { adminTokens: [adminToken] },
   firecracker: {
     firecrackerBinary: "/usr/bin/false",
     flockBinary: undefined,
@@ -114,6 +116,14 @@ const waitForListener = (server: Server) =>
     return address.port
   })
 
+
+/** Starts admission-closed; opens the gate for the harness before tests run. */
+const openAdmission = (port: number) =>
+  Effect.gen(function*() {
+    const admin = yield* makeMicrovmClient({ url: `http://127.0.0.1:${port}`, token: adminToken })
+    yield* admin.setAdmission({ accepting: true })
+  })
+
 type GuestRequest = Parameters<GuestExecChannel["Service"]["exec"]>[0]
 
 interface HarnessOptions {
@@ -163,12 +173,14 @@ const startHarness = (root: string, options: HarnessOptions = {}) =>
       }
     }))
     yield* daemonLayer(configFor(root, options.maxVms ?? 3), {
+          credentials: CredentialStore.layer([adminToken]),
       firecracker, guestExec: guest, prereqs, server, unsafeSkipKernelLockForTests: true
     }).pipe(
       Layer.launch,
       Effect.forkScoped
     )
     const port = yield* waitForListener(server)
+    yield* openAdmission(port)
     return { url: `http://127.0.0.1:${port}`, bootCount: () => boots, guestCalls }
   })
 
@@ -219,8 +231,10 @@ describe("daemon RPC abuse", () => {
 
       const escalatedCreate = yield* Effect.result(sandbox.create(createPayload))
       expect(failureTag(escalatedCreate)).toBe("Forbidden")
-      const escalatedCleanup = yield* Effect.result(sandbox.cleanup({}))
-      expect(failureTag(escalatedCleanup)).toBe("Forbidden")
+      const escalatedAdmission = yield* Effect.result(sandbox.setAdmission({ accepting: false }))
+      expect(failureTag(escalatedAdmission)).toBe("Forbidden")
+      const escalatedInfo = yield* Effect.result(sandbox.info({}))
+      expect(failureTag(escalatedInfo)).toBe("Forbidden")
 
       const crossInspect = yield* Effect.result(sandbox.inspect({ vmId: second.vm.vmId }))
       const crossExecute = yield* Effect.result(sandbox.execute(execCall(second.vm.vmId)))
@@ -453,7 +467,6 @@ describe("daemon RPC abuse", () => {
         { concurrency: "unbounded" }
       )
       expect(destroys.filter((result) => Result.isSuccess(result)).length).toBe(4)
-      yield* admin.cleanup({})
       expect((yield* admin.list({})).vms.length).toBe(0)
 
       // Exact-accounting probe: with capacity 2, three concurrent creates can
@@ -553,7 +566,7 @@ describe("daemon RPC abuse", () => {
     })))
   })
 
-  it("coalesces concurrent destroy and cleanup callers without double-releasing capacity", async () => {
+  it("coalesces concurrent destroy callers without double-releasing capacity", async () => {
     const root = await fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const harness = yield* startHarness(root, { maxVms: 2 })
@@ -561,10 +574,8 @@ describe("daemon RPC abuse", () => {
       const created = yield* admin.create(createPayload)
 
       const calls: Array<Result.Result<unknown, { readonly _tag: string }>> = yield* Effect.forEach(
-        Array.from({ length: 4 }, (_, index) => index),
-        (index): Effect.Effect<Result.Result<unknown, { readonly _tag: string }>> => index % 2 === 0
-          ? admin.destroy({ vmId: created.vm.vmId }).pipe(Effect.result)
-          : admin.cleanup({}).pipe(Effect.result),
+        Array.from({ length: 4 }, () => created.vm.vmId),
+        (vmId) => admin.destroy({ vmId }).pipe(Effect.result),
         { concurrency: "unbounded" }
       )
       for (const call of calls) expect(Result.isSuccess(call)).toBe(true)
@@ -576,7 +587,7 @@ describe("daemon RPC abuse", () => {
     })))
   })
 
-  it("reclaims a poisoned VM through admin cleanup and never double-releases its quota", async () => {
+  it("reclaims a poisoned VM through the periodic reaper and never double-releases its quota", async () => {
     const root = await fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const harness = yield* startHarness(root, {
@@ -590,17 +601,13 @@ describe("daemon RPC abuse", () => {
       const faulted = yield* Effect.result(admin.execute(execCall(created.vm.vmId, { argv: ["/fault"] })))
       expect(failureTag(faulted)).toBe("VmPoisoned")
 
-      // The explicit cleanup or the periodic reaper (same code path) must
-      // reclaim the poisoned VM; either way it happens exactly once.
-      yield* admin.cleanup({})
+      // The ~1s periodic reaper reclaims the poisoned record exactly once.
       let gone = false
-      for (let attempt = 0; attempt < 200 && !gone; attempt++) {
+      for (let attempt = 0; attempt < 300 && !gone; attempt++) {
         gone = (yield* admin.list({})).vms.length === 0
         if (!gone) yield* Effect.sleep(10)
       }
       expect(gone).toBe(true)
-      const repeated = yield* admin.cleanup({})
-      expect(repeated.destroyed).toEqual([])
 
       // Exactly one slot was released, so one refill succeeds and one fails.
       yield* admin.create(createPayload)

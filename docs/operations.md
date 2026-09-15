@@ -8,15 +8,97 @@ Proxmox cluster. Read `README.md` (security model, limitations) first.
 - A **dedicated Linux VM** on the Proxmox cluster (x86_64) with **nested
   KVM** enabled — not the Proxmox host itself. Proxmox VM CPU type must be
   `host` (or another type exposing VT-x) so `/dev/kvm` exists inside.
-- The daemon listens on a **private, authenticated TLS endpoint**. It is not
-  part of the public ingress path (Cloudflare → edge → Caddy) and must not
-  be exposed there; admin access rides the private Wireguard network, the
-  same split the cluster already uses for management APIs.
+- The daemon listens on a **private, authenticated TLS endpoint** and is never
+  exposed as a public origin. In the approved cutover, Workers reach it only
+  through the fixed Cloudflare VPC Service → Cloudflare Tunnel path, with
+  origin TLS verification set to `verify_full`. Operator deploy/admin traffic
+  remains on the private management path. Detailed Cloudflare binding and
+  application handoff configuration is deliberately documented elsewhere.
 - No placement assumptions are made about which Proxmox node runs the VM.
   Size the VM from the quotas you configure (see below); remember guests add
   their `memMib` plus the configured `vmmOverheadMib` to host memory pressure.
   The example uses 256 MiB of VMM overhead; it is a required operator setting,
   not an implicit default.
+
+## Workers VPC, Tunnel, and canary qualification
+
+This is the fixed operator target, not a menu of fallback architectures.
+Workers VPC is an open-beta service, and this repository has **not yet
+verified** that a Durable Object can use its VPC Service binding to reach this
+daemon end to end. The evidence and remaining unknowns are tracked in the
+[Workers VPC + Durable Object qualification research](research/workers-vpc-durable-object-qualification.md).
+No permanent cutover is allowed until every P0 gate below has observed
+evidence.
+
+Provision one fixed **VPC Service** for each daemon node; do not substitute a
+VPC Network binding:
+
+- **node1:** private origin `node1.internal.dylans.link`; fixed VPC
+  Service target at that host's configured HTTPS port; node1 tunnel.
+- **node2 canary:** private origin `node2.internal.dylans.link`; fixed
+  VPC Service target at that host's configured HTTPS port; node2 tunnel.
+
+Each daemon certificate must be issued by Cloudflare Origin CA for its exact
+private origin name. Configure the VPC Service TLS mode as `verify_full`, so
+both the chain and hostname are checked; never use `verify_ca`, disabled
+verification, or `noTLSVerify`. The origin names resolve only on the private
+resolver network available to the connectors. There is no public daemon DNS
+route, Tunnel published application, or caller-selectable daemon URL. A Worker
+may use the pinned private origin as the request `Host`/SNI value required by
+the fixed service binding, but it must never accept that value from a caller
+or use it to choose a target.
+
+Create one Cloudflare Tunnel per node. Run two connectors for each tunnel on
+separate connector hosts/failure domains, both attached to the same private
+resolver network and both restricted to their node's private origin and HTTPS
+port. Tunnel replicas provide redundancy, not traffic steering; node
+selection remains the explicit VPC Service binding. The node2 canary must use
+its own host-local `runStateDir` and jailer cgroup parent. Never mount, copy, or
+share node1 runtime state into node2.
+
+Keep capability boundaries explicit:
+
+- The daemon admin token exists only in the daemon's root-owned environment
+  file and the approved Cloudflare Worker secret store used by the Worker that
+  performs admin RPCs. It never enters a Durable Object record, backend
+  request, URL, cookie, log, or sandbox.
+- Per-VM `sandboxToken` and `httpIngressToken` values are stored only in that
+  sandbox's versioned Durable Object record, cleared on destroy/expiry, and
+  exposed only to request-scoped sandbox/ingress clients. They never enter
+  module-global state or a public response.
+- Origin private keys stay on their daemon nodes. Tunnel credentials stay on
+  the connector hosts for that node. A VPC binding or successful TLS
+  handshake never replaces daemon bearer authorization.
+
+Run these as separate deployed P0 gates against node2 before any permanent
+route or traffic change:
+
+1. **DO → fixed VPC Service binding:** from a deployed Durable Object, call
+   daemon `info` through the node2 VPC Service and observe the exact qualified
+   version, closed/open admission state, and zero-VM baseline. A local
+   Miniflare binding is not evidence for this gate.
+2. **Origin identity failure:** prove the valid node2 Cloudflare Origin CA
+   certificate succeeds with `verify_full`; then prove both a wrong-host
+   certificate and a certificate from an untrusted/wrong CA fail the TLS
+   handshake without reaching daemon authorization.
+3. **Effect in workerd:** use `effect/unstable/http/FetchHttpClient` with the
+   repository's request-scoped client inside deployed workerd. Prove
+   `info`, create, status, and destroy, then reconstruct the client from the
+   persisted Durable Object record in a second invocation.
+4. **HTTP and SSE:** independently prove an ordinary HTTP request and an SSE
+   response through Worker → DO → VPC Service → Tunnel → node2. SSE must
+   arrive incrementally rather than as a buffered terminal body, and both
+   paths must preserve status, headers, cancellation, and configured limits.
+5. **WebSocket:** run a separate real upgrade attempt over the same deployed
+   path. The current HTTP-only ingress contract must produce an explicit
+   fail-closed refusal; record that result and the product decision. Do not
+   infer WebSocket support from HTTP/SSE success or from a platform error-code
+   reference.
+
+Workers VPC beta behavior and Durable Object binding support remain unverified
+until these gates pass. This section authorizes no production deployment,
+Cloudflare resource mutation, DNS change, public route, or Free Vibecode
+cutover; those actions remain outside this repository task.
 
 ## Startup checks and operator requirements
 
@@ -49,13 +131,16 @@ proved separately for each VM before `create` returns.
 
 ## Configuration reference
 
-`daemon.json` — `${ENV_VAR}` references expand from the daemon's environment;
-unresolved references are a fatal config error.
+`/etc/microvm/config.json` — `${ENV_VAR}` references expand from the daemon's
+environment; unresolved references are a fatal config error.
 
 ```jsonc
 {
   "listen": { "host": "192.0.2.10", "port": 9443 },
   "advertisedUrl": "https://192.0.2.10:9443",
+  // Required. Every service start/restart used for deployment is closed until
+  // an authenticated operator explicitly opens admission.
+  "acceptingAtStartup": false,
   // PEM contents, not filenames. TLS is required off loopback.
   "tls": {
     "cert": "${MICROVM_TLS_CERT_PEM}",
@@ -170,6 +255,166 @@ Notes:
 - State writes are atomic (temp file + rename); a crash mid-write cannot
   produce a torn state file.
 
+## Immutable non-production host release
+
+`.github/workflows/release.yml` is manual and non-production-only. Its required
+inputs are an exact lowercase 40-hex `source_sha`, a new `vX.Y.Z` `tag` matching
+`package.json`, and an explicit `publish` boolean. It first calls the hosted
+Linux/KVM acceptance workflow for that exact commit. The build then performs a
+frozen install, `pnpm check-all`, guest Go race tests, deterministic host
+packaging, SBOM generation, GitHub build-provenance attestation, and Actions
+artifact upload. `publish: false` stops without a tag or release write.
+
+Publishing is always a prerelease and never marks the release latest. It
+requires the repository's immutable-releases setting, refuses an existing tag,
+release, or asset, creates the tag at the requested commit, uploads each asset
+once to a draft release, verifies the exact asset-name set and the
+GitHub-reported digests of both primary artifacts against the built
+checksums, and only then publishes the draft and requires GitHub to report
+`isImmutable: true`. Any verification failure removes the just-created
+release and tag and fails; the release is never sealed while unverified. The
+workflow uses only the built-in `GITHUB_TOKEN`; it has no host, SSH,
+Cloudflare, daemon-token, or TLS secret and does not deploy anything. Do not
+add provenance-doc mutations after tagging: the workflow's sidecars and
+attestation are the immutable evidence.
+
+`scripts/build-release-artifact.sh` requires the toolchain qualified by hosted
+acceptance: Node.js `v24.20.0`, pnpm `10.34.5`, and a prebuilt `dist/`. It uses
+`pnpm deploy --prod --legacy --os=linux --cpu=x64 --libc=glibc` for the
+production dependency tree and emits:
+
+```text
+microvm-<version>-<40sha>.tgz
+microvm-<version>-<40sha>.tgz.sha256
+microvm-<version>-<40sha>.tgz.inventory.txt
+microvm-<version>-<40sha>.tgz.provenance.json
+microvm-host-linux-x86_64-<version>-<40sha>.tar.gz
+microvm-host-linux-x86_64-<version>-<40sha>.tar.gz.sha256
+microvm-host-linux-x86_64-<version>-<40sha>.tar.gz.inventory.txt
+microvm-host-linux-x86_64-<version>-<40sha>.tar.gz.provenance.json
+microvm-host-linux-x86_64-<version>-<40sha>.tar.gz.spdx.json
+```
+
+The `.tgz` is the npm-consumable SDK package from the same deterministic
+run: the manifest's `files` whitelist (`dist`, README, `docs`) plus
+`package.json` under an npm `package/` root, with `dependencies` declared
+and never vendored (no `node_modules` in the tarball). The builder refuses
+stale `dist` output without a source file, requires every declared
+export/bin target to exist, and rejects removed legacy subpaths. Consumers
+pin the exact immutable release URL plus the independently recorded
+SHA-256; this is a `private` GitHub prerelease, never an npm publication.
+Both primary artifacts are attested together and digest-verified against
+the release assets before the immutable seal.
+
+The tar is path-sorted with normalized timestamps, numeric root ownership, and
+read-only `0555` directories plus `0444`/`0555` files. The inventory is sorted
+and binds every regular file and symlink by mode, owner, byte count, SHA-256,
+and path. The embedded release manifest binds version, source commit, platform,
+entrypoints, fail-closed admission generation, systemd unit, and the external
+runtime contract.
+
+Node is intentionally **not** bundled: this repository has no reviewed host
+Node archive digest. Deployment therefore requires `/usr/bin/node` to report
+exactly `v24.20.0`; a mismatch fails rather than weakening immutable rollback.
+The package contains production dependencies, but not Firecracker, jailer,
+the guest kernel, images, config, or secrets. Firecracker `v1.17.0` and jailer
+binary hashes are fixed in the manifest. The operator supplies and verifies the
+promoted kernel SHA-256 and image `imageDigest` separately.
+
+## systemd service
+
+The canonical unit is `deploy/systemd/microvm-daemon.service`. It runs as root
+because the daemon must open KVM, manage cgroup v2, prepare jailer chroots, and
+then let jailer drop each VMM to its configured UID/GID. It uses:
+
+```text
+WorkingDirectory=/opt/microvm/current/package
+EnvironmentFile=/etc/microvm/microvm.env
+ExecStart=/usr/bin/node /opt/microvm/current/package/dist/bin/daemon.js --config /etc/microvm/config.json
+```
+
+The environment file and config are root-owned, non-symlinked, and not
+group/world-writable. The environment file defines `MICROVM_ADMIN_TOKEN`; TLS
+PEM environment references remain host-owned. `/etc/microvm/ca.pem` is the CA
+used by the administrative CLI. Releases live below
+`/opt/microvm/releases/<version>-<40sha>/`; `/opt/microvm/current` is an atomic
+symlink. Firecracker/jailer binaries, images, and run state remain under their
+operator paths in `/var/lib/microvm` and are not replaced by an application
+deploy.
+
+`KillMode=mixed` sends SIGTERM to the daemon first, allowing its scoped shutdown
+to destroy VMs and prove cgroup/run-state release. `TimeoutStopSec=30s` is
+longer than the existing 20-second daemon shutdown bound; only then may systemd
+SIGKILL remaining children. The unit deliberately avoids generic sandboxing
+options that would block KVM, cgroup, jailer/chroot, image, or run-state access.
+Every automatic restart is safe only because `acceptingAtStartup` is required
+to be `false`.
+
+## Canary deployment and rollback
+
+Run `scripts/deploy-host.sh` locally as root on an approved, unrouted or
+drained Linux x86_64 canary. It never uses SSH and never writes Cloudflare.
+`--help` documents every argument; `--validate-only` verifies the archive,
+checksum, sorted inventory, safe member/link paths, manifest, exact identities,
+and versioned/symlink plan off-host without requiring root or mutating systemd
+or the install root.
+
+The real path additionally verifies trusted config/environment/CA paths,
+`/usr/bin/node`, configured Firecracker/jailer/kernel bytes, and the selected
+image manifest/raw digest. It takes a kernel-held deployment flock, refuses an
+existing release directory, and preserves diagnostics under
+`/var/lib/microvm/deploy`.
+
+For an existing admission-compatible daemon the sequence is fixed:
+
+1. `microvm set-admission --no --json`, then require `microvm info --json` to
+   report the old version and `accepting: false`. Allow the configured drain
+   grace; if VMs remain, list their exact IDs, destroy each within the separate
+   forced-destruction bound, and require `liveVms: 0`.
+2. Prove both the daemon run-state VM directory and dedicated jailer cgroup
+   parent contain no VM residue. Stop systemd within the configured bound;
+   residue is retained for diagnosis on failure, never deleted to force green.
+3. Move the verified tree into its immutable version directory, install the
+   checked-in unit, and atomically replace `current` with a same-directory
+   temporary symlink plus rename.
+4. Start the daemon and require `info` to report the requested version,
+   `accepting: false`, and `liveVms: 0`. Require empty VM run-state/cgroup
+   directories and verify the systemd main process working directory resolves
+   to the selected release.
+5. Prove a real create fails specifically with `AdmissionClosed`, then run
+   `microvm set-admission --yes --json`.
+6. Run one bounded create/exec/status/destroy lifecycle against the exact
+   operator-supplied image digest; require `liveVms: 0` and no VM run-state or
+   cgroup residue afterward.
+
+Any failure after the old daemon is stopped or the new symlink is switched
+closes admission, stops the new unit, restores exactly one captured compatible
+symlink/unit, starts it closed, repeats the version, closed-create, zero-VM,
+and residue gates, removes only the failed candidate tree, then opens it. The
+diagnostic log remains outside the release tree and there is no retry loop. If
+rollback cannot be proved, the service remains stopped/admission closed and
+all diagnostic state is retained. `--simulate-post-switch-failure` deliberately
+fails after the new closed-start gates and requires a compatible prior release;
+its expected nonzero run proves this exact single rollback path before a normal
+canary run can reuse the verified artifact.
+
+The pre-cutover `v0.2.0` daemon has no admission gate and is not a safe rollback
+target after routing exists. `--bootstrap` therefore permits no compatible
+prior release only while the service is already inactive on an unrouted
+canary; a failed bootstrap remains stopped. Establish an admission-aware
+baseline before enabling the Cloudflare route.
+
+On the primary approved canary, first run the rollback simulation and require
+the previous version to be restored, closed-checked, residue-free, and reopened;
+then rerun normally and require exact version, closed-start, `AdmissionClosed`,
+lifecycle, and zero-residue evidence. Only then apply the same artifact and
+checksums normally to the approved second canary host. A greenfield
+`--bootstrap` has no compatible prior release and therefore cannot simulate
+rollback: keep it unrouted and accept only a fail-closed stopped result until an
+admission-aware baseline exists. Production changes, VPC Service/Tunnel
+configuration, and Free Vibecode implementation are outside this workflow and
+script.
+
 ## Acceptance
 
 Run on a native Linux KVM host. Build inputs are explicit:
@@ -200,10 +445,12 @@ Image construction intentionally never fetches it.
 
 ### Hosted acceptance (CI)
 
-`.github/workflows/acceptance.yml` is dispatch-only and runs the real path on
-a standard public `ubuntu-24.04` runner with `contents: read` and a bounded
-job timeout: a fail-closed KVM/cgroup/disk preflight (a missing capability
-fails the job, it never skips), digest-verified pinned Firecracker/jailer
+`.github/workflows/acceptance.yml` remains manually dispatchable and is also a
+least-permission reusable workflow for an exact 40-hex commit. It runs the real
+path on a standard public `ubuntu-24.04` runner with `contents: read` and a
+bounded job timeout: a fail-closed KVM/cgroup/disk preflight (a missing
+capability fails the job, it never skips), digest-verified pinned
+Firecracker/jailer
 installed under the dedicated root-owned `/var/lib/microvm/bin` prefix (the CI
 job does not depend on or modify shared `/usr/local`), and the pinned kernel
 under `/var/lib/microvm/images` (provenance and trust labels in
