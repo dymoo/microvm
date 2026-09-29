@@ -18,11 +18,12 @@ admission-closed.
 ## Platform support
 
 The daemon is Linux-only and must run as root with KVM and cgroup v2. macOS
-can build, typecheck, run portable tests, and use the client, but it cannot
-perform a real Firecracker boot because macOS does not expose Linux
-`/dev/kvm`. A probe that opens `/dev/kvm` is only a prerequisite check; the
-Linux acceptance run is the proof that nested KVM and the complete boot path
-work.
+can build, typecheck, run portable tests, and use the client natively. On
+Apple M3 or later (macOS 15+), `scripts/dev-mac.sh accept` also runs the
+real jailed boot and the full acceptance suite inside an arm64 Lima VM with
+nested KVM (see "Developing on macOS" in `docs/operations.md`). A probe that
+opens `/dev/kvm` is only a prerequisite check; the Linux acceptance run is
+the proof that nested KVM and the complete boot path work.
 
 References: [Firecracker getting started](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md),
 [Firecracker jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md),
