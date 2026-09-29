@@ -63,7 +63,7 @@ The archive digest is the download trust boundary; the per-binary digests are a 
 
 Firecracker v1.17.0's [kernel policy](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/kernel-policy.md) supports 4K-page **6.18 guest kernels** through at least 2028-06-01. Kernel.org's official [`releases.json`](https://www.kernel.org/releases.json) identifies **6.18.51** as the current 6.18 longterm release on 2026-09-11.
 
-The repository boots an ext4 root block device at `/dev/vda`, mounts cgroup v2 plus `proc`, `sysfs`, `devtmpfs`, `devpts`, and `tmpfs`, opens `/dev/console`, listens on `AF_VSOCK`, and atomically starts workloads with `CLONE_INTO_CGROUP`. The build script also requires native x86_64 Linux, root, Go 1.25 (from `guest/go.mod`), `mmdebstrap`, and a pre-existing kernel whose operator-provided SHA-256 matches; none of these checks should be weakened.
+The repository boots an ext4 root block device at `/dev/vda`, mounts cgroup v2 plus `proc`, `sysfs`, `devtmpfs`, `devpts`, and `tmpfs`, opens `/dev/console`, listens on `AF_VSOCK`, and atomically starts workloads with `CLONE_INTO_CGROUP`. The build script also requires native Linux of the target architecture, root, Go 1.25 (from `guest/go.mod`), `mmdebstrap`, and a pre-existing kernel whose operator-provided SHA-256 matches; none of these checks should be weakened.
 
 ### First-party CI prebuilt: exact binary/config, but no upstream SHA-256
 
@@ -141,6 +141,30 @@ sha256sum resources/x86_64/vmlinux-6.18.44 \
 This is the exact upstream entry point documented in Firecracker's [kernel setup guide](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/rootfs-and-kernel-setup.md#use-the-provided-recipe). The pinned [`resources/rebuild.sh`](https://github.com/firecracker-microvm/firecracker/blob/a8e1c383054529a1c53ba7a0f498383a04e0c4e2/resources/rebuild.sh) concatenates the 6.18 base config, `ci.config`, and `nvme.config`, runs `make olddefconfig`, then `make -j $(nproc) vmlinux bzImage`. The source tag is annotated and contains a PGP signature, but GitHub reports `unknown_key`; the peeled commit pin above is therefore the actionable identity, not a claimed verified signature.
 
 No output kernel SHA-256 can be supplied before that native Linux build. After building, inspect the emitted config for the required `=y` settings, hash the output, promote that digest independently, and only then pass it to `scripts/build-guest-image.sh --kernel-sha256`. A real Firecracker/jailer boot must still prove compatibility.
+
+## aarch64 development pins (Lima on Apple Silicon)
+
+`scripts/dev-mac.sh` runs the same acceptance phases in an arm64 Lima VM with
+nested KVM (see `docs/operations.md`, "Developing on macOS"). Its pins follow
+the same trust labels as the x86_64 set above, from the same Firecracker
+v1.17.0 release and the same `20260909-a8e1c3830545-0` CI kernel set:
+
+| Input | Pinned value | Trust |
+| --- | --- | --- |
+| Archive | `https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-aarch64.tgz` | |
+| Archive SHA-256 | `e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256` | upstream-published (`.sha256.txt` asset and release API `digest`); local hash matched |
+| Firecracker | `release-v1.17.0-aarch64/firecracker-v1.17.0-aarch64`, `fe726e0b43c04363ac07e358be4dee982c3947c65ed3ae10c770fef5e1cd756c` | archive `SHA256SUMS` and local hash agree; static aarch64 ELF |
+| jailer | `release-v1.17.0-aarch64/jailer-v1.17.0-aarch64`, `4d8d2dd4dfc1d47932b2bd261479181dd0c54f0a2f32714421a7e7f9f07ddec8` | archive `SHA256SUMS` and local hash agree |
+| Kernel | `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260909-a8e1c3830545-0/aarch64/vmlinux-6.18.44`, `3b0233769ed8c89f1f47fdbcc4ff9300a2b1b5c618e25ade966a484481b151dc` | **local HTTPS observation / TOFU** |
+| Kernel config | `.../aarch64/vmlinux-6.18.44.config`, `9d9438039dc83026d0c86085e00acfec0c0a49454b35203eb7b315708f17a1dd` | **local HTTPS observation / TOFU** |
+
+The archive's 24 entries are all regular files beneath the single
+`release-v1.17.0-aarch64/` prefix. The kernel is an `ARM64 boot executable
+Image` (4K pages, `Linux version 6.18.44+`); its embedded `IKCONFIG` payload
+(99,550 bytes) is byte-identical to the config object, which has every
+required option above as `=y` (with `CONFIG_SERIAL_OF_PLATFORM` for the
+device-tree 8250 console) and `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` unset. These
+are development pins: they qualify a Mac dev loop, not an arm64 production host.
 
 ## Hosted-runner constraint
 

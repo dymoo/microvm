@@ -222,6 +222,27 @@ export interface BootSpec {
   readonly gid: number
 }
 
+/**
+ * Jailer cgroup v2 ceilings for one VM. With huge pages the guest RAM is
+ * charged to hugetlb instead of memory, so it gets its own exact cap and
+ * memory.max shrinks to the VMM overhead; the per-VM total never loosens.
+ */
+export const jailerCgroupArgs = (
+  spec: Pick<BootSpec, "cpus" | "memMib">,
+  config: Pick<HostConfig, "vmmOverheadMib" | "maxPidsPerVm" | "hugePages">
+): Array<string> => {
+  const mib = 1_048_576
+  const pageBackedMib = config.hugePages === undefined ? spec.memMib : 0
+  return [
+    "--cgroup", `cpu.max=${spec.cpus * 100_000} 100000`,
+    // Include VMM overhead above guest RAM or the kernel OOM killer takes
+    // out valid VMs.
+    "--cgroup", `memory.max=${(pageBackedMib + config.vmmOverheadMib) * mib}`,
+    ...(config.hugePages === "2M" ? ["--cgroup", `hugetlb.2MB.max=${spec.memMib * mib}`] : []),
+    "--cgroup", `pids.max=${config.maxPidsPerVm}`
+  ]
+}
+
 export interface VmHandle {
   readonly pid: number
   /**
@@ -299,10 +320,6 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
         //    <chroot-base-dir>/<exec_file_name>/<id>/root, privilege drop to
         //    the per-VM unprivileged uid/gid, cgroup v2 resource ceilings.
         //    New process group so teardown can signal the whole tree.
-        const cpuQuotaUs = spec.cpus * 100_000
-        // Include VMM overhead above guest RAM or the kernel OOM killer takes
-        // out valid VMs.
-        const memoryMaxBytes = (spec.memMib + config.vmmOverheadMib) * 1_048_576
         const child = spawn(
           config.jailerBinary,
           [
@@ -315,9 +332,7 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
             ...(config.jailerParentCgroup !== undefined
               ? ["--parent-cgroup", config.jailerParentCgroup]
               : []),
-            "--cgroup", `cpu.max=${cpuQuotaUs} 100000`,
-            "--cgroup", `memory.max=${memoryMaxBytes}`,
-            "--cgroup", `pids.max=${config.maxPidsPerVm}`,
+            ...jailerCgroupArgs(spec, config),
             "--resource-limit", `fsize=${config.jailerFsizeBytes}`,
             "--resource-limit", `no-file=${config.jailerNoFileLimit}`,
             "--",
@@ -417,7 +432,8 @@ export const FirecrackerLive = (config: HostConfig): Layer.Layer<Firecracker> =>
             })
             yield* apiRequest(vmId, layout.apiSocket, "PUT", "/machine-config", {
               vcpu_count: spec.cpus,
-              mem_size_mib: spec.memMib
+              mem_size_mib: spec.memMib,
+              ...(config.hugePages !== undefined ? { huge_pages: config.hugePages } : {})
             })
             // vsock only. There is no /network-interface PUT anywhere in
             // this file: the guest has no NIC and therefore no egress path.

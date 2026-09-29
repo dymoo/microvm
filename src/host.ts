@@ -8,7 +8,7 @@
  */
 import { Context, Effect, Layer, Schema } from "effect"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import { accessSync, constants as fsConstants, createReadStream, statSync, lstatSync, mkdirSync, type Stats } from "node:fs"
+import { accessSync, constants as fsConstants, createReadStream, statSync, lstatSync, mkdirSync, readFileSync, type Stats } from "node:fs"
 import {
   chmod,
   chown,
@@ -37,6 +37,14 @@ const isReadable = (path: string): boolean => {
     return true
   } catch {
     return false
+  }
+}
+
+const readTrimmed = (path: string): string | undefined => {
+  try {
+    return readFileSync(path, "utf8").trim()
+  } catch {
+    return undefined
   }
 }
 
@@ -125,6 +133,13 @@ export interface HostConfig {
   readonly jailerFsizeBytes: number
   /** Jailer rlimit no-file for the firecracker process. */
   readonly jailerNoFileLimit: number
+  /**
+   * Back guest RAM with 2 MiB huge pages. The operator reserves the pool
+   * (`vm.nr_hugepages`) and delegates the `hugetlb` controller to the jailer
+   * parent cgroup; each VM's RAM is then capped by `hugetlb.2MB.max`, and
+   * `memory.max` covers only VMM overhead. Omit for regular pages.
+   */
+  readonly hugePages?: "2M" | undefined
   /**
    * util-linux `flock` binary backing the kernel-held single-daemon lock.
    * Defaults to /usr/bin/flock when omitted.
@@ -238,6 +253,17 @@ export class HostPrereqs extends Context.Service<HostPrereqs, {
           }
           if (config.vmmOverheadMib < 0 || !Number.isInteger(config.vmmOverheadMib)) {
             failures.push({ name: "vmm-overhead-mib", detail: "must be a non-negative integer" })
+          }
+          if (config.hugePages === "2M") {
+            const pool = Number(readTrimmed("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"))
+            if (!(pool > 0)) {
+              failures.push({ name: "huge-pages", detail: "no reserved 2 MiB huge page pool (vm.nr_hugepages)" })
+            }
+            const parent = join("/sys/fs/cgroup", config.jailerParentCgroup ?? "")
+            const delegated = readTrimmed(join(parent, "cgroup.subtree_control"))?.split(" ") ?? []
+            if (!delegated.includes("hugetlb")) {
+              failures.push({ name: "huge-pages", detail: `hugetlb controller not delegated in ${parent}/cgroup.subtree_control` })
+            }
           }
 
           if (failures.length > 0) {

@@ -62,6 +62,17 @@ describe("host prerequisites (fail closed)", () => {
     }
   })
 
+  it("fails closed when huge pages are configured without hugetlb delegation", async () => {
+    const missingParent = "microvm-test-missing.slice"
+    const reasonFor = (hugePages: "2M" | undefined) =>
+      verifyWith(baseConfig({ firecrackerBinary: "/nonexistent/fc", jailerParentCgroup: missingParent, hugePages }))
+        .then(() => "ok", (error: HostPrereqFailed) => error.reason)
+    expect(await reasonFor("2M")).toMatch(
+      new RegExp(`huge-pages: hugetlb controller not delegated in /sys/fs/cgroup/${missingParent}/`)
+    )
+    expect(await reasonFor(undefined)).not.toMatch(/huge-pages/)
+  })
+
   it("never reports success with capabilities unchecked", async () => {
     const result = await verifyWith(baseConfig({ firecrackerBinary: "/nonexistent/fc" })).then(
       () => "ok",

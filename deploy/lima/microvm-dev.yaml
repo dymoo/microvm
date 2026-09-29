@@ -1,0 +1,56 @@
+# Lima dev host for Apple Silicon (M3 or later): an arm64 Ubuntu 24.04 VM (the
+# CI runner OS) with nested KVM, so the real jailed Firecracker lifecycle runs
+# on a Mac. Driven by scripts/dev-mac.sh, which mounts the checkout read-only;
+# builds happen on a VM-local copy so darwin node_modules never mix in.
+minimumLimaVersion: 2.0.0
+base:
+- template:_images/ubuntu-24.04
+vmType: vz
+nestedVirtualization: true
+cpus: 4
+memory: 8GiB
+disk: 60GiB
+mounts: []
+containerd:
+  system: false
+  user: false
+
+# Same toolchain as .github/workflows/acceptance.yml, verified against the
+# upstream-published digests (nodejs.org SHASUMS256.txt, go.dev/dl).
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+      build-essential ca-certificates curl file git openssl python3 rsync xz-utils
+    fetch() { curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$2" "$1"; }
+    if [[ $(node --version 2>/dev/null) != v24.20.0 ]]; then
+      fetch https://nodejs.org/dist/v24.20.0/node-v24.20.0-linux-arm64.tar.xz /tmp/node.tar.xz
+      echo "5f4ddab610c1ab2016b3c227cebdbf6d9495161487e4739c7b90090595f465f7  /tmp/node.tar.xz" | sha256sum --check --status
+      tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner
+      rm /tmp/node.tar.xz
+    fi
+    if [[ $(/usr/local/go/bin/go version 2>/dev/null) != *go1.27.1* ]]; then
+      fetch https://go.dev/dl/go1.27.1.linux-arm64.tar.gz /tmp/go.tar.gz
+      echo "3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec  /tmp/go.tar.gz" | sha256sum --check --status
+      rm -rf /usr/local/go && tar -xzf /tmp/go.tar.gz -C /usr/local --no-same-owner
+      ln -sf /usr/local/go/bin/go /usr/local/go/bin/gofmt /usr/local/bin/
+      rm /tmp/go.tar.gz
+    fi
+    [[ $(pnpm --version 2>/dev/null) == 10.34.5 ]] || npm install --global --silent pnpm@10.34.5
+    # Guest RAM on 2 MiB huge pages (daemon firecracker.hugePages): nested
+    # virtualization makes 4 KiB guest page faults 10-25x slower.
+    echo 'vm.nr_hugepages = 1536' > /etc/sysctl.d/60-microvm-hugepages.conf
+    sysctl --quiet --load /etc/sysctl.d/60-microvm-hugepages.conf
+
+probes:
+- description: nested KVM and the CI toolchain are present
+  script: |
+    #!/bin/bash
+    set -eu
+    [ -c /dev/kvm ] || { echo "no /dev/kvm: needs Apple M3+, macOS 15+, vmType vz" >&2; exit 1; }
+    command -v node go pnpm rsync >/dev/null
+  hint: See scripts/dev-mac.sh and docs/operations.md ("Developing on macOS").

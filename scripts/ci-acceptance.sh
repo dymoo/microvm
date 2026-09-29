@@ -309,7 +309,7 @@ image() {
   local started finished digest
   started=$(now_ms)
   "$ROOT/scripts/build-guest-image.sh" \
-    --arch x86_64 \
+    --arch "$(uname -m)" \
     --kernel "$KERNEL_INSTALL" \
     --kernel-sha256 "$KERNEL_SHA256" \
     --output-dir "$IMAGES_DIR" \
@@ -366,9 +366,13 @@ wait_for_port() { # pid seconds label
   die "timed out waiting for $label"
 }
 
+HUGE_PAGES=${MICROVM_CI_HUGE_PAGES:-}
+[[ -z $HUGE_PAGES || $HUGE_PAGES == 2M ]] || die "MICROVM_CI_HUGE_PAGES must be empty or 2M"
+CGROUP_CONTROLLERS="cpu memory pids${HUGE_PAGES:+ hugetlb}"
+
 enable_cgroup_controllers() { # dir
   local dir=$1 needed have
-  for needed in cpu memory pids; do
+  for needed in $CGROUP_CONTROLLERS; do
     have=$(< "$dir/cgroup.controllers")
     [[ " $have " == *" $needed "* ]] || continue
     have=$(< "$dir/cgroup.subtree_control")
@@ -436,7 +440,7 @@ daemon() {
   # or the boot would fail later with a much less specific error.
   local have_controllers needed
   have_controllers=$(< "$CGROUP_SLICE/cgroup.controllers")
-  for needed in cpu memory pids; do
+  for needed in $CGROUP_CONTROLLERS; do
     [[ " $have_controllers " == *" $needed "* ]] \
       || die "cgroup controller $needed is not available to $CGROUP_SLICE; the jailer cannot enforce VM ceilings"
   done
@@ -476,7 +480,8 @@ daemon() {
     "vmmOverheadMib": 256,
     "maxPidsPerVm": 1024,
     "jailerFsizeBytes": 2147483648,
-    "jailerNoFileLimit": 4096
+    "jailerNoFileLimit": 4096${HUGE_PAGES:+,
+    \"hugePages\": \"$HUGE_PAGES\"}
   },
   "limits": {
     "maxVms": 4,
@@ -720,7 +725,7 @@ assert payload["liveVms"] == 0
   verify_vm_release "$RUN_STATE_DIR/vms" "$CGROUP_SLICE"
 
   {
-    echo "host: ubuntu-24.04 GitHub-hosted runner, nested KVM (not representative of any Proxmox latency)"
+    echo "host: $(uname -srm)${GITHUB_ACTIONS:+ GitHub-hosted runner}, nested KVM${HUGE_PAGES:+, $HUGE_PAGES huge pages} (not representative of any Proxmox latency)"
     echo "daemon cold start to listening ms: $daemon_listen_ms"
     echo "protocol VM create (jailer boot + readiness) ms: $protocol_vm_create_ms"
     echo "guest protocol acceptance ms: $protocol_accept_ms"
