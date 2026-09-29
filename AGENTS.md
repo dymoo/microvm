@@ -101,6 +101,8 @@ HTTP preview, and durable web-service contracts exactly as specified in
   `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess` stay on)
 - `npx vitest run` — tests
 - `pnpm build` — emit `dist/`
+- `scripts/dev-mac.sh accept` — real jailed-Firecracker acceptance on an
+  M3+ Mac inside an arm64 Lima VM with nested KVM (`docs/operations.md`)
 
 ## Docs
 

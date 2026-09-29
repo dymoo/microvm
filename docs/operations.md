@@ -114,7 +114,10 @@ Before listening, the daemon checks and aggregates these failures in one
 4. the image and run-state directories are trusted; the daemon creates the
    run-state directory with mode 0700 when absent;
 5. UID/GID ranges are positive and ordered, `maxPidsPerVm` is at least 8, and
-   `vmmOverheadMib` is a non-negative integer.
+   `vmmOverheadMib` is a non-negative integer;
+6. when `hugePages` is `"2M"`, a 2 MiB huge page pool is reserved
+   (`vm.nr_hugepages` > 0) and the `hugetlb` controller is delegated in the
+   jailer parent cgroup's `cgroup.subtree_control`.
 
 Configuration validation separately requires TLS on a non-loopback listener,
 non-empty TLS PEM values, a secure advertised origin, an admin token of at
@@ -212,6 +215,13 @@ Notes:
   remote, NIC, DNS, or push path.
 - `memory.max` per VM = guest `memMib` + the configured `vmmOverheadMib`; do
   not drop the overhead or the OOM killer can take valid VMs.
+- Optional `"hugePages": "2M"` backs guest RAM with 2 MiB huge pages. Guest
+  RAM is then charged to hugetlb, not memory: each VM gets
+  `hugetlb.2MB.max` = `memMib` and `memory.max` = `vmmOverheadMib`, so the
+  per-VM ceiling does not loosen. Reserve a pool that covers the guest RAM
+  you admit (`vm.nr_hugepages` × 2 MiB); when it runs out, boot fails closed.
+  Omit the field for regular pages. It is essential under nested
+  virtualization (see "Developing on macOS").
 - `jailerFsizeBytes` must be at least the largest allowed root image.
 - `runStateDir` stores one private logical full-size root disk per live VM.
   Provisioning requests a copy-on-write reflink and automatically falls back
@@ -473,6 +483,38 @@ ephemerally, masked before any output, and passed only through the config's
 an always-step cleanup, and the uploaded evidence contains versions,
 checksums, logs, and timings only — never tokens, the rootfs image, or daemon
 config.
+
+### Developing on macOS (Apple Silicon)
+
+Apple M3 or later on macOS 15+ exposes nested virtualization to Lima's `vz`
+driver, so a Mac can run the real jailed Firecracker path; nothing about the
+daemon's prerequisites is relaxed. `deploy/lima/microvm-dev.yaml` defines an
+arm64 Ubuntu 24.04 VM (the CI runner OS) with `/dev/kvm`, cgroup v2, and the CI
+toolchain (Node 24.20.0, pnpm 10.34.5, Go 1.27.1, digest-verified).
+
+```bash
+brew install lima
+scripts/dev-mac.sh accept   # create/start VM, sync checkout, run acceptance
+scripts/dev-mac.sh up       # just create/start and re-sync the checkout
+limactl shell microvm-dev   # shell; the synced checkout is ~/microvm
+```
+
+The checkout is mounted read-only and rsynced to a VM-local `~/microvm`
+(excluding `node_modules` and `dist`), so Linux builds never mix with darwin
+dependencies. `accept` runs `scripts/ci-acceptance.sh` `preflight`,
+`artifacts`, `tests`, `image`, and `daemon` with the aarch64 pins from
+`docs/runtime-artifacts.md`, then `clean` on exit. The real-VSOCK peer test
+stays GitHub-hosted only, and production remains x86_64: the Mac loop proves
+the code, not an arm64 deployment. `scripts/dev-mac.sh phase <name>` reruns
+one phase on the VM as-is (`phase daemon` cleans up on exit, like `accept`).
+
+The Lima VM reserves 3 GiB of 2 MiB huge pages, and `dev-mac.sh` runs the
+daemon with `"hugePages": "2M"` (`MICROVM_CI_HUGE_PAGES=2M`). This matters.
+With regular pages, nested virtualization makes guest page faults so slow
+that `pnpm --version` took 7–12 s and `next-init` blew its 15 s exec budget.
+With huge pages, measured on an M3 Max on 2026-09-29, `node` takes 0.08 s,
+`pnpm --version` 0.8 s, and `next-init` 4.6 s. Full daemon acceptance passes:
+guest protocol, HTTP preview, two-VM, and all 52 hostile-abuse checks.
 
 ## Troubleshooting
 

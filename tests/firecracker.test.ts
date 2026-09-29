@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { Effect, Result } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
-import { Firecracker, FirecrackerLive } from "../src/firecracker.js"
+import { Firecracker, FirecrackerLive, jailerCgroupArgs } from "../src/firecracker.js"
 import { ImageAllowlist, ImageManifest, type HostConfig, type ResolvedImage, type VmLayout } from "../src/host.js"
 import { ImageNotAllowed } from "../src/protocol.js"
 
@@ -270,5 +270,27 @@ describe("image allowlist", () => {
     roots.push(dir)
     await writeImage(dir, { name: "node", file: "node.raw", arch: "x86_64", sizeBytes: "4 GiB", imageDigest: rawImageDigest })
     await expect(resolveNode(dir)).rejects.toBeInstanceOf(ImageNotAllowed)
+  })
+})
+
+describe("jailer cgroup ceilings", () => {
+  const limits = { vmmOverheadMib: 256, maxPidsPerVm: 1024 }
+  const mib = 1_048_576
+
+  it("caps guest RAM plus VMM overhead in memory.max with regular pages", () => {
+    expect(jailerCgroupArgs({ cpus: 2, memMib: 512 }, limits)).toEqual([
+      "--cgroup", "cpu.max=200000 100000",
+      "--cgroup", `memory.max=${768 * mib}`,
+      "--cgroup", "pids.max=1024"
+    ])
+  })
+
+  it("moves guest RAM to an exact hugetlb cap without loosening the total", () => {
+    expect(jailerCgroupArgs({ cpus: 1, memMib: 512 }, { ...limits, hugePages: "2M" })).toEqual([
+      "--cgroup", "cpu.max=100000 100000",
+      "--cgroup", `memory.max=${256 * mib}`,
+      "--cgroup", `hugetlb.2MB.max=${512 * mib}`,
+      "--cgroup", "pids.max=1024"
+    ])
   })
 })

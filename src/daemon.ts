@@ -133,7 +133,8 @@ export class DaemonConfig extends Schema.Class<DaemonConfig>("DaemonConfig")({
     vmmOverheadMib: positiveInt,
     maxPidsPerVm: positiveInt,
     jailerFsizeBytes: positiveInt,
-    jailerNoFileLimit: positiveInt
+    jailerNoFileLimit: positiveInt,
+    hugePages: Schema.optional(Schema.Literal("2M"))
   }),
   limits: Schema.Struct({
     maxVms: positiveInt,
