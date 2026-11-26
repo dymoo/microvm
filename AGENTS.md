@@ -115,6 +115,11 @@ HTTP preview, and durable web-service contracts exactly as specified in
 
 ## Agent skills
 
+- Gufo: read the `gufo` skill before changing model calls, scheduled inference,
+  batches, retries or inference telemetry; default deferrable work to Batch when
+  supported. Canonical source: `dymoo/dylans-skills`,
+  `collections/workstation/skills/gufo/SKILL.md`.
+
 ### Issue tracker
 
 Issues and specs live in GitHub Issues for `dymoo/microvm`; pull requests are not a triage request surface. See `docs/agents/issue-tracker.md`.
